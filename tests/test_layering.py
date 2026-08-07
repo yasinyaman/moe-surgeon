@@ -24,7 +24,6 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "vllm_moe_surgeon"
 _ALLOWED = {
     "compat",  # the seam layer -- its entire job
     "plugin.py",  # the entry point vLLM itself calls
-    "telemetry",  # runtime hooks; must go through compat, see test below
 }
 
 

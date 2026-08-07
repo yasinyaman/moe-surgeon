@@ -85,8 +85,37 @@ That number is the argument for this package. The same window would have landed
 on the fork's ~800 lines of in-file hooks: `moe_runner.py` alone lost 41 lines,
 `config/vllm.py` gained 195.
 
+## Profiling
+
+```bash
+surgeon profile --model allenai/OLMoE-1B-7B-0924 --corpus domain.jsonl --out profile.npz
+```
+
+Telemetry rides vLLM's own `--enable-return-routed-experts`, which captures
+per-token, per-layer expert ids and returns them per request. So this costs
+**zero seams** — the aggregator is numpy over a public output field, and adding it
+*removed* three internal seams the plan had budgeted for a `MoERunner` subclass.
+
+What the public API does not carry is router *weights*. Token-weighted counts and
+co-occurrence are exact; gate mass would need a routing hook and is deferred.
+
+One trap is handled for you. vLLM sizes the capture buffer by
+`num_hidden_layers` and zeroes it each step, and only layers that route ever
+write to it — so in a model with dense layers those rows read as *expert 0 chosen
+by every token*. Aggregate naively and expert 0 looks like the hottest expert in
+the model. `telemetry/layers.py` resolves the real MoE layer set from the config,
+and `ExpertStats` cross-checks it against the data (a genuine top-k row cannot
+repeat an expert, so an all-identical row is uncaptured).
+
 ## Status
 
-Faz 0 complete: package scaffold, disk tier lifted out of the fork with the
-regression suite, seam layer and its tests. Faz 1 (telemetry) is next; see the
-plan for the full sequence.
+Faz 0 and Faz 1 complete, verified on GB10: 167 tests pass with CUDA and vLLM
+installed.
+
+First real measurement, OLMoE-1B-7B (64 experts, top-8, 16 MoE layers), 3 prompts
+/ 169 tokens: `mean experts/tok` came back exactly 8.000, all 16 layers captured,
+no dropped rows. 54–64 of 64 experts were touched *per layer*, and the hottest
+quarter of experts carried 50–66% of load against 25% for a uniform
+distribution. So the concentration is real (~2–2.6x), but at 169 tokens this is a
+pipeline check, not a pruning basis — it also reproduces the earlier finding that
+a handful of prompts already reaches nearly the whole expert set.

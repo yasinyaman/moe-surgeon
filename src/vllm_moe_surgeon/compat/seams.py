@@ -215,19 +215,6 @@ SEAMS: tuple[Seam, ...] = (
     Seam(
         target=(
             "vllm.model_executor.layers.fused_moe.runner.moe_runner"
-            ":MoERunner._apply_quant_method"
-        ),
-        kind="method",
-        tier="internal",
-        why=(
-            "The single routing site: it calls router.select_experts and is where "
-            "we read topk_ids/topk_weights for per-expert telemetry. A rename "
-            "means the profiler records nothing and reports zeros."
-        ),
-    ),
-    Seam(
-        target=(
-            "vllm.model_executor.layers.fused_moe.runner.moe_runner"
             ":MoERunner._forward_impl"
         ),
         kind="method",
@@ -238,17 +225,36 @@ SEAMS: tuple[Seam, ...] = (
             "upstream's and should be proposed separately."
         ),
     ),
+    # ------------------------------------------------------------------
+    # Telemetry rides vLLM's own routed-experts capture, so this section
+    # holds a CLI flag and an output field instead of a routing hook.
+    #
+    # The plan budgeted three internal seams here -- a MoERunner subclass,
+    # _apply_quant_method, and FusedMoERouter.select_experts -- to read
+    # topk_ids out of the forward pass. None are needed:
+    # --enable-return-routed-experts already captures per-token, per-layer
+    # expert ids and returns them per request. Both are public API.
+    # ------------------------------------------------------------------
     Seam(
-        target=(
-            "vllm.model_executor.layers.fused_moe.router.fused_moe_router"
-            ":FusedMoERouter.select_experts"
-        ),
-        kind="method",
-        tier="internal",
+        target="vllm.config.model:ModelConfig.enable_return_routed_experts",
+        kind="attribute",
+        tier="documented",
         why=(
-            "Signature of the call we wrap for telemetry. FusedMoERouter is a "
-            "plain ABC, NOT a PluggableLayer, so it cannot be registered -- we "
-            "have to reach it through the runner's .router attribute."
+            "The flag that turns on per-token routed-expert capture, exposed as "
+            "--enable-return-routed-experts. This is the entire telemetry "
+            "mechanism; without it we would be back to subclassing MoERunner and "
+            "wrapping router.select_experts."
+        ),
+    ),
+    Seam(
+        target="vllm.outputs:CompletionOutput.routed_experts",
+        kind="attribute",
+        tier="documented",
+        why=(
+            "Where the capture surfaces: [seq_len, num_layers, top_k] expert ids "
+            "per finished request, in both the offline LLM path and (base64 "
+            "np.save encoded) the OpenAI-compatible response. The read side of "
+            "the profiler is ordinary numpy over this field."
         ),
     ),
     Seam(
@@ -297,8 +303,58 @@ def resolve(seam: Seam) -> Any:
     return obj
 
 
+def _has_field(owner: Any, name: str) -> bool:
+    """Does ``owner`` declare a field called ``name``?
+
+    Plain ``getattr`` is not enough. vLLM's configs are pydantic dataclasses,
+    which move declared fields off the class body, so a field can exist while
+    ``getattr(cls, name)`` raises. Check every place a field can hide.
+    """
+    import dataclasses
+
+    if hasattr(owner, name):
+        return True
+    if name in getattr(owner, "__annotations__", {}):
+        return True
+    # pydantic BaseModel / pydantic dataclass
+    model_fields = getattr(owner, "model_fields", None)
+    if isinstance(model_fields, dict) and name in model_fields:
+        return True
+    if dataclasses.is_dataclass(owner):
+        if any(f.name == name for f in dataclasses.fields(owner)):
+            return True
+    # Annotations on base classes, for a subclassed config.
+    for base in getattr(owner, "__mro__", ())[1:]:
+        if name in getattr(base, "__annotations__", {}):
+            return True
+    return False
+
+
 def check(seam: Seam) -> SeamProblem | None:
     """Verify one seam resolves and, for callables, carries the params we need."""
+    if seam.kind == "attribute":
+        # Resolve the owner, then look the field up properly.
+        *owner_path, field_name = seam.qualname.split(".")
+        if not owner_path:
+            return SeamProblem(seam, "attribute seam needs 'Module:Owner.field'")
+        owner_seam = Seam(
+            target=f"{seam.module}:{'.'.join(owner_path)}",
+            kind="class",
+            tier=seam.tier,
+            why=seam.why,
+        )
+        try:
+            owner = resolve(owner_seam)
+        except ModuleNotFoundError as exc:
+            return SeamProblem(seam, f"module missing: {exc}")
+        except AttributeError as exc:
+            return SeamProblem(seam, f"owner missing: {exc}")
+        if not _has_field(owner, field_name):
+            return SeamProblem(
+                seam, f"{'.'.join(owner_path)} has no field {field_name!r}"
+            )
+        return None
+
     try:
         obj = resolve(seam)
     except ModuleNotFoundError as exc:
@@ -383,6 +439,21 @@ def _toplevel_names(tree: Any) -> dict[str, Any]:
     return names
 
 
+def _declares_field(class_node: Any, name: str) -> bool:
+    """Does this ClassDef body declare ``name`` as an attribute?"""
+    import ast
+
+    for child in class_node.body:
+        if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+            if child.target.id == name:
+                return True
+        elif isinstance(child, ast.Assign):
+            for target in child.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return True
+    return False
+
+
 def check_static(seam: Seam, source_root: str) -> SeamProblem | None:
     """Verify a seam against a vLLM *source tree*, without importing it.
 
@@ -406,29 +477,38 @@ def check_static(seam: Seam, source_root: str) -> SeamProblem | None:
     if node is None:
         return SeamProblem(seam, f"{parts[0]} not defined in {seam.module}")
 
+    _Def = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+
     for part in parts[1:]:
         if not isinstance(node, ast.ClassDef):
             return SeamProblem(seam, f"cannot look up .{part} on a non-class")
-        members = {
-            child.name
-            for child in node.body
-            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
-        }
-        if part not in members:
-            # Inherited members are legitimately invisible to a single-file
-            # parse; say so rather than reporting a false break.
-            bases = [ast.unparse(b) for b in node.bases]
-            return SeamProblem(
-                seam,
-                f"{part} not defined directly on {node.name} "
-                f"(bases: {bases or 'none'}) -- inherited, or gone",
-            )
-        node = next(
-            child
-            for child in node.body
-            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
-            and child.name == part
+
+        child_def = next(
+            (c for c in node.body if isinstance(c, _Def) and c.name == part), None
         )
+        if child_def is not None:
+            node = child_def
+            continue
+
+        # A declared field -- a dataclass or pydantic attribute, which appears
+        # as an annotated assignment rather than a def. It is terminal: there is
+        # nothing to descend into, so the remaining path (if any) is bogus.
+        if _declares_field(node, part):
+            node = None
+            continue
+
+        # Inherited members are legitimately invisible to a single-file parse;
+        # say so rather than reporting a false break.
+        bases = [ast.unparse(b) for b in node.bases]
+        return SeamProblem(
+            seam,
+            f"{part} not defined directly on {node.name} "
+            f"(bases: {bases or 'none'}) -- inherited, or gone",
+        )
+
+    if node is None:
+        # Terminated on a field. Nothing further to verify statically.
+        return None
 
     if seam.params and isinstance(node, ast.ClassDef):
         # Mirror check(): for a class, the params we require are its
