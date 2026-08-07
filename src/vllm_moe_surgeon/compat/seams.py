@@ -51,6 +51,12 @@ class Seam:
     #: subset, not the full signature: requiring an exact match would fail on
     #: every harmless upstream addition, which trains you to ignore the test.
     params: tuple[str, ...] = field(default_factory=tuple)
+    #: ``False`` for a seam we would *like* to use but can live without -- one
+    #: that upstream has only recently grown, or that we have a fallback for.
+    #: Tracking upstream is not only about names disappearing: when upstream
+    #: extracts a helper we were duplicating, we want to notice and adopt it.
+    #: Optional seams report as informational rather than failing the pin.
+    required: bool = True
 
     @property
     def module(self) -> str:
@@ -191,6 +197,23 @@ SEAMS: tuple[Seam, ...] = (
     ),
     Seam(
         target=(
+            "vllm.model_executor.layers.fused_moe.routed_experts"
+            ":RoutedExperts._orient_fused_weight"
+        ),
+        kind="method",
+        tier="internal",
+        required=False,
+        why=(
+            "Upstream extracted the fused-weight orientation logic that used to "
+            "be an inline branch inside weight_loader. Where it exists we should "
+            "call it instead of duplicating the transpose rule in our override; "
+            "where it does not, our override carries its own copy. Absent at the "
+            "0.26.1 merge base, present ~300 commits later -- kept optional so "
+            "the pinned version still passes."
+        ),
+    ),
+    Seam(
+        target=(
             "vllm.model_executor.layers.fused_moe.runner.moe_runner"
             ":MoERunner._apply_quant_method"
         ),
@@ -302,9 +325,17 @@ def check(seam: Seam) -> SeamProblem | None:
     return None
 
 
-def check_all() -> list[SeamProblem]:
-    """Every seam that no longer holds. Empty list means the pin is safe."""
-    return [problem for seam in SEAMS if (problem := check(seam)) is not None]
+def check_all(include_optional: bool = False) -> list[SeamProblem]:
+    """Every required seam that no longer holds.
+
+    An empty list means the installed vLLM is safe to run against. Optional
+    seams are excluded by default: a missing optional seam is news, not a break.
+    """
+    return [
+        problem
+        for seam in SEAMS
+        if (include_optional or seam.required) and (problem := check(seam)) is not None
+    ]
 
 
 # ----------------------------------------------------------------------
@@ -434,10 +465,13 @@ def check_static(seam: Seam, source_root: str) -> SeamProblem | None:
     return None
 
 
-def check_all_static(source_root: str) -> list[SeamProblem]:
-    """Every seam that fails the source-tree check."""
+def check_all_static(
+    source_root: str, include_optional: bool = False
+) -> list[SeamProblem]:
+    """Every required seam that fails the source-tree check."""
     return [
         problem
         for seam in SEAMS
-        if (problem := check_static(seam, source_root)) is not None
+        if (include_optional or seam.required)
+        and (problem := check_static(seam, source_root)) is not None
     ]

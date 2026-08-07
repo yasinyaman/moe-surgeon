@@ -64,7 +64,26 @@ Three levels, and they run in different places:
 - **CUDA / installed vLLM** (`test_expert_cache.py`, import-level seam checks) —
   skip without a device. These run on the GPU boxes.
 
-A `92 skipped` line on a laptop is expected, not a warning sign.
+A large `skipped` count on a laptop is expected, not a warning sign.
+
+## Pricing a vLLM upgrade
+
+```bash
+python tools/upstream_drift.py --repo ../vllm --from <pinned-ref> --to <candidate-ref>
+```
+
+Reads the seam modules straight out of git at both refs and reports, per seam,
+whether it holds, broke, or newly appeared. No install, no torch, no GPU. Exit
+status is 1 if a required seam broke, so it can gate a pin bump.
+
+Measured 2026-08-07, merge base → upstream `main`, **296 commits**: 342 lines
+changed across the five files we hold, **0 required seams broken**, 1 optional
+seam newly available (`RoutedExperts._orient_fused_weight` — upstream extracted
+the fused-weight orientation branch we would otherwise have duplicated).
+
+That number is the argument for this package. The same window would have landed
+on the fork's ~800 lines of in-file hooks: `moe_runner.py` alone lost 41 lines,
+`config/vllm.py` gained 195.
 
 ## Status
 

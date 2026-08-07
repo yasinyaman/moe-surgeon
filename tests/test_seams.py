@@ -59,6 +59,22 @@ def test_seam_table_is_well_formed():
         assert len(seam.why) > 40, f"{seam.target} needs a real 'why'"
 
 
+def test_optional_seams_are_excluded_from_the_pin_check():
+    """A missing optional seam must never fail the pin.
+
+    ``check_all`` is what a version bump gates on. Optional seams exist to
+    record upstream helpers we want to adopt as they appear -- counting their
+    absence as a break would make the gate unusable on the pinned version,
+    which is precisely the version that does not have them yet.
+    """
+    from vllm_moe_surgeon.compat.seams import SEAMS as table
+
+    optional = [s for s in table if not s.required]
+    assert optional, "the table should track at least one emerging upstream seam"
+    for seam in optional:
+        assert seam.why, f"{seam.target} must say what it would buy us"
+
+
 def test_no_reliance_on_fork_only_api():
     """``supports_expert_lru_cache`` was added by the in-tree prototype.
 
@@ -99,8 +115,11 @@ def test_seam_present_in_source_tree(seam):
     if root is None:
         pytest.skip("set MOE_SURGEON_VLLM_SRC to a vLLM checkout")
     problem = check_static(seam, root)
-    if problem is not None:
-        pytest.fail(_failure_message(seam, problem, f"source tree at {root}"))
+    if problem is None:
+        return
+    if not seam.required:
+        pytest.skip(f"optional seam unavailable here: {problem.detail}")
+    pytest.fail(_failure_message(seam, problem, f"source tree at {root}"))
 
 
 # ----------------------------------------------------------------------
@@ -113,7 +132,10 @@ def test_seam_present_in_source_tree(seam):
 def test_seam_still_holds(seam):
     vllm = pytest.importorskip("vllm", reason="import-level seam check needs vLLM")
     problem = check(seam)
-    if problem is not None:
-        pytest.fail(
-            _failure_message(seam, problem, getattr(vllm, "__version__", "unknown"))
-        )
+    if problem is None:
+        return
+    if not seam.required:
+        pytest.skip(f"optional seam unavailable here: {problem.detail}")
+    pytest.fail(
+        _failure_message(seam, problem, getattr(vllm, "__version__", "unknown"))
+    )
