@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-moe-surgeon"
+version = "0.1.0.dev0"
+description = "Permanent MoE expert pruning and merging for domain-specialised vLLM deployments"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+license = "Apache-2.0"
+
+# Deliberately minimal. The offline surgery pipeline must stay importable
+# without vLLM installed -- see docs/architecture.md. vLLM is an extra.
+dependencies = [
+    "torch",
+    "safetensors",
+    "numpy",
+]
+
+[project.optional-dependencies]
+# The runtime half: telemetry collection and the serve-time disk tier.
+# Pinned narrowly on purpose. Widening the pin is a decision, not a default:
+# tests/test_seams.py is what tells you whether a wider pin is safe.
+runtime = ["vllm>=0.26.1,<0.27"]
+server = ["fastapi", "uvicorn", "pydantic>=2", "pyarrow"]
+dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "pyarrow"]
+
+[project.scripts]
+surgeon = "vllm_moe_surgeon.cli:main"
+
+# Loaded by vLLM in every process that touches the model: EngineArgs.__post_init__,
+# EngineCore.__init__, and WorkerWrapperBase.init_worker. The callable must be
+# re-entrant -- vLLM makes no promise about how many times it runs.
+[project.entry-points."vllm.general_plugins"]
+moe_surgeon = "vllm_moe_surgeon.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# These files are verbatim lifts from the in-tree prototype: only their import
+# lines were rewritten. They are kept byte-comparable against
+# repos/vllm on branch disk-tier-proto so the lift stays auditable and so
+# upstream fixes can still be diffed in. Reformatting them to satisfy rules
+# vLLM's own ruff config does not select would forfeit that for nothing.
+# Delete an entry here once the corresponding file is genuinely ours.
+"src/vllm_moe_surgeon/store/*.py" = ["B007", "B905"]
+"tests/test_expert_cache.py" = ["B905", "I001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# So the suite runs from a bare checkout without an editable install.
+pythonpath = ["src"]
+# pytest-randomly's teardown reseed goes through thinc's fix_random_seed, which
+# rejects the seed it is handed ("Seed must be between 0 and 2**32 - 1"). Both
+# arrive from the ambient site-packages, not from this project, and the failure
+# is in teardown so it masks real results. The suite seeds explicitly via
+# tests/_support.set_random_seed, so random ordering buys us nothing here.
+addopts = ["-p", "no:randomly"]
+markers = [
+    "needs_vllm: requires vLLM importable",
+    "needs_cuda: requires a CUDA device",
+]
