@@ -107,10 +107,60 @@ the model. `telemetry/layers.py` resolves the real MoE layer set from the config
 and `ExpertStats` cross-checks it against the data (a genuine top-k row cannot
 repeat an expert, so an all-identical row is uncaptured).
 
+## Planning
+
+```bash
+surgeon plan --profile profile.npz --core-experts 24 \
+    --checkpoint /path/to/model --similarity-cache sim.npz --out plan.json
+```
+
+The plan is the reviewable artifact: JSON, one line of rationale per expert,
+hand-editable, and re-validated on load. Every expert gets one of three
+placements — `merge_into_core`, `keep_on_disk`, `drop` — so pruning is a
+*placement* problem. Nothing is deleted unless you pass `--drop-share-below`.
+
+Two things the engine refuses to do. It will not build a plan from a profile too
+thin to justify one (drops are irreversible, and a ranking over a handful of
+tokens is noise), and it will never touch a layer that produced no routing rows —
+silence is not evidence that a layer's experts are cold.
+
+### Merging needs permutation-invariant similarity
+
+An FFN expert is unchanged by permuting its intermediate neurons. So two experts
+can be functionally near-identical while their flattened weights look unrelated:
+entrywise cosine similarity is close to meaningless here. `surgery/descriptors.py`
+compares the *row space of `gate_proj`/`up_proj`* and the *column space of
+`down_proj`* instead — subspaces that the permutation provably leaves fixed — via
+the mean squared cosine of principal angles. `tests/test_descriptors.py` asserts
+a permuted copy scores 1.0 where flattened cosine collapses to ~0.
+
+### Measured: OLMoE has no mergeable experts
+
+| layer | median | max | pairs ≥ 0.85 |
+|---|---|---|---|
+| 0 | 0.080 | 0.259 | 0 of 2016 |
+| 7 | 0.033 | 0.289 | 0 of 2016 |
+| 15 | 0.054 | 0.370 | 0 of 2016 |
+
+Rank sweep on layer 0 (H = 2048): as descriptor rank grows 4 → 256, the median
+rises 0.09 → 0.18 while the **max falls** 0.28 → 0.23. If a near-duplicate pair
+existed its similarity would stay high as rank grew; instead the ceiling
+compresses toward the median. There is no redundant pair to merge.
+
+The similarity is still ~10x the random-subspace baseline, so the experts do
+share structure — they are just nowhere near interchangeable. For this model that
+makes the **disk tier the primary mechanism, not the fallback**: the cold tail
+gets retained rather than merged away.
+
+The caveat worth stating: weight-space orthogonality does not prove functional
+distinctness *on a narrow domain*. On a domain corpus the hidden states occupy a
+small subspace, and two experts could act almost identically there while spanning
+different global subspaces. Activation-based similarity would settle it, and this
+result promotes that from optional to necessary if merging is to be pursued.
+
 ## Status
 
-Faz 0 and Faz 1 complete, verified on GB10: 167 tests pass with CUDA and vLLM
-installed.
+Faz 0, 1 and 2 complete, verified on GB10.
 
 First real measurement, OLMoE-1B-7B (64 experts, top-8, 16 MoE layers), 3 prompts
 / 169 tokens: `mean experts/tok` came back exactly 8.000, all 16 layers captured,
