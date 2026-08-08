@@ -92,6 +92,11 @@ class ExpertPlacement:
     action: Action
     tokens: int
     share: float
+    #: Per-layer share of the *importance* the ranking used (rank-1 frequency by
+    #: default), which is what residency should follow. ``share`` remains the raw
+    #: token share, so both are auditable and the tier does not have to re-derive
+    #: the ranking from counts it was told not to trust.
+    importance_share: float = 0.0
     #: For a merge, the surviving expert this one folds into.
     merge_target: int | None = None
     similarity: float | None = None
@@ -108,6 +113,10 @@ class Plan:
     untouched_layers: dict[int, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     provenance: dict[str, Any] = field(default_factory=dict)
+    #: Ablation verdict, written by the quality gate. ``None`` means the plan has
+    #: never been measured, which :func:`~.apply.apply_plan` treats as a refusal
+    #: when the plan deletes anything.
+    gate: dict[str, Any] | None = None
     plan_version: int = PLAN_VERSION
 
     def by_layer(self, layer: int) -> list[ExpertPlacement]:
@@ -126,6 +135,7 @@ class Plan:
             "revision": self.revision,
             "budget": self.budget,
             "provenance": self.provenance,
+            "gate": self.gate,
             "warnings": self.warnings,
             "untouched_layers": {str(k): v for k, v in self.untouched_layers.items()},
             "placements": [asdict(p) for p in self.placements],
@@ -157,6 +167,7 @@ def load_plan(path: str) -> Plan:
         },
         warnings=list(payload.get("warnings") or ()),
         provenance=payload.get("provenance") or {},
+        gate=payload.get("gate"),
     )
     validate_plan(plan)
     return plan
@@ -205,6 +216,19 @@ def validate_plan(plan: Plan) -> None:
     for layer, keep in sorted(survivors.items()):
         if not keep:
             raise ValueError(f"layer {layer} would keep no experts")
+
+
+def deletes_anything(plan: Plan) -> bool:
+    """Whether this plan removes expert capacity at all.
+
+    A plan that only re-places experts (core vs disk) loses nothing, so it needs
+    no quality gate. Only deletions are irreversible.
+    """
+    return any(p.action == "drop" for p in plan.placements)
+
+
+def gate_passed(plan: Plan) -> bool:
+    return bool(plan.gate and plan.gate.get("passed"))
 
 
 def coverage(stats: ExpertStats) -> float:
@@ -303,6 +327,10 @@ def build_plan(
     for slot, layer in enumerate(stats.moe_layers):
         counts = stats.tokens[slot]
         rank_by = importance[slot]
+        rank_total = float(rank_by.sum())
+        rank_share = (
+            rank_by / rank_total if rank_total > 0 else np.zeros_like(rank_by)
+        )
 
         if stats.layer_token_rows[slot] == 0:
             untouched[layer] = (
@@ -317,6 +345,7 @@ def build_plan(
                         action="merge_into_core",
                         tokens=int(counts[expert]),
                         share=float(share[slot, expert]),
+                        importance_share=float(share[slot, expert]),
                         reason="layer untouched: no profile data",
                     )
                 )
@@ -339,7 +368,8 @@ def build_plan(
                     action="merge_into_core",
                     tokens=int(counts[expert]),
                     share=float(share[slot, expert]),
-                    reason=f"rank {order.index(expert) + 1} by token load",
+                    importance_share=float(rank_share[expert]),
+                    reason=f"rank {order.index(expert) + 1} by importance",
                 )
             )
 
@@ -361,6 +391,7 @@ def build_plan(
                         action="drop",
                         tokens=int(counts[expert]),
                         share=expert_share,
+                        importance_share=float(rank_share[expert]),
                         merge_target=target,
                         similarity=sim,
                         reason=(
@@ -383,6 +414,7 @@ def build_plan(
                         action="drop",
                         tokens=int(counts[expert]),
                         share=expert_share,
+                        importance_share=float(rank_share[expert]),
                         similarity=sim,
                         reason=(
                             f"share {expert_share:.5f} < "
@@ -400,6 +432,7 @@ def build_plan(
                         action="drop",
                         tokens=int(counts[expert]),
                         share=expert_share,
+                        importance_share=float(rank_share[expert]),
                         similarity=sim,
                         reason="disk budget exhausted and no merge target",
                     )
@@ -414,6 +447,7 @@ def build_plan(
                     action="keep_on_disk",
                     tokens=int(counts[expert]),
                     share=expert_share,
+                    importance_share=float(rank_share[expert]),
                     similarity=sim,
                     reason="cold tail retained on the disk tier",
                 )

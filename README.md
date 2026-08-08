@@ -248,61 +248,89 @@ saying so in the plan, when they do not. That check is a population-level proxy,
 not a direct test: verifying slot *j* holds the *j*-th best score would need the
 scores, which the public capture does not carry.
 
-### Where that leaves the two paths
+### Surgery serves the tier — it is not an alternative to it
+
+The two are not competing options, and reading the numbers as a contest was a
+framing error on my part. Every measurement above says the tier keeps quality that
+deletion costs, so deletion is not the product. What surgery does is make the tier
+cheaper:
+
+- **A smaller store.** Deleting the experts that genuinely contribute nothing
+  removes their records from disk entirely.
+- **A smaller candidate set.** The cache chooses residency among fewer experts, so
+  the same VRAM capacity covers a larger fraction of what routing asks for.
+- **A better residency prior.** The question "which experts deserve VRAM" is the
+  same question as "which experts contribute most", which is exactly what rank-1
+  importance measures. So the ranking that improved pruning also improves the
+  tier's warm start.
+
+For reference, what deletion alone costs at 40/64, so the tradeoff is on the record:
 
 | approach | experts kept | resident | perplexity |
 |---|---|---|---|
 | delete 24, count-ranked | 40 | 40 | 15.26 (1.57×) |
 | delete 24, **rank-1 ranked** | 40 | 40 | **12.13 (1.25×)** |
-| **disk tier** | **64** | **24** | **~9.71 (same tokens as base)** |
+| **disk tier alone** | **64** | **24** | **~9.71 (same tokens as base)** |
 
-The tier still wins — fewer resident experts *and* better quality, because every
-expert is there when the router asks. But pruning is now a defensible option
-rather than a broken one: 1.25× perplexity for a 34% smaller artifact. Closing the
-remaining gap would need distillation, which this pipeline deliberately does not
-do.
+Deletion is worth doing where an expert is genuinely worthless — it shrinks the
+store and the candidate set for free. It is not worth doing to *replace* the tier.
 
-## Tiering — where the win actually is
+## The quality gate
 
 ```bash
-surgeon tier --plan plan.json --source /path/to/model \
-    --store ./store --hot-experts ./store/hot_experts.json \
-    --model-id org/model
+surgeon gate --plan plan.json --corpus heldout.jsonl --max-ratio 1.3
+surgeon apply --plan plan.json --source model --out ./pruned   # refuses without a pass
 ```
 
-Given the measurements above, this is the phase that matters. Nothing is deleted:
-every expert goes into an NVMe store, and `hot_experts.json` tells the cache which
-ones deserve VRAM. The store holds *all* `num_experts` records — the cache, not
-the store, decides residency.
+Deletion is the one irreversible step in the pipeline, and its cost is measurable
+before it is paid — so `apply_plan` refuses to delete from a plan that has not been
+measured. `surgeon gate` ablates exactly the set the plan drops, compares held-out
+perplexity to baseline, and writes the verdict back into the plan; the verdict then
+travels into the artifact's `surgeon_manifest.json`, so an artifact records what
+measurement authorised it. `--skip-gate` exists and is a deliberate choice.
 
-Building it offline is new. Until now a store could only be produced by booting
-vLLM with `VLLM_MOE_STREAM_LOAD=1` and intercepting the weight loader, which needs
-a GPU and a working engine. Here it is a safetensors-to-records pass: OLMoE's 16
-layers, 6.02 GiB fp8, in **59 seconds** on any host.
+Only deletions are gated. A plan that merely re-places experts between core and
+disk loses nothing to measure, and merges are covered instead by the exactness
+tests in `surgery/align.py`, since zeroing cannot emulate a merge.
 
-`hot_experts.json` fills a seam that has been an empty dict since the prototype —
-`EWMAPolicy.prior`, documented as "a table loaded at boot that biases residency
-toward experts that were hot in a previous run. Empty until seeded." Priors are
-share-proportional rather than rank-based, and deliberately small (worth a few
-cache hits): a boot-time hint that traffic cannot overrule is a pin, not a hint,
-and a test asserts that 50 hits on a cold expert overtake it.
+The ceiling applies to a **pessimistic** bound. On OLMoE the same 40/64 plan scored
+1.303× zeroed and 1.25× once actually applied, so it fails a 1.3 ceiling while the
+real artifact would have passed. Rather than fudge the number, a narrow failure
+carries a note saying exactly that, and the operator raises the ceiling knowingly
+or measures the applied artifact.
 
-### The result that decides the project
+## Cold start: what the residency prior is actually worth
 
-Serving OLMoE from the offline-built store with **24 of 64 experts resident**:
+`store/replay.py` replays a real routing trace through the real cache policies —
+pure numpy, no GPU, no engine — so the prior can be evaluated instead of assumed.
+(It also restores a capability the prototype lost: its docstrings referenced a
+`bench/hit_rate_sweep.py` that is not on the branch.)
 
-| approach | resident | output |
-|---|---|---|
-| base | 64/64 | reference |
-| **disk tier** | **24/64** | **same tokens as base** |
-| hard prune | 40/64 | degenerates into repetition |
+Measured at capacity 24 of 64, priors derived from **gsm8k** and the trace replayed
+from **hellaswag** — a different domain on purpose, since scoring the prior on the
+corpus it came from is scoring the answer key:
 
-Keeping 37.5% resident costs nothing measurable, while *deleting* 37.5% destroys
-the model. Same fraction of experts, opposite outcomes — because the disk tier
-still has every expert when the router asks for one.
+| arm | N=50 | N=100 | N=200 | N=500 | N=2000 | overall |
+|---|---|---|---|---|---|---|
+| cold, LFRU (today's default) | 32.0% | 41.0% | 47.0% | 57.0% | 58.2% | 70.1% |
+| cold, EWMA | 32.0% | 42.0% | 50.0% | 59.6% | 60.5% | 71.3% |
+| **warm, EWMA + prior** | **42.0%** | **49.0%** | **55.0%** | **62.0%** | 61.0% | 71.3% |
 
-(Same tokens under greedy decoding, not a bit-exactness claim: the fp8 store does
-perturb logits, it just did not move any argmax here.)
+Two separable wins, and it matters not to conflate them:
+
+- **The policy is worth more than the prior.** EWMA over LFRU is +2.3 to +4.0
+  points on the cold-start window and +1.2 sustained, for one env var
+  (`VLLM_MOE_CACHE_POLICY=ewma`).
+- **The prior is real but short-lived**: +10.0 points over the first 50 accesses,
+  decaying to +7, +5, +2.4, then nothing by 2000. That is exactly the shape
+  `DEFAULT_SCALE` was specified for — "large enough to decide the cold-start
+  window, small enough that observed traffic overrules it soon after". With
+  capacity 24 and top_k 8 a cache saturates in about 4 tokens per layer, so the
+  window a prior can win is genuinely narrow. It costs nothing to ship, since the
+  manifest is a byproduct of the plan, and should not be oversold.
+
+An earlier version of this measurement used a 2000-access window and found the
+prior worth nothing. That window was simply too long to see it.
 
 ## Cold start, and what static analysis is worth
 

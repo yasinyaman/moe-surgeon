@@ -132,10 +132,16 @@ def load(path: str) -> HotExperts:
 def from_plan(plan: Any, *, scale: float = DEFAULT_SCALE) -> HotExperts:
     """Derive residency hints from a plan.
 
-    The prior is the expert's per-layer *load share* times ``scale``, not its
-    rank: sharing 20% of a layer's traffic should count for more than being
-    third in an almost-flat distribution, and the share carries that where a
-    rank does not.
+    The prior is the expert's per-layer **importance** share times ``scale`` --
+    rank-1 selection frequency by default, not raw token count. "Which experts
+    deserve VRAM" is the same question as "which experts contribute most", and
+    measuring contribution instead of frequency cut pruning cost from 1.57x to
+    1.25x on OLMoE; the tier's warm start is entitled to the same improvement.
+    Share rather than rank, because taking 20% of a layer's importance should count
+    for more than placing third in an almost-flat distribution.
+
+    Falls back to the raw token share when a plan predates the importance field,
+    so an old plan still produces a usable (if worse-ranked) prior.
 
     Experts the plan deletes get no entry -- they will not exist to be resident.
     Experts placed on disk get a share-proportional prior too, just a small one,
@@ -148,7 +154,8 @@ def from_plan(plan: Any, *, scale: float = DEFAULT_SCALE) -> HotExperts:
         if placement.action == "drop":
             continue
         layer_priors = priors.setdefault(placement.layer, {})
-        layer_priors[placement.expert] = float(placement.share) * scale
+        weight = getattr(placement, "importance_share", 0.0) or placement.share
+        layer_priors[placement.expert] = float(weight) * scale
         if placement.action == "merge_into_core":
             core.setdefault(placement.layer, []).append(placement.expert)
 

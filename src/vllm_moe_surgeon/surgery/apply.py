@@ -38,7 +38,7 @@ import numpy as np
 
 from .._logging import init_logger
 from .descriptors import CheckpointIndex
-from .plan import Plan, validate_plan
+from .plan import Plan, deletes_anything, gate_passed, validate_plan
 
 logger = init_logger(__name__)
 
@@ -235,9 +235,24 @@ def apply_plan(
     *,
     shard_bytes: int = DEFAULT_SHARD_BYTES,
     copy_extra_files: bool = True,
+    require_gate: bool = True,
 ) -> dict[str, Any]:
-    """Write the operated-on checkpoint. Returns the manifest."""
+    """Write the operated-on checkpoint. Returns the manifest.
+
+    Refuses to delete experts from a plan that has not passed the ablation gate.
+    Deletion is the one irreversible step in the pipeline, and its cost is
+    measurable before it is paid -- so paying it unmeasured is a choice that has to
+    be made explicitly, not by default.
+    """
     import torch
+
+    if require_gate and deletes_anything(plan) and not gate_passed(plan):
+        verdict = (plan.gate or {}).get("reason", "never measured")
+        raise RuntimeError(
+            "this plan deletes experts but has not passed the quality gate "
+            f"({verdict}). Run `surgeon gate` to measure what the deletions cost, "
+            "or pass require_gate=False to accept an unmeasured plan."
+        )
 
     surgery = derive_surgery(plan)
     index = CheckpointIndex.open(source)
@@ -323,6 +338,7 @@ def apply_plan(
         "plan_budget": plan.budget,
         "plan_provenance": plan.provenance,
         "plan_warnings": plan.warnings,
+        "gate": plan.gate,
         "experts_before": _expert_count(config),
         "experts_after": _expert_count(new_config),
         "top_k_before": _top_k(config),

@@ -116,7 +116,21 @@ def _plan(keep_by_layer, *, merges=None, model="test/model"):
         revision="r1",
         budget={"core_experts": 0},
         placements=placements,
+        # These tests exercise the surgery mechanics, not the gate, so they stand
+        # in for a plan that has already been measured and approved.
+        gate=_passing_gate(),
     )
+
+
+def _passing_gate():
+    return {
+        "passed": True,
+        "baseline_perplexity": 9.71,
+        "perplexity": 12.13,
+        "ratio": 1.25,
+        "max_ratio": 1.3,
+        "reason": "1.25x <= 1.3x",
+    }
 
 
 # ------------------------------------------------------------------- deriving
@@ -320,6 +334,7 @@ def test_merge_of_a_permuted_duplicate_recovers_the_original(tmp_path):
             ExpertPlacement(0, 0, "merge_into_core", tokens=100, share=0.9),
             ExpertPlacement(0, 1, "drop", tokens=100, share=0.1, merge_target=0),
         ],
+        gate=_passing_gate(),
     )
     manifest = apply_plan(plan, str(source), str(out))
     assert manifest["merges_applied"] == 1
@@ -388,3 +403,89 @@ def test_sharding_splits_and_indexes_correctly(tmp_path):
     reopened = CheckpointIndex.open(str(out))
     assert reopened.expert_ids(0) == [0, 1]
     assert reopened.read("model.norm.weight").shape == (H,)
+
+
+# ------------------------------------------------------------------- the gate
+
+
+def test_an_ungated_deletion_is_refused(tmp_path):
+    """Deletion is the one irreversible step, and its cost is measurable first.
+
+    So paying it unmeasured has to be an explicit choice, not the default.
+    """
+    source = tmp_path / "src"
+    out = tmp_path / "out"
+    _make_checkpoint(source)
+
+    plan = _plan({0: {0, 1}, 1: {0, 1}})
+    plan.gate = None
+    with pytest.raises(RuntimeError, match="not passed the quality gate"):
+        apply_plan(plan, str(source), str(out))
+
+
+def test_a_failing_gate_is_refused_and_says_why(tmp_path):
+    source = tmp_path / "src"
+    out = tmp_path / "out"
+    _make_checkpoint(source)
+
+    plan = _plan({0: {0, 1}, 1: {0, 1}})
+    plan.gate = {"passed": False, "reason": "2.80x > 1.3x", "ratio": 2.8}
+    with pytest.raises(RuntimeError, match="2.80x > 1.3x"):
+        apply_plan(plan, str(source), str(out))
+
+
+def test_the_gate_can_be_waived_explicitly(tmp_path):
+    source = tmp_path / "src"
+    out = tmp_path / "out"
+    _make_checkpoint(source)
+
+    plan = _plan({0: {0, 1}, 1: {0, 1}})
+    plan.gate = None
+    manifest = apply_plan(plan, str(source), str(out), require_gate=False)
+    assert manifest["experts_after"] == 2
+    assert manifest["gate"] is None
+
+
+def test_a_plan_that_deletes_nothing_needs_no_gate(tmp_path):
+    """Re-placing experts between core and disk loses nothing to measure."""
+    from vllm_moe_surgeon.surgery.plan import deletes_anything
+
+    source = tmp_path / "src"
+    out = tmp_path / "out"
+    _make_checkpoint(source)
+
+    placements = []
+    for layer in (0, 1):
+        for expert in range(NUM_EXPERTS):
+            action = "merge_into_core" if expert < 2 else "keep_on_disk"
+            placements.append(
+                ExpertPlacement(layer, expert, action, tokens=100, share=0.1)
+            )
+    plan = Plan(model="m", revision=None, budget={}, placements=placements)
+    assert not deletes_anything(plan)
+
+    manifest = apply_plan(plan, str(source), str(out))
+    assert manifest["experts_after"] == NUM_EXPERTS
+
+
+def test_the_gate_verdict_travels_into_the_manifest(tmp_path):
+    """Provenance: the artifact records what measurement authorised it."""
+    source = tmp_path / "src"
+    out = tmp_path / "out"
+    _make_checkpoint(source)
+
+    manifest = apply_plan(_plan({0: {0, 1}, 1: {0, 1}}), str(source), str(out))
+    assert manifest["gate"]["passed"] is True
+    assert manifest["gate"]["ratio"] == 1.25
+
+
+def test_gate_survives_a_plan_roundtrip(tmp_path):
+    from vllm_moe_surgeon.surgery import load_plan
+    from vllm_moe_surgeon.surgery.plan import gate_passed
+
+    plan = _plan({0: {0, 1}, 1: {0, 1}})
+    path = str(tmp_path / "plan.json")
+    plan.save(path)
+    back = load_plan(path)
+    assert gate_passed(back)
+    assert back.gate["ratio"] == 1.25

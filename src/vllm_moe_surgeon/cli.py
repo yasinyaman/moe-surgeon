@@ -110,6 +110,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         args.source,
         args.out,
         shard_bytes=int(args.shard_gb * 1024**3),
+        require_gate=not args.skip_gate,
     )
     print(f"experts: {manifest['experts_before']} -> {manifest['experts_after']}")
     print(f"top_k:   {manifest['top_k_before']} -> {manifest['top_k_after']}")
@@ -225,6 +226,39 @@ def _cmd_ablate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_gate(args: argparse.Namespace) -> int:
+    from .compat.ablation import gate_plan
+    from .compat.profile_runner import iter_prompts_from_jsonl
+    from .surgery import load_plan
+
+    plan = load_plan(args.plan)
+    prompts = list(iter_prompts_from_jsonl(args.corpus, args.field))
+    if args.limit:
+        prompts = prompts[: args.limit]
+
+    verdict = gate_plan(
+        plan,
+        prompts,
+        max_ratio=args.max_ratio,
+        model=args.model,
+        llm_kwargs=json.loads(args.llm_kwargs) if args.llm_kwargs else None,
+    )
+    plan.gate = verdict
+    plan.save(args.plan)
+
+    mark = "PASS" if verdict["passed"] else "FAIL"
+    print(f"verdict:    {mark}  ({verdict['reason']})")
+    if "perplexity" in verdict:
+        print(f"baseline:   {verdict['baseline_perplexity']:.4f}")
+        print(f"ablated:    {verdict['perplexity']:.4f}")
+        print(f"tokens:     {verdict.get('held_out_tokens')}")
+    if verdict.get("note"):
+        print()
+        print(f"note: {verdict['note']}")
+    print(f"\nwritten to  {args.plan}")
+    return 0 if verdict["passed"] else 1
+
+
 def _cmd_seams(args: argparse.Namespace) -> int:
     from .compat.seams import SEAMS, check, check_all_static
 
@@ -303,6 +337,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source", required=True, help="the base model directory")
     p.add_argument("--out", required=True, help="output checkpoint directory")
     p.add_argument("--shard-gb", type=float, default=4.0)
+    p.add_argument(
+        "--skip-gate",
+        action="store_true",
+        help="apply an unmeasured plan (deletion is irreversible)",
+    )
     p.set_defaults(func=_cmd_apply)
 
     p = sub.add_parser("tier", help="build the disk store and the residency hint")
@@ -365,6 +404,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--llm-kwargs", help="extra LLM() kwargs as JSON")
     p.set_defaults(func=_cmd_ablate)
+
+    p = sub.add_parser(
+        "gate", help="measure what a plan's deletions cost, and record the verdict"
+    )
+    p.add_argument(
+        "--plan", required=True, help="plan.json; the verdict is written back"
+    )
+    p.add_argument("--corpus", required=True, help="HELD-OUT JSONL to score on")
+    p.add_argument("--field", default="text")
+    p.add_argument("--limit", type=int)
+    p.add_argument("--model", help="override the model named in the plan")
+    p.add_argument("--max-ratio", type=float, default=1.3, help="perplexity ceiling")
+    p.add_argument("--llm-kwargs", help="extra LLM() kwargs as JSON")
+    p.set_defaults(func=_cmd_gate)
 
     p = sub.add_parser("seams", help="check the vLLM seams this package holds")
     p.add_argument("--source", help="check a vLLM source tree instead of the install")

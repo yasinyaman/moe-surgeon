@@ -296,3 +296,82 @@ def arms_from_profile(
     if include_hot_control:
         arms.append((f"hottest {drop}/{stats.num_experts} (control)", hot))
     return arms
+
+
+def gate_plan(
+    plan: Any,
+    prompts: Sequence[str],
+    *,
+    max_ratio: float = 1.3,
+    model: str | None = None,
+    llm_kwargs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Measure what a plan's deletions cost, and return a gate verdict.
+
+    Ablates exactly the set the plan drops -- one arm, one model load -- and
+    compares held-out perplexity against the unablated baseline. The verdict goes
+    into ``plan.gate`` and :func:`~..surgery.apply.apply_plan` refuses to delete
+    without it.
+
+    Zeroing is pessimistic relative to the deletion the plan will actually perform
+    (the renormalised gate mass flows to survivors instead of being discarded), so
+    a plan that passes here will do at least as well once applied. Measured on
+    OLMoE: zeroed 12.65 vs deleted 12.13.
+
+    Only deletions are gated. Merges change weights in a way zeroing cannot
+    emulate, and are covered instead by the exactness tests in
+    :mod:`..surgery.align`.
+    """
+    dropped: dict[int, list[int]] = {}
+    for placement in plan.placements:
+        if placement.action == "drop":
+            dropped.setdefault(placement.layer, []).append(placement.expert)
+
+    if not dropped:
+        return {
+            "passed": True,
+            "reason": "plan deletes nothing, so there is nothing to measure",
+            "ratio": 1.0,
+            "max_ratio": max_ratio,
+        }
+
+    study = run_study(
+        model or plan.model,
+        prompts,
+        [("plan deletions", dropped)],
+        llm_kwargs=llm_kwargs,
+    )
+    arm = study.arms[0]
+    base = study.baseline.perplexity
+    ratio = arm.perplexity / base if base > 0 else float("inf")
+    passed = ratio <= max_ratio
+
+    # The ceiling is applied to a deliberately pessimistic measurement, so a plan
+    # can fail by a hair and still be fine once applied -- on OLMoE the deletion
+    # came in about 4% below its zeroed bound (12.13 vs 12.65). Say so rather than
+    # letting a narrow FAIL read as a verdict on the plan itself.
+    note = None
+    if not passed and ratio <= max_ratio * 1.1:
+        note = (
+            f"failed narrowly: {ratio:.3f}x against a {max_ratio}x ceiling, and "
+            "this measurement zeroes the experts, which is pessimistic relative to "
+            "the deletion the plan performs (the renormalised gate mass is "
+            "discarded rather than redistributed). Measured on OLMoE the applied "
+            "checkpoint scored 4% better than its zeroed bound. Either raise the "
+            "ceiling knowingly or measure the applied artifact."
+        )
+
+    verdict = {
+        "passed": bool(passed),
+        "reason": f"{ratio:.3f}x {'<=' if passed else '>'} {max_ratio}x",
+        "baseline_perplexity": base,
+        "perplexity": arm.perplexity,
+        "ratio": ratio,
+        "max_ratio": max_ratio,
+        "held_out_tokens": study.baseline.tokens,
+        "experts_zeroed": arm.experts_zeroed,
+        "method": "zeroed weights, router held fixed (pessimistic vs deletion)",
+    }
+    if note:
+        verdict["note"] = note
+    return verdict
