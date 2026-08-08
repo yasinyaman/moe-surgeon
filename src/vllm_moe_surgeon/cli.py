@@ -120,6 +120,43 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_tier(args: argparse.Namespace) -> int:
+    from . import hot_experts
+    from .surgery import load_plan
+    from .surgery.tiered import build_store
+
+    plan = load_plan(args.plan)
+    hints = hot_experts.from_plan(plan, scale=args.prior_scale)
+
+    layers = sorted(hints.priors)
+    summary = build_store(
+        args.source,
+        args.store,
+        layers,
+        model_id=args.model_id or args.source,
+        revision=plan.revision,
+        fp8=not args.no_fp8,
+    )
+    hints.save(args.hot_experts)
+
+    core = sum(len(v) for v in hints.core.values())
+    total = sum(len(v) for v in hints.priors.values())
+    print(f"store:   {summary['directory']}")
+    print(f"layers:  {len(summary['layers'])}  fp8={summary['fp8']}")
+    print(f"size:    {summary['bytes'] / 1024**3:.2f} GiB")
+    print(f"hints:   {core} core of {total} resident-eligible experts")
+    print(f"wrote    {args.hot_experts}")
+    print()
+    print("serve with:")
+    print(f"  VLLM_MOE_DISK_STORE_DIR={summary['directory']} \\")
+    if summary["fp8"]:
+        print("  VLLM_MOE_DISK_STORE_FP8=1 \\")
+    print("  VLLM_MOE_CACHE_POLICY=ewma \\")
+    print(f"  VLLM_MOE_HOT_EXPERTS={args.hot_experts} \\")
+    print("  VLLM_MOE_RAM_CACHE=<records> --moe-expert-cache-size <slots>")
+    return 0
+
+
 def _cmd_seams(args: argparse.Namespace) -> int:
     from .compat.seams import SEAMS, check, check_all_static
 
@@ -199,6 +236,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", required=True, help="output checkpoint directory")
     p.add_argument("--shard-gb", type=float, default=4.0)
     p.set_defaults(func=_cmd_apply)
+
+    p = sub.add_parser("tier", help="build the disk store and the residency hint")
+    p.add_argument("--plan", required=True)
+    p.add_argument("--source", required=True, help="checkpoint to build the store from")
+    p.add_argument("--store", required=True, help="output store directory")
+    p.add_argument("--hot-experts", required=True, help="output hot_experts.json")
+    p.add_argument(
+        "--model-id",
+        help="identity recorded in the store; must match what vLLM will report",
+    )
+    p.add_argument("--prior-scale", type=float, default=8.0)
+    p.add_argument("--no-fp8", action="store_true", help="full-precision records")
+    p.set_defaults(func=_cmd_tier)
 
     p = sub.add_parser("seams", help="check the vLLM seams this package holds")
     p.add_argument("--source", help="check a vLLM source tree instead of the install")

@@ -205,9 +205,51 @@ tier to decide what stays resident.** Artifact B is not the fallback, it is the
 answer. Hard deletion would need distillation to recover, which this pipeline
 deliberately does not do.
 
+## Tiering — where the win actually is
+
+```bash
+surgeon tier --plan plan.json --source /path/to/model \
+    --store ./store --hot-experts ./store/hot_experts.json \
+    --model-id org/model
+```
+
+Given the measurements above, this is the phase that matters. Nothing is deleted:
+every expert goes into an NVMe store, and `hot_experts.json` tells the cache which
+ones deserve VRAM. The store holds *all* `num_experts` records — the cache, not
+the store, decides residency.
+
+Building it offline is new. Until now a store could only be produced by booting
+vLLM with `VLLM_MOE_STREAM_LOAD=1` and intercepting the weight loader, which needs
+a GPU and a working engine. Here it is a safetensors-to-records pass: OLMoE's 16
+layers, 6.02 GiB fp8, in **59 seconds** on any host.
+
+`hot_experts.json` fills a seam that has been an empty dict since the prototype —
+`EWMAPolicy.prior`, documented as "a table loaded at boot that biases residency
+toward experts that were hot in a previous run. Empty until seeded." Priors are
+share-proportional rather than rank-based, and deliberately small (worth a few
+cache hits): a boot-time hint that traffic cannot overrule is a pin, not a hint,
+and a test asserts that 50 hits on a cold expert overtake it.
+
+### The result that decides the project
+
+Serving OLMoE from the offline-built store with **24 of 64 experts resident**:
+
+| approach | resident | output |
+|---|---|---|
+| base | 64/64 | reference |
+| **disk tier** | **24/64** | **same tokens as base** |
+| hard prune | 40/64 | degenerates into repetition |
+
+Keeping 37.5% resident costs nothing measurable, while *deleting* 37.5% destroys
+the model. Same fraction of experts, opposite outcomes — because the disk tier
+still has every expert when the router asks for one.
+
+(Same tokens under greedy decoding, not a bit-exactness claim: the fp8 store does
+perturb logits, it just did not move any argmax here.)
+
 ## Status
 
-Faz 0–3 complete, verified on GB10: 151 tests locally, 210 with CUDA and vLLM.
+Faz 0–4 complete, verified on GB10: 176 tests locally, 211 with CUDA and vLLM.
 
 First real measurement, OLMoE-1B-7B (64 experts, top-8, 16 MoE layers), 3 prompts
 / 169 tokens: `mean experts/tok` came back exactly 8.000, all 16 layers captured,
