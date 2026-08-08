@@ -183,6 +183,22 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_budget(args: argparse.Namespace) -> int:
+    from .surgery.budget import analyze, report
+
+    geometry = analyze(args.checkpoint)
+    print(
+        report(
+            geometry,
+            vram_gib=args.vram,
+            fp8_store=not args.no_fp8,
+            kv_cache_gib=args.kv_reserve,
+            model=args.model or args.checkpoint,
+        )
+    )
+    return 0
+
+
 def _cmd_seams(args: argparse.Namespace) -> int:
     from .compat.seams import SEAMS, check, check_all_static
 
@@ -291,6 +307,16 @@ def main(argv: list[str] | None = None) -> int:
         help="add per-expert SVD spectra (slow: tens of seconds per layer)",
     )
     p.set_defaults(func=_cmd_inspect)
+
+    p = sub.add_parser(
+        "budget", help="least GPU memory this model can be served in (headers only)"
+    )
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--model", help="name to print")
+    p.add_argument("--vram", type=float, help="target VRAM in GiB; solves for capacity")
+    p.add_argument("--kv-reserve", type=float, default=1.0, help="KV cache GiB")
+    p.add_argument("--no-fp8", action="store_true", help="full-precision store")
+    p.set_defaults(func=_cmd_budget)
 
     p = sub.add_parser("seams", help="check the vLLM seams this package holds")
     p.add_argument("--source", help="check a vLLM source tree instead of the install")
