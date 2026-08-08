@@ -32,6 +32,42 @@ reason we hold it. `tests/test_seams.py` checks each one. On an upgrade, that te
 fails first — before a worker does, and with a message naming the symbol that
 moved.
 
+## The tier, served from outside the vLLM tree
+
+```bash
+pip install -e .   # registers a vllm.general_plugins entry point
+vllm serve allenai/OLMoE-1B-7B-0924 --enforce-eager \
+  --additional-config '{"surgeon": {"expert_cache_size": 24,
+      "store_dir": "./store", "ram_cache": 48, "fp8_store": true}}'
+```
+
+This is the claim the package exists to make good on. The prototype reaches the same
+behaviour with ~800 lines of hooks threaded through upstream files; `compat/runtime.py`
+does it with **one substituted quantisation method**, registered from a plugin,
+touching no vLLM source. The simplification that made it small: the method already
+receives `layer`, so the provider is built and stashed from inside it — no
+`RoutedExperts` subclass, which drops the most churn-prone seam in the table.
+
+Verified on GB10 against the in-tree implementation it replaces. In the same
+residency shape (full-DRAM, no fp8) the out-of-tree tier is **token-identical to both
+the in-tree tier and the untiered baseline**. With the fp8 store one prompt of three
+diverges, which is quantisation and not the port.
+
+Engagement is asserted, not inferred: 16/16 MoE layers hold a provider, 16/16 have
+their full `w13_weight` released to `numel() == 0`, and layer 0 logged 128 hits /
+93 misses. That check matters — the first attempt registered under the op name
+`unquantized_fused_moe` when `CustomOp.__new__` looks up the *class* name, so the
+substitution silently no-opped and **the tokens still matched**. Matching output was
+not evidence of anything.
+
+Activation is deliberately not `--moe-expert-cache-size`, which drives the in-tree
+path; the two can therefore run side by side and be compared.
+
+Scope, stated rather than implied: unquantized checkpoints, `--enforce-eager`
+required, and streaming the checkpoint into the store is not ported. fp8 checkpoints
+still need `Fp8MoEMethod` substituted, and its cache must be installed before
+`get_fused_moe_quant_config` captures the scale tensors.
+
 ## Three axes, and why nothing is judged on one
 
 Every method is measured on **feasibility** (does it run, on how small a device),
@@ -65,11 +101,10 @@ at all, and halves disk, host RAM and transfer bytes.
 |---|---|---|
 | `compat/` | **yes** | the seam layer; the only place that knows vLLM internals |
 | `plugin.py` | **yes** | the `vllm.general_plugins` entry point |
-| `telemetry/` | via compat | per-expert usage recording during a forward pass |
-| `store/` | no | the NVMe → pinned RAM → VRAM expert tier |
-| `surgery/` | no | prune, cluster, permutation-align, merge, router refit |
-| `writer/` | no | safetensors + `config.json` + provenance manifest |
-| `server/` | no | the job server |
+| `telemetry/` | no | aggregation of vLLM's routed-experts capture |
+| `store/` | no | the NVMe → pinned RAM → VRAM expert tier, plus its replay simulator |
+| `surgery/` | no | inspect, budget, plan, align, merge, apply, tier |
+| `server/` | no | the job server (not built yet) |
 
 `store/` is a verbatim lift from the prototype branch — only its imports were
 rewritten (`vllm.envs` → `env.py`, `vllm.logger` → `_logging.py`). It is kept

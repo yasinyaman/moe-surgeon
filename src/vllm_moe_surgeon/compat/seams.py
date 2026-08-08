@@ -78,7 +78,11 @@ SEAMS: tuple[Seam, ...] = (
         why=(
             "Substitutes UnquantizedFusedMoEMethod so the expert cache can change "
             "where expert weights are allocated and what apply() dispatches to. "
-            "Without it the unquantized MoE path needs an in-tree patch."
+            "Without it the unquantized MoE path needs an in-tree patch. "
+            "CONTRACT: op_registry_oot is keyed by the *class* name, because "
+            "CustomOp.__new__ looks up cls.__name__ -- not by the op name given to "
+            "@CustomOp.register. Registering under the op name puts the class where "
+            "nothing looks, and the substitution no-ops silently."
         ),
         params=("name",),
     ),
