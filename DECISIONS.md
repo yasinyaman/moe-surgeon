@@ -77,21 +77,36 @@ decide are measurable before committing:
 | has mergeable pairs (similarity ≥ merge threshold) | merge instead of deleting — no capacity lost |
 | carries `e_score_correction_bias` | a static popularity prior is available with no profiling |
 | has shared/always-on experts | they are fixed VRAM cost, never cached — `surgeon budget` accounts for them separately |
-| ships pre-stacked expert tensors (IBM Granite) | **not yet supported** — `CheckpointIndex` reads per-expert naming only |
+| ships pre-stacked expert tensors (IBM Granite) | reading is supported (inspect, budget, tier); `apply` refuses to write that layout back |
 
 `surgeon inspect` and `surgeon budget` between them report every property in the
-second table without a GPU, so the strategy can be chosen before any weight moves.
-Automating that choice — a `surgeon recommend` that reads the two reports and a
-target and emits the configuration — is the obvious next step and is not built yet.
+second table without a GPU, and **`surgeon recommend` applies both tables**:
+
+```bash
+surgeon recommend --checkpoint model --vram 3.68 --profile p.npz --similarity-cache sim.npz
+```
+
+On OLMoE against a 3.68 GiB target it reproduces this session's conclusions from the
+measurements alone — tier mandatory at capacity 10, delete nothing (no dead tail),
+merge nothing (0.370 < 0.85), seed the prior, use EWMA — and lists what it could not
+decide rather than guessing. Deletion quality is always deferred to `surgeon gate`.
 
 ## Open
 
-- **Granite's stacked layout** (`block_sparse_moe.input_linear`) is unsupported.
-  Ironically its fused form is closer to the store's `w13` layout than the
-  per-expert convention is.
+- **Faz 5, the job server.** `server/` is empty. The CLI covers every stage, so this
+  is packaging rather than capability — a FastAPI wrapper that runs the stages as
+  subprocesses and keeps an artifact registry.
+- **Writing a stacked (Granite) checkpoint.** Reading is supported; `apply` refuses
+  to write one, because emitting per-expert tensors for a loader expecting stacked
+  ones fails to load and emitting them under stacked names loads wrong.
 - **Peak-VRAM measurement** in `bench.py` reports the preallocated pool on a
   unified-memory device, so the feasibility axis leans on `surgeon budget`'s
   arithmetic rather than a measured minimum. A boot-bisection would close it.
 - **Merging is unexercised on real candidates.** The machinery is exact on
   synthetic ones; no model measured so far offers a real pair.
-- **`surgeon recommend`** — the strategy selector the tables above describe.
+- **fp8 and streaming load in the out-of-tree runtime.** `compat/runtime.py` covers
+  the unquantized path with `--enforce-eager`; fp8 needs `Fp8MoEMethod` substituted
+  with the cache installed before the quant config captures scale tensors.
+- **Router least-squares refit** for merged clusters. The gate has `bias=False`, so a
+  merged cluster's combined selection mass has no additive term to live in; the
+  current rewrite is a usage-weighted mean.

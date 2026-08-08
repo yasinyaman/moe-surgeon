@@ -259,6 +259,41 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     return 0 if verdict["passed"] else 1
 
 
+def _cmd_recommend(args: argparse.Namespace) -> int:
+    from .surgery.budget import analyze
+    from .surgery.recommend import recommend
+
+    stats = None
+    if args.profile:
+        from .telemetry import load
+
+        stats, _ = load(args.profile)
+
+    max_similarity = None
+    if args.similarity_cache and os.path.exists(args.similarity_cache):
+        import numpy as np
+
+        with np.load(args.similarity_cache) as data:
+            best = 0.0
+            for key in data.files:
+                matrix = data[key]
+                off = matrix[~np.eye(matrix.shape[0], dtype=bool)]
+                best = max(best, float(off.max()))
+        max_similarity = best
+
+    rec = recommend(
+        analyze(args.checkpoint),
+        vram_gib=args.vram,
+        kv_cache_gib=args.kv_reserve,
+        stats=stats,
+        max_similarity=max_similarity,
+        restarts_often=args.restarts_often,
+        latency_sensitive=args.latency_sensitive,
+    )
+    print(rec.report())
+    return 0
+
+
 def _cmd_seams(args: argparse.Namespace) -> int:
     from .compat.seams import SEAMS, check, check_all_static
 
@@ -418,6 +453,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-ratio", type=float, default=1.3, help="perplexity ceiling")
     p.add_argument("--llm-kwargs", help="extra LLM() kwargs as JSON")
     p.set_defaults(func=_cmd_gate)
+
+    p = sub.add_parser(
+        "recommend", help="choose a strategy for a target, from measured properties"
+    )
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--vram", type=float, help="target VRAM in GiB")
+    p.add_argument("--kv-reserve", type=float, default=1.0)
+    p.add_argument("--profile", help="profile .npz; without it nothing is called cold")
+    p.add_argument("--similarity-cache", help="sim .npz; without it no merge is judged")
+    p.add_argument("--restarts-often", action="store_true")
+    p.add_argument("--latency-sensitive", action="store_true")
+    p.set_defaults(func=_cmd_recommend)
 
     p = sub.add_parser("seams", help="check the vLLM seams this package holds")
     p.add_argument("--source", help="check a vLLM source tree instead of the install")

@@ -38,9 +38,12 @@ from .plan import (
     summarize_plan,
     validate_plan,
 )
+from .recommend import Recommendation, recommend
 
 __all__ = [
     "Budget",
+    "Recommendation",
+    "recommend",
     "CheckpointGeometry",
     "TierPlan",
     "floor_plan",

@@ -458,7 +458,12 @@ are *more* orthogonal than OLMoE's.
 
 ## Status
 
-Faz 0–4 complete, verified on GB10: 199 tests locally, 234 with CUDA and vLLM.
+Faz 0–4 complete and the out-of-tree runtime verified against the implementation it
+replaces. Faz 5 (the job server) is the one phase not started; `DECISIONS.md` lists
+the remaining open items with reasons.
+
+Three expert-storage layouts read (per-expert and stacked), three model families
+measured (OLMoE, Qwen3-30B, DeepSeek-V2-Lite, Granite).
 
 First real measurement, OLMoE-1B-7B (64 experts, top-8, 16 MoE layers), 3 prompts
 / 169 tokens: `mean experts/tok` came back exactly 8.000, all 16 layers captured,
