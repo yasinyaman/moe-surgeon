@@ -1,0 +1,97 @@
+# Decision register
+
+Every method here is judged on **three axes**, never one:
+
+| axis | what it asks | how it is measured |
+|---|---|---|
+| **feasibility** | does it run, and on how small a device | `surgeon budget` (validated arithmetic) + measured load time |
+| **speed** | tokens per second | `compat/bench.py`, short prompts / long generations |
+| **accuracy** | held-out perplexity | `compat/ablation.py`, the same metric the gate uses |
+
+**A method that loses on one axis is not eliminated if it wins on another.** Most
+of what follows would have been thrown away under a single-number verdict. The
+register exists so the axis a method wins on is recorded next to the axis it loses
+on, and so a later reader can tell "measured useless" from "useless for this one
+purpose".
+
+All numbers are OLMoE-1B-7B (64 experts, top-8, 16 MoE layers) on GB10, held-out
+gsm8k[400:500], baseline perplexity 9.703. `n/a` means not measured, not zero.
+
+## Measured configurations
+
+| configuration | load | decode | perplexity |
+|---|---|---|---|
+| baseline, 64 experts resident | 98.6 s | 689.4/s | 9.703 |
+| disk tier, 24/64 resident | 45.2 s | 265.1/s | 9.734 (1.003×) |
+| pruned to 40, no tier | 83.4 s | 695.1/s | 12.115 (1.249×) |
+| **pruned to 40 + tier, 24/40 resident** | **44.5 s** | **350.8/s** | 12.145 (1.252×) |
+
+Two readings worth keeping:
+
+- **Surgery supports the tier.** Pruned+tier decodes **1.32× faster than tier
+  alone** at the same capacity, because a 24-slot cache covers more of a 40-expert
+  candidate set than a 64-expert one. This is why deletion is worth doing even
+  though the tier alone has better accuracy — they are not competing options.
+- **The tier halves load time** (45 s vs 99 s), which was not anticipated: expert
+  weights stream to the store instead of being staged onto the device. A
+  feasibility win that no accuracy or throughput number would have surfaced.
+
+## Per-method verdicts
+
+| method | feasibility | speed | accuracy | verdict |
+|---|---|---|---|---|
+| **disk tier** | **strong win**: runs a 12.9 GiB model with a 2.39 GiB floor; halves load time | **loses**: 0.38× decode | neutral: 1.003× | **keep** — the only method that changes what is possible at all |
+| **pruning (rank-1 ranked)** | win: 34% smaller artifact and store; shrinks the tier's candidate set | neutral alone (1.01×); **win in composition** (1.32× over tier alone) | loses: 1.249× | **keep** — its speed win only appears *with* the tier |
+| **rank-1 importance** vs token count | n/a | n/a | **strong win**: 1.57× → 1.25× | **keep, as default** |
+| **permutation-aligned merging** | n/a | n/a | not exercised: no mergeable pair in OLMoE (max similarity 0.37 of 64512) or Qwen3-30B (0.401 of 81280) | **keep the machinery** — tested exactly, and redundancy is a per-model property; absent here is not absent everywhere |
+| **residency prior** (`hot_experts.json`) | **win, narrow**: +10.0 pts hit rate over the first 50 accesses, decaying to 0 by 2000 | negligible in steady state | n/a | **keep** — free (a byproduct of the plan) and confined to cold start; do not oversell |
+| **EWMA cache policy** vs LFRU | win: +2.3…+4.0 pts on the cold-start window | win: +1.2 pts sustained hit rate | n/a | **keep** — one env var, wins on two axes |
+| **fp8 store** | **loses on VRAM**: none saved, the provider dequantizes into model-dtype slots | win: halves disk, host RAM and transfer bytes | small loss: quantization error, no argmax moved in testing | **keep** — the axis it wins on is not the one people expect |
+| **static gate geometry** (row norm, cosine) | n/a | n/a | **loses**: ρ ≈ 0.00 against measured load and co-occurrence | **drop as a selection signal** — but see below |
+| **static byte accounting** (`surgeon budget`) | **strong win**: answers "least VRAM" in 1.5 s with no GPU | n/a | n/a | **keep** — the same static analysis, pointed at sizing instead of selection |
+| **`e_score_correction_bias`** | n/a | n/a | untested: absent from every accessible small MoE | **keep detection** — principled (a *learned* balancing term), just unavailable here |
+| **cross-domain profile** as a cold-start prior | win: ρ +0.43, top-24 overlap 54% vs 37.5% random | n/a | n/a | **keep** — dominates static analysis, and profiling costs minutes |
+| **block dedup across experts** | n/a | n/a | n/a | **drop** — untested, and near-orthogonality makes duplicate blocks implausible in trained bf16 experts |
+| **correlation-driven disk layout** | n/a | no headroom: 6.0 MiB records already reach 93% of the NVMe ceiling on one thread | n/a | **drop** — the lever is already banked by the record-stride design |
+
+The two static-signal rows are the clearest case for judging per axis. Gate
+geometry is worthless for *choosing* experts and genuinely useful for *sizing* them
+— the same analysis, kept or dropped depending on which question it is asked.
+
+## Choosing a strategy per target and per model
+
+Different targets and different models want different subsets. The properties that
+decide are measurable before committing:
+
+| if the target… | then |
+|---|---|
+| has less VRAM than the bit-exact floor (`surgeon budget --vram`) | the tier is mandatory, not optional |
+| is latency-sensitive and VRAM-rich | skip the tier; pruning alone costs no throughput |
+| is VRAM-constrained *and* latency-sensitive | prune **and** tier — the composition recovers 1.32× over tier alone |
+| restarts often | seed the residency prior and set `VLLM_MOE_CACHE_POLICY=ewma` |
+
+| if the model… | then |
+|---|---|
+| has a genuine dead tail (coldest expert ≪ uniform) | deletion is cheap; measure with `surgeon gate` |
+| has no dead tail (OLMoE: coldest is 0.5% vs 1.56% uniform) | prefer the tier; delete only under a gate |
+| has mergeable pairs (similarity ≥ merge threshold) | merge instead of deleting — no capacity lost |
+| carries `e_score_correction_bias` | a static popularity prior is available with no profiling |
+| has shared/always-on experts | they are fixed VRAM cost, never cached — `surgeon budget` accounts for them separately |
+| ships pre-stacked expert tensors (IBM Granite) | **not yet supported** — `CheckpointIndex` reads per-expert naming only |
+
+`surgeon inspect` and `surgeon budget` between them report every property in the
+second table without a GPU, so the strategy can be chosen before any weight moves.
+Automating that choice — a `surgeon recommend` that reads the two reports and a
+target and emits the configuration — is the obvious next step and is not built yet.
+
+## Open
+
+- **Granite's stacked layout** (`block_sparse_moe.input_linear`) is unsupported.
+  Ironically its fused form is closer to the store's `w13` layout than the
+  per-expert convention is.
+- **Peak-VRAM measurement** in `bench.py` reports the preallocated pool on a
+  unified-memory device, so the feasibility axis leans on `surgeon budget`'s
+  arithmetic rather than a measured minimum. A boot-bisection would close it.
+- **Merging is unexercised on real candidates.** The machinery is exact on
+  synthetic ones; no model measured so far offers a real pair.
+- **`surgeon recommend`** — the strategy selector the tables above describe.

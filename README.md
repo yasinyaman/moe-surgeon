@@ -32,6 +32,33 @@ reason we hold it. `tests/test_seams.py` checks each one. On an upgrade, that te
 fails first — before a worker does, and with a message naming the symbol that
 moved.
 
+## Three axes, and why nothing is judged on one
+
+Every method is measured on **feasibility** (does it run, on how small a device),
+**speed** (tokens/s) and **accuracy** (held-out perplexity) — and a method that
+loses on one axis is kept if it wins on another. [DECISIONS.md](DECISIONS.md) is the
+register, with the per-axis verdict for each method and the rules for choosing a
+strategy per target and per model.
+
+Measured on OLMoE-1B-7B, GB10, held-out gsm8k:
+
+| configuration | load | decode | perplexity |
+|---|---|---|---|
+| baseline, 64 resident | 98.6 s | 689.4/s | 9.703 |
+| disk tier, 24/64 resident | 45.2 s | 265.1/s | 9.734 (1.003×) |
+| pruned to 40, no tier | 83.4 s | 695.1/s | 12.115 (1.249×) |
+| **pruned 40 + tier, 24/40** | **44.5 s** | **350.8/s** | 12.145 (1.252×) |
+
+The fourth row is why surgery exists: **pruned+tier decodes 1.32× faster than tier
+alone** at the same capacity, because a 24-slot cache covers more of a 40-expert
+candidate set than a 64-expert one. And the tier **halves load time**, which no
+accuracy or throughput number would have surfaced.
+
+Two examples of the per-axis rule doing real work. Static gate geometry is
+worthless for *choosing* experts (ρ ≈ 0.00) and genuinely useful for *sizing* them
+(`surgeon budget`) — same analysis, different question. An fp8 store saves no VRAM
+at all, and halves disk, host RAM and transfer bytes.
+
 ## Layout
 
 | path | imports vLLM | what it is |
