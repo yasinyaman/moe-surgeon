@@ -247,9 +247,71 @@ still has every expert when the router asks for one.
 (Same tokens under greedy decoding, not a bit-exactness claim: the fp8 store does
 perturb logits, it just did not move any argmax here.)
 
+## Cold start, and what static analysis is worth
+
+```bash
+surgeon inspect --checkpoint /path/to/model --profile profile.npz
+```
+
+A cold cache learns residency from traffic, so every restart pays misses on
+experts a previous run already knew were hot. Static analysis of the router is the
+tempting fix — free, no engine, no data. `surgeon inspect` reports which signals a
+checkpoint carries **and scores each one against a measured profile**, because
+whether a signal carries information is a property of the model, not of the idea.
+
+Measured on OLMoE (16 layers, 400-prompt profile), mean rank correlation:
+
+| candidate signal | ρ | verdict |
+|---|---|---|
+| gate row norm → expert load | −0.03 | no signal, sign flips per layer |
+| gate row norm, centered → load | −0.05 | no signal |
+| gate cosine → co-occurrence | +0.00 | no signal |
+| gate cosine, centered → co-occurrence | +0.00 | no signal |
+
+The target is highly predictable — real load spreads 18.5× across experts — and
+the static signals captured none of it. Centering the gate rows to remove their
+shared component (which top-k cancels anyway) did not help. Gate rows are *not*
+near-orthogonal — Qwen3-30B's median |cos| is 0.47–0.57, with pairs up to 0.99 —
+so there is geometry there; it simply does not predict routing.
+
+**What does work for cold start is a profile from a different domain.** gsm8k vs
+hellaswag on OLMoE:
+
+| | ρ | top-24 overlap | random |
+|---|---|---|---|
+| cross-domain load | **+0.43** | **54.2%** | 37.5% |
+
+So roughly 1.4× better than random residency, for free, from any profile you
+already have. That dominates static analysis outright, and a profiling run is
+~5 minutes — the window where "no profile exists" is real is very short. Ship a
+generic profile with the artifact rather than deriving a prior from weights.
+
+Two static signals remain worth having, for different reasons. The aux-loss-free
+balancing bias (`e_score_correction_bias`, DeepSeek-V3 style) is a *learned*
+load-balancing correction, so a large negative value is a direct popularity
+readout rather than a geometric proxy — `inspect` detects it and scores it with
+the inverse sign. Neither OLMoE nor Qwen3-MoE has one, so it is unvalidated here.
+Per-expert SVD spectra are captured under `--spectra` as a candidate
+quantization-tolerance signal, but acting on them would need a store format
+change: records carry one dtype per layer, not per expert.
+
+Not pursued, with reasons: **correlation-driven disk layout** — the record stride
+is already 6.0 MiB and this project's own NVMe probe found a single thread reaches
+93% of the 6.9 GB/s ceiling at expert-sized reads (granularity only has to clear
+~1 MB), so co-locating correlated experts has almost no bandwidth left to recover.
+**Cross-expert block dedup** — untested, but the similarity results argue against
+finding duplicate blocks in distinct trained bf16 experts.
+
+### Generalisation: Qwen3-30B-A3B
+
+128 experts, 5 of 48 layers sampled, **81,280 pairs**: median similarity 0.034,
+max 0.401, exactly **one** pair at or above 0.4. Doubling the expert count and
+tripling the depth did not produce mergeable experts — if anything Qwen's experts
+are *more* orthogonal than OLMoE's.
+
 ## Status
 
-Faz 0–4 complete, verified on GB10: 176 tests locally, 211 with CUDA and vLLM.
+Faz 0–4 complete, verified on GB10: 199 tests locally, 234 with CUDA and vLLM.
 
 First real measurement, OLMoE-1B-7B (64 experts, top-8, 16 MoE layers), 3 prompts
 / 169 tokens: `mean experts/tok` came back exactly 8.000, all 16 layers captured,

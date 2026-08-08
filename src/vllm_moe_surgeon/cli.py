@@ -157,6 +157,32 @@ def _cmd_tier(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_inspect(args: argparse.Namespace) -> int:
+    from .surgery.inspect import inspect_checkpoint, report
+
+    profile = None
+    if args.profile:
+        from .telemetry import load
+
+        profile, _ = load(args.profile)
+
+    if args.layers:
+        layers = [int(x) for x in args.layers.split(",")]
+    elif profile is not None:
+        layers = list(profile.moe_layers)
+    else:
+        from .surgery.descriptors import CheckpointIndex
+
+        index = CheckpointIndex.open(args.checkpoint)
+        layers = [0] if index.expert_ids(0) else []
+
+    results, model = inspect_checkpoint(
+        args.checkpoint, layers, profile=profile, spectra=args.spectra
+    )
+    print(report(results, model=model or args.checkpoint))
+    return 0
+
+
 def _cmd_seams(args: argparse.Namespace) -> int:
     from .compat.seams import SEAMS, check, check_all_static
 
@@ -249,6 +275,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--prior-scale", type=float, default=8.0)
     p.add_argument("--no-fp8", action="store_true", help="full-precision records")
     p.set_defaults(func=_cmd_tier)
+
+    p = sub.add_parser(
+        "inspect", help="which routing signals a checkpoint carries, and if they work"
+    )
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument(
+        "--profile",
+        help="profile .npz; without it nothing is validated, only reported",
+    )
+    p.add_argument("--layers", help="comma-separated layer indices")
+    p.add_argument(
+        "--spectra",
+        action="store_true",
+        help="add per-expert SVD spectra (slow: tens of seconds per layer)",
+    )
+    p.set_defaults(func=_cmd_inspect)
 
     p = sub.add_parser("seams", help="check the vLLM seams this package holds")
     p.add_argument("--source", help="check a vLLM source tree instead of the install")

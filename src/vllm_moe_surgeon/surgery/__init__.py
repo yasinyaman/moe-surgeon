@@ -18,6 +18,14 @@ from .descriptors import (
     subspace_basis,
     subspace_similarity,
 )
+from .inspect import (
+    LayerSignals,
+    effective_rank,
+    inspect_checkpoint,
+    inspect_layer,
+    score_against_profile,
+    spearman,
+)
 from .plan import (
     Budget,
     ExpertPlacement,
@@ -32,6 +40,12 @@ from .plan import (
 
 __all__ = [
     "Budget",
+    "LayerSignals",
+    "effective_rank",
+    "inspect_checkpoint",
+    "inspect_layer",
+    "score_against_profile",
+    "spearman",
     "align_donor_to_target",
     "apply_permutation",
     "apply_plan",
