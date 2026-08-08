@@ -7,6 +7,8 @@ meaningless and every merge decision would be arbitrary. :mod:`.plan` turns a
 usage profile plus a budget into a reviewable, hand-editable placement.
 """
 
+from .align import align_donor_to_target, apply_permutation, merge_experts
+from .apply import apply_plan, derive_surgery, rewrite_config
 from .descriptors import (
     CheckpointIndex,
     ExpertDescriptor,
@@ -30,6 +32,12 @@ from .plan import (
 
 __all__ = [
     "Budget",
+    "align_donor_to_target",
+    "apply_permutation",
+    "apply_plan",
+    "derive_surgery",
+    "merge_experts",
+    "rewrite_config",
     "CheckpointIndex",
     "ExpertDescriptor",
     "ExpertPlacement",

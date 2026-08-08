@@ -101,6 +101,25 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_apply(args: argparse.Namespace) -> int:
+    from .surgery import apply_plan, load_plan
+
+    plan = load_plan(args.plan)
+    manifest = apply_plan(
+        plan,
+        args.source,
+        args.out,
+        shard_bytes=int(args.shard_gb * 1024**3),
+    )
+    print(f"experts: {manifest['experts_before']} -> {manifest['experts_after']}")
+    print(f"top_k:   {manifest['top_k_before']} -> {manifest['top_k_after']}")
+    print(f"merges applied: {manifest['merges_applied']}")
+    print(f"router:  {manifest['router_rewrite']}")
+    print(f"shards:  {len(manifest['shards'])}")
+    print(f"\nwrote {args.out}")
+    return 0
+
+
 def _cmd_seams(args: argparse.Namespace) -> int:
     from .compat.seams import SEAMS, check, check_all_static
 
@@ -173,6 +192,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--out", help="write plan.json here")
     p.set_defaults(func=_cmd_plan)
+
+    p = sub.add_parser("apply", help="write the operated-on checkpoint")
+    p.add_argument("--plan", required=True, help="plan.json from `plan`")
+    p.add_argument("--source", required=True, help="the base model directory")
+    p.add_argument("--out", required=True, help="output checkpoint directory")
+    p.add_argument("--shard-gb", type=float, default=4.0)
+    p.set_defaults(func=_cmd_apply)
 
     p = sub.add_parser("seams", help="check the vLLM seams this package holds")
     p.add_argument("--source", help="check a vLLM source tree instead of the install")
