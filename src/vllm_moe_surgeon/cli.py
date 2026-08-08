@@ -199,6 +199,32 @@ def _cmd_budget(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ablate(args: argparse.Namespace) -> int:
+    from .compat.ablation import arms_from_profile, run_study
+    from .compat.profile_runner import iter_prompts_from_jsonl
+    from .telemetry import load
+
+    stats, meta = load(args.profile)
+    prompts = list(iter_prompts_from_jsonl(args.corpus, args.field))
+    if args.limit:
+        prompts = prompts[: args.limit]
+    if not prompts:
+        print("no held-out prompts", file=sys.stderr)
+        return 2
+
+    arms = arms_from_profile(
+        stats, args.keep, include_hot_control=not args.no_control
+    )
+    study = run_study(
+        args.model or meta["model"],
+        prompts,
+        arms,
+        llm_kwargs=json.loads(args.llm_kwargs) if args.llm_kwargs else None,
+    )
+    print(study.report())
+    return 0
+
+
 def _cmd_seams(args: argparse.Namespace) -> int:
     from .compat.seams import SEAMS, check, check_all_static
 
@@ -317,6 +343,28 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kv-reserve", type=float, default=1.0, help="KV cache GiB")
     p.add_argument("--no-fp8", action="store_true", help="full-precision store")
     p.set_defaults(func=_cmd_budget)
+
+    p = sub.add_parser(
+        "ablate", help="measure what experts contribute, by zeroing them"
+    )
+    p.add_argument("--profile", required=True, help="profile .npz for the ranking")
+    p.add_argument("--corpus", required=True, help="HELD-OUT JSONL to score on")
+    p.add_argument("--field", default="text")
+    p.add_argument("--limit", type=int, help="cap the number of held-out prompts")
+    p.add_argument("--model", help="override the model from the profile")
+    p.add_argument(
+        "--keep",
+        type=int,
+        required=True,
+        help="experts kept per layer; the rest are ablated",
+    )
+    p.add_argument(
+        "--no-control",
+        action="store_true",
+        help="skip the hottest-N control arm (not recommended)",
+    )
+    p.add_argument("--llm-kwargs", help="extra LLM() kwargs as JSON")
+    p.set_defaults(func=_cmd_ablate)
 
     p = sub.add_parser("seams", help="check the vLLM seams this package holds")
     p.add_argument("--source", help="check a vLLM source tree instead of the install")

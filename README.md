@@ -192,17 +192,41 @@ Profiled on 400 gsm8k prompts — 6,006 token slots per expert, 30× the thresho
 below uniform, not 100×. The hottest quarter carries 46–60% against 25% uniform,
 so concentration is real but mild.
 
-Generation at 40/64 is badly degraded either way, and the isolating experiment
-settles why. Planning from the thin 169-token profile and from the 6,006-slot
-profile produced keep-sets sharing only 26 of 40 experts — so the thin ranking
-*was* mostly noise, as the refusal claimed. But the real profile did not rescue
-quality; it lost "The capital of France is Paris" that the noisy one kept. The
-damage is the deleted 14.6% of routing, not the choice of which experts to delete.
+Planning from the thin 169-token profile and from the 6,006-slot profile produced
+keep-sets sharing only 26 of 40 experts, so the thin ranking *was* mostly noise, as
+the refusal claimed.
 
-Together with the similarity result — no mergeable pair anywhere in the model —
-that leaves one viable path for this model: **keep every expert, and use the disk
-tier to decide what stays resident.** Artifact B is not the fallback, it is the
-answer. Hard deletion would need distillation to recover, which this pipeline
+**Corrected 2026-08-08.** An earlier version of this section called the pruned
+model "badly degraded", read off three greedy samples. Measured on held-out
+gsm8k[400:500] it is **9.71 → 15.26 perplexity, 1.57×** — a real cost, but not the
+collapse three samples suggested. The qualitative read overstated it.
+
+The ablation study puts that number in context (`surgeon ablate`):
+
+| arm | perplexity | vs baseline |
+|---|---|---|
+| baseline, 64 experts | 9.71 | — |
+| coldest 24/64 **zeroed** | 16.90 | 1.74× |
+| coldest 24/64 **deleted** | 15.26 | 1.57× |
+| hottest 24/64 zeroed (control) | 548.09 | 56.45× |
+
+Two things follow. The count-based ranking is **real** — a 32× separation between
+ablating the coldest 24 and the hottest 24. And deletion scores *better* than
+zeroing, which is the predicted ordering: deletion lets the renormalised gate mass
+flow to survivors while zeroing discards it. That ordering is also the check that
+`apply_plan` is not damaging the model beyond the loss of experts.
+
+So the comparison that decides the project is not "works vs broken", it is a
+tradeoff with numbers on both sides, at roughly the same VRAM:
+
+| approach | experts kept | resident | perplexity |
+|---|---|---|---|
+| delete 24 | 40 | 40 | 15.26 (1.57×) |
+| **disk tier** | **64** | **24** | **~9.71 (same tokens as base)** |
+
+Same resident footprint, and the tier keeps every expert available for when the
+router asks. That is why Artifact B is the answer here rather than the fallback.
+Closing the 1.57× gap by deletion would need distillation, which this pipeline
 deliberately does not do.
 
 ## Tiering — where the win actually is
