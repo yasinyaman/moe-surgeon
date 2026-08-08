@@ -193,8 +193,7 @@ def inspect_layer(
             total_sq = 0.0
             spectrum: list[np.ndarray] = []
             for projection in ("gate_proj", "up_proj", "down_proj"):
-                name = index.tensor_name(layer, expert, projection)
-                w = _as_float32(index.read(name))
+                w = _as_float32(index.read_expert(layer, expert, projection))
                 total_sq += float(np.sum(w.astype(np.float64) ** 2))
                 sv = np.linalg.svd(w, compute_uv=False)
                 if spectra_rank:

@@ -256,6 +256,17 @@ def apply_plan(
 
     surgery = derive_surgery(plan)
     index = CheckpointIndex.open(source)
+    if index.layout != "per_expert":
+        # Reading a stacked checkpoint works; writing one back does not, since the
+        # experts would have to be re-stacked and the router renamed. Refusing is
+        # the only safe option: emitting per-expert tensors for a model whose
+        # loader expects stacked ones produces a checkpoint that fails to load, and
+        # emitting them under stacked names would produce one that loads wrong.
+        raise NotImplementedError(
+            f"{source} uses the {index.layout!r} expert layout. Reading it is "
+            "supported (inspect, budget, tier), but writing an operated-on "
+            "checkpoint back in that layout is not implemented."
+        )
 
     with open(os.path.join(source, "config.json")) as f:
         config = json.load(f)

@@ -259,3 +259,52 @@ def test_report_explains_an_impossible_target(tmp_path):
     text = report(g, vram_gib=1.0)
     assert "does not fit" in text
     assert "fixed cost alone" in text
+
+
+def test_stacked_layout_expert_bytes_are_not_misfiled(tmp_path):
+    """Classifying by name means the layout matters here too.
+
+    Keying only on ".experts." filed every one of a stacked checkpoint's expert
+    bytes under "everything else", which reported Granite as 0% experts with the
+    whole model as fixed cost -- backwards, not just imprecise.
+    """
+    import json
+
+    from safetensors.torch import save_file
+
+    rng = torch.Generator().manual_seed(41)
+    experts, inter, hidden = 4, 8, 16
+    tensors = {
+        "model.layers.0.block_sparse_moe.input_linear.weight": torch.randn(
+            experts, 2 * inter, hidden, generator=rng, dtype=torch.float32
+        ).to(torch.bfloat16),
+        "model.layers.0.block_sparse_moe.output_linear.weight": torch.randn(
+            experts, hidden, inter, generator=rng, dtype=torch.float32
+        ).to(torch.bfloat16),
+        "model.layers.0.block_sparse_moe.router.layer.weight": torch.randn(
+            experts, hidden, generator=rng, dtype=torch.float32
+        ).to(torch.bfloat16),
+        "model.embed_tokens.weight": torch.zeros(8, hidden, dtype=torch.bfloat16),
+    }
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(tmp_path / "model.safetensors"), metadata={"format": "pt"})
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "num_hidden_layers": 1,
+                "num_local_experts": experts,
+                "num_experts_per_tok": 2,
+                "hidden_size": hidden,
+            },
+            f,
+        )
+
+    g = analyze(str(tmp_path))
+    assert g.num_experts == experts
+    assert g.intermediate == inter
+    assert g.hidden == hidden
+    expected = 2 * experts * (2 * inter * hidden + hidden * inter)
+    assert g.routed_expert_bytes == expected
+    assert g.router_bytes == 2 * experts * hidden
+    # The experts must dominate, as they do in every real MoE checkpoint.
+    assert g.routed_expert_bytes > g.other_bytes

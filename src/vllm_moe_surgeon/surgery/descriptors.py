@@ -45,6 +45,24 @@ logger = init_logger(__name__)
 _EXPERT_RE = re.compile(r"\.experts\.(\d+)\.")
 SHARD_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
+#: Checkpoints do not agree on how expert weights are stored, and the difference is
+#: structural rather than cosmetic:
+#:
+#: ``per_expert``
+#:     one tensor per expert per projection --
+#:     ``model.layers.L.mlp.experts.E.gate_proj.weight``. OLMoE, Qwen2/Qwen3-MoE,
+#:     DeepSeek, Mixtral-style exports.
+#: ``stacked``
+#:     every expert in one tensor, with gate and up already fused --
+#:     ``model.layers.L.block_sparse_moe.input_linear.weight`` of shape
+#:     ``[E, 2I, H]``, plus ``output_linear.weight`` of ``[E, H, I]``. IBM Granite.
+#:
+#: The stacked form is *closer* to what the disk store wants than the per-expert
+#: form is: its ``input_linear`` is already the store's ``w13``. The half order is
+#: gate then up, which is not a guess -- vLLM's own granitemoe loader does
+#: ``w1, w3 = p[e].chunk(2, dim=0)``.
+LAYOUTS = ("per_expert", "stacked")
+
 
 @dataclass(frozen=True)
 class CheckpointIndex:
@@ -53,6 +71,8 @@ class CheckpointIndex:
     root: str
     #: tensor name -> shard filename
     weight_map: dict[str, str]
+    #: One of :data:`LAYOUTS`, detected from the tensor names.
+    layout: str = "per_expert"
 
     @classmethod
     def open(cls, root: str) -> CheckpointIndex:
@@ -60,7 +80,7 @@ class CheckpointIndex:
         if os.path.exists(index_path):
             with open(index_path) as f:
                 weight_map = json.load(f)["weight_map"]
-            return cls(root, weight_map)
+            return cls(root, weight_map, detect_layout(weight_map))
         # Single-shard checkpoint: no index file is written.
         single = "model.safetensors"
         if os.path.exists(os.path.join(root, single)):
@@ -68,10 +88,15 @@ class CheckpointIndex:
 
             with safe_open(os.path.join(root, single), framework="pt") as f:
                 weight_map = dict.fromkeys(f.keys(), single)
-            return cls(root, weight_map)
+            return cls(root, weight_map, detect_layout(weight_map))
         raise FileNotFoundError(f"no safetensors checkpoint under {root}")
 
     def expert_ids(self, layer: int) -> list[int]:
+        if self.layout == "stacked":
+            name = self._stacked_name(layer, "input_linear")
+            if name not in self.weight_map:
+                return []
+            return list(range(self._stacked_expert_count(layer)))
         prefix = f"model.layers.{layer}.mlp.experts."
         ids = {
             int(m.group(1))
@@ -80,10 +105,50 @@ class CheckpointIndex:
         }
         return sorted(ids)
 
+    def _stacked_name(self, layer: int, which: str) -> str:
+        return f"model.layers.{layer}.block_sparse_moe.{which}.weight"
+
+    def _stacked_expert_count(self, layer: int) -> int:
+        from safetensors import safe_open
+
+        name = self._stacked_name(layer, "input_linear")
+        shard = self.weight_map[name]
+        with safe_open(os.path.join(self.root, shard), framework="pt") as f:
+            return int(f.get_slice(name).get_shape()[0])
+
     def tensor_name(self, layer: int, expert: int, projection: str) -> str:
+        """The tensor holding this projection.
+
+        For a stacked checkpoint there is no per-expert tensor, so this names the
+        stacked one; use :meth:`read_expert` to get a single expert's slice.
+        """
+        if self.layout == "stacked":
+            which = "output_linear" if projection == "down_proj" else "input_linear"
+            return self._stacked_name(layer, which)
         return f"model.layers.{layer}.mlp.experts.{expert}.{projection}.weight"
 
+    def read_expert(self, layer: int, expert: int, projection: str) -> np.ndarray:
+        """One expert's projection as float32, whatever the layout.
+
+        This is the layout-aware read every caller should use. ``read`` plus
+        ``tensor_name`` only coincide for the per-expert layout.
+        """
+        if self.layout != "stacked":
+            return self.read(self.tensor_name(layer, expert, projection))
+
+        whole = self.read(self.tensor_name(layer, expert, projection))
+        if projection == "down_proj":
+            return np.ascontiguousarray(whole[expert])
+        # input_linear[e] is [2I, H], gate first then up -- the order vLLM's
+        # granitemoe loader uses when it does w1, w3 = p[e].chunk(2, dim=0).
+        fused = whole[expert]
+        half = fused.shape[0] // 2
+        start = 0 if projection == "gate_proj" else half
+        return np.ascontiguousarray(fused[start : start + half])
+
     def router_name(self, layer: int) -> str:
+        if self.layout == "stacked":
+            return f"model.layers.{layer}.block_sparse_moe.router.layer.weight"
         return f"model.layers.{layer}.mlp.gate.weight"
 
     def read(self, name: str) -> np.ndarray:
@@ -189,8 +254,7 @@ def describe_layer(
         bases: dict[str, np.ndarray] = {}
         norms: dict[str, float] = {}
         for projection in projections:
-            name = index.tensor_name(layer, expert, projection)
-            weight = _as_float32(index.read(name))
+            weight = _as_float32(index.read_expert(layer, expert, projection))
             # down_proj is [H, I]: its *column* space is the invariant one, so
             # transpose into the [n, H] convention subspace_basis expects.
             oriented = weight.T if projection == "down_proj" else weight
@@ -225,3 +289,15 @@ def iter_layer_similarity(
             continue
         logger.info("layer %d: described %d experts", layer, len(descriptors))
         yield layer, similarity_matrix(descriptors)
+
+
+def detect_layout(weight_map: dict[str, str]) -> str:
+    """Which expert-storage convention this checkpoint uses.
+
+    Detected from tensor names rather than from the config's architecture field, so
+    a re-export under a different architecture name still reads correctly.
+    """
+    for name in weight_map:
+        if ".block_sparse_moe.input_linear.weight" in name:
+            return "stacked"
+    return "per_expert"

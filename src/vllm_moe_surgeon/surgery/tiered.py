@@ -80,7 +80,7 @@ def build_layer_store(
             f"{expert_ids[:5]}... -- renumber the checkpoint first"
         )
 
-    probe = index.read(index.tensor_name(layer, expert_ids[0], "gate_proj"))
+    probe = index.read_expert(layer, expert_ids[0], "gate_proj")
     inter, hidden = probe.shape
     dtype = _source_dtype(index, layer, expert_ids[0])
 
@@ -120,8 +120,7 @@ def build_layer_store(
         return store
 
     def read(expert: int, projection: str):
-        name = index.tensor_name(layer, expert, projection)
-        return torch.from_numpy(index.read(name))
+        return torch.from_numpy(index.read_expert(layer, expert, projection))
 
     for expert in expert_ids:
         row = torch.zeros(store.record_stride, dtype=torch.uint8)

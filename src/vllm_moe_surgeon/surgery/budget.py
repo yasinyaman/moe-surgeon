@@ -65,6 +65,32 @@ def _align_up(value: int, to: int = ALIGN) -> int:
     return -(-value // to) * to
 
 
+def _classify(name: str, layout: str) -> str:
+    """Which budget bucket a tensor belongs to, per expert-storage layout.
+
+    Classifying by name means the layout matters here as much as it does for
+    reading. Keying only on ``".experts."`` put every one of a stacked
+    checkpoint's expert bytes into "everything else", which reported Granite as
+    0% experts and a fixed cost of the entire model -- a budget that is not
+    merely imprecise but backwards.
+    """
+    if "shared_expert" in name:
+        return "shared"
+    if layout == "stacked":
+        if ".block_sparse_moe.router." in name:
+            return "router"
+        if ".block_sparse_moe.input_linear" in name or (
+            ".block_sparse_moe.output_linear" in name
+        ):
+            return "routed"
+        return "other"
+    if ".experts." in name:
+        return "routed"
+    if name.endswith("mlp.gate.weight") or "correction_bias" in name:
+        return "router"
+    return "other"
+
+
 @dataclass
 class CheckpointGeometry:
     """Byte accounting for a checkpoint, from headers alone."""
@@ -152,12 +178,13 @@ def analyze(checkpoint: str) -> CheckpointGeometry:
                 for dim in shape:
                     nbytes *= dim
 
-                if "shared_expert" in name:
+                role = _classify(name, index.layout)
+                if role == "shared":
                     shared += nbytes
-                elif ".experts." in name:
+                elif role == "routed":
                     routed += nbytes
                     dtype_votes[width] = dtype_votes.get(width, 0) + 1
-                elif name.endswith("mlp.gate.weight") or "correction_bias" in name:
+                elif role == "router":
                     router += nbytes
                 else:
                     other += nbytes
@@ -166,7 +193,7 @@ def analyze(checkpoint: str) -> CheckpointGeometry:
 
     # Geometry from a real expert tensor rather than the config, since config
     # field names for the MoE intermediate size vary by family.
-    probe = index.read(index.tensor_name(moe_layers[0], 0, "gate_proj"))
+    probe = index.read_expert(moe_layers[0], 0, "gate_proj")
     intermediate, hidden = probe.shape
 
     return CheckpointGeometry(

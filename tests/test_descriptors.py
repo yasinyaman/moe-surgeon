@@ -212,3 +212,126 @@ def test_missing_checkpoint_is_reported(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="no safetensors checkpoint"):
         CheckpointIndex.open(str(tmp_path))
+
+
+# --------------------------------------------------- the stacked (Granite) layout
+
+
+def _write_stacked_checkpoint(root, num_experts=3):
+    """IBM Granite's convention: all experts in one tensor, gate and up fused.
+
+    ``input_linear`` is ``[E, 2I, H]`` with gate first then up -- the order vLLM's
+    own granitemoe loader assumes when it does ``w1, w3 = p[e].chunk(2, dim=0)``.
+    """
+    import torch
+    from safetensors.torch import save_file
+
+    rng = torch.Generator().manual_seed(31)
+    gate = torch.randn(num_experts, INTER, H, generator=rng)
+    up = torch.randn(num_experts, INTER, H, generator=rng)
+    down = torch.randn(num_experts, H, INTER, generator=rng)
+    tensors = {
+        "model.layers.0.block_sparse_moe.input_linear.weight": torch.cat(
+            [gate, up], dim=1
+        ),
+        "model.layers.0.block_sparse_moe.output_linear.weight": down,
+        "model.layers.0.block_sparse_moe.router.layer.weight": torch.randn(
+            num_experts, H, generator=rng
+        ),
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(root / "model.safetensors"), metadata={"format": "pt"})
+    return gate, up, down
+
+
+def test_stacked_layout_is_detected(tmp_path):
+    from vllm_moe_surgeon.surgery.descriptors import CheckpointIndex, detect_layout
+
+    _write_stacked_checkpoint(tmp_path)
+    index = CheckpointIndex.open(str(tmp_path))
+    assert index.layout == "stacked"
+    assert detect_layout({"model.layers.0.mlp.experts.0.gate_proj.weight": "s"}) == (
+        "per_expert"
+    )
+
+
+def test_stacked_expert_ids_come_from_the_tensor_shape(tmp_path):
+    from vllm_moe_surgeon.surgery.descriptors import CheckpointIndex
+
+    _write_stacked_checkpoint(tmp_path, num_experts=5)
+    assert CheckpointIndex.open(str(tmp_path)).expert_ids(0) == [0, 1, 2, 3, 4]
+
+
+def test_stacked_reads_split_gate_and_up_the_right_way_round(tmp_path):
+    """A swapped half loads without complaint and computes the wrong function."""
+    from vllm_moe_surgeon.surgery.descriptors import CheckpointIndex
+
+    gate, up, down = _write_stacked_checkpoint(tmp_path)
+    index = CheckpointIndex.open(str(tmp_path))
+
+    for expert in range(gate.shape[0]):
+        np.testing.assert_allclose(
+            index.read_expert(0, expert, "gate_proj"), gate[expert].numpy(), atol=0
+        )
+        np.testing.assert_allclose(
+            index.read_expert(0, expert, "up_proj"), up[expert].numpy(), atol=0
+        )
+        np.testing.assert_allclose(
+            index.read_expert(0, expert, "down_proj"), down[expert].numpy(), atol=0
+        )
+    # Guard the guard: if gate == up the assertions above prove nothing.
+    assert not np.allclose(gate[0].numpy(), up[0].numpy())
+
+
+def test_stacked_router_name_differs(tmp_path):
+    from vllm_moe_surgeon.surgery.descriptors import CheckpointIndex
+
+    _write_stacked_checkpoint(tmp_path)
+    index = CheckpointIndex.open(str(tmp_path))
+    assert index.router_name(0).endswith("block_sparse_moe.router.layer.weight")
+    assert index.read(index.router_name(0)).shape == (3, H)
+
+
+def test_descriptors_work_on_a_stacked_checkpoint(tmp_path):
+    from vllm_moe_surgeon.surgery.descriptors import (
+        CheckpointIndex,
+        describe_layer,
+        similarity_matrix,
+    )
+
+    _write_stacked_checkpoint(tmp_path, num_experts=4)
+    index = CheckpointIndex.open(str(tmp_path))
+    matrix = similarity_matrix(describe_layer(index, 0, rank=RANK))
+    assert matrix.shape == (4, 4)
+    np.testing.assert_allclose(np.diag(matrix), 1.0, atol=1e-5)
+
+
+def test_writing_a_stacked_checkpoint_is_refused(tmp_path):
+    """Reading is supported; writing one back is not, and must say so."""
+    import pytest
+
+    from vllm_moe_surgeon.surgery import Plan
+    from vllm_moe_surgeon.surgery.apply import apply_plan
+    from vllm_moe_surgeon.surgery.plan import ExpertPlacement
+
+    _write_stacked_checkpoint(tmp_path / "src")
+    import json
+
+    with open(tmp_path / "src" / "config.json", "w") as f:
+        json.dump(
+            {"num_hidden_layers": 1, "num_local_experts": 3, "num_experts_per_tok": 2},
+            f,
+        )
+    plan = Plan(
+        model="m",
+        revision=None,
+        budget={},
+        placements=[
+            ExpertPlacement(0, 0, "merge_into_core", tokens=10, share=0.5),
+            ExpertPlacement(0, 1, "merge_into_core", tokens=10, share=0.5),
+            ExpertPlacement(0, 2, "drop", tokens=1, share=0.0),
+        ],
+        gate={"passed": True, "reason": "test"},
+    )
+    with pytest.raises(NotImplementedError, match="stacked"):
+        apply_plan(plan, str(tmp_path / "src"), str(tmp_path / "out"))
