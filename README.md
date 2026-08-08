@@ -158,9 +158,56 @@ small subspace, and two experts could act almost identically there while spannin
 different global subspaces. Activation-based similarity would settle it, and this
 result promotes that from optional to necessary if merging is to be pursued.
 
+## Surgery
+
+```bash
+surgeon apply --plan plan.json --source /path/to/model --out ./pruned
+```
+
+Streams one tensor at a time, so a model larger than host RAM is fine. Survivors
+are renumbered contiguously and **router rows are reordered by the same mapping** —
+a row left at its old index routes to a different expert than the one it was
+trained for, and nothing raises. `top_k` is clamped if fewer experts survive than
+the model routed to. Merges align neurons first (`surgery/align.py`): merging an
+expert with a permuted copy of itself returns the original to 1e-6, where naive
+elementwise averaging of the same pair produces a function unlike either.
+
+Verified on GB10: OLMoE 64 → 40 experts in 7 seconds, 8.4G in 3 shards, then
+loaded and generated through a plain `LLM()` — no plugin, no flags, no env.
+Artifact A is an ordinary HF checkpoint as far as vLLM is concerned.
+
+### Measured: hard deletion is not viable for OLMoE
+
+Profiled on 400 gsm8k prompts — 6,006 token slots per expert, 30× the threshold:
+
+| keep | routing load deleted |
+|---|---|
+| 56/64 | 2.8% |
+| 48/64 | 7.8% |
+| 40/64 | 14.6% |
+| 32/64 | 23.5% |
+
+**There is no dead tail.** All 64 experts are used in every layer, and the
+*coldest* still carries 0.5% of load where uniform would be 1.56% — only ~3×
+below uniform, not 100×. The hottest quarter carries 46–60% against 25% uniform,
+so concentration is real but mild.
+
+Generation at 40/64 is badly degraded either way, and the isolating experiment
+settles why. Planning from the thin 169-token profile and from the 6,006-slot
+profile produced keep-sets sharing only 26 of 40 experts — so the thin ranking
+*was* mostly noise, as the refusal claimed. But the real profile did not rescue
+quality; it lost "The capital of France is Paris" that the noisy one kept. The
+damage is the deleted 14.6% of routing, not the choice of which experts to delete.
+
+Together with the similarity result — no mergeable pair anywhere in the model —
+that leaves one viable path for this model: **keep every expert, and use the disk
+tier to decide what stays resident.** Artifact B is not the fallback, it is the
+answer. Hard deletion would need distillation to recover, which this pipeline
+deliberately does not do.
+
 ## Status
 
-Faz 0, 1 and 2 complete, verified on GB10.
+Faz 0–3 complete, verified on GB10: 151 tests locally, 210 with CUDA and vLLM.
 
 First real measurement, OLMoE-1B-7B (64 experts, top-8, 16 MoE layers), 3 prompts
 / 169 tokens: `mean experts/tok` came back exactly 8.000, all 16 layers captured,
