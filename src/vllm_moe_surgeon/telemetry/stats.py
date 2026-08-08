@@ -48,6 +48,11 @@ class ExpertStats:
     layer_token_rows: np.ndarray
     #: Optional within-token co-occurrence, (len(moe_layers), E, E) int64.
     cooc: np.ndarray | None = None
+    #: Optional position histogram, (len(moe_layers), E, top_k) int64.
+    #: ``positions[slot, e, j]`` counts expert ``e`` appearing at top-k slot ``j``.
+    #: Only meaningful when the router emits score-ordered ids -- see
+    #: :meth:`position_order_correlation`, which checks that rather than assuming.
+    positions: np.ndarray | None = None
     n_sequences: int = 0
     #: Rows rejected as uncaptured (all top_k entries identical).
     dropped_degenerate_rows: int = 0
@@ -62,6 +67,7 @@ class ExpertStats:
         num_experts: int,
         moe_layers: Sequence[int],
         with_cooc: bool = False,
+        top_k: int = 0,
     ) -> ExpertStats:
         layers = sorted(moe_layers)
         n = len(layers)
@@ -74,6 +80,9 @@ class ExpertStats:
                 np.zeros((n, num_experts, num_experts), dtype=np.int64)
                 if with_cooc
                 else None
+            ),
+            positions=(
+                np.zeros((n, num_experts, top_k), dtype=np.int64) if top_k else None
             ),
         )
 
@@ -135,6 +144,16 @@ class ExpertStats:
             self.tokens[slot] += np.bincount(flat, minlength=self.num_experts)
             self.layer_token_rows[slot] += rows.shape[0]
 
+            if self.positions is not None:
+                width = min(top_k, self.positions.shape[2])
+                for j in range(width):
+                    column = rows[:, j]
+                    column = column[column >= 0]
+                    if column.size:
+                        self.positions[slot, :, j] += np.bincount(
+                            column, minlength=self.num_experts
+                        )
+
             if self.cooc is not None:
                 self._add_cooc(slot, rows)
 
@@ -193,6 +212,84 @@ class ExpertStats:
                 sorted(self.silent_layers),
             )
 
+    def position_order_correlation(self) -> float:
+        """Mean rank correlation of per-expert mean position with selection count.
+
+        The precondition check for every rank-weighted measure. vLLM's fused
+        ``topk_softmax`` kernel carries no ordering contract -- only the grouped
+        and bias routers honour a ``sorted`` flag -- so whether slot 0 holds the
+        top-scoring expert is an empirical property that can change under us.
+
+        Strongly negative means ordered: a globally strong expert occupies better
+        slots. Near zero means the ids arrive in arbitrary order and any
+        rank weighting is noise. Measured -0.49 on OLMoE.
+
+        This is a **population-level proxy, not a direct test.** Verifying that
+        slot j holds the j-th highest score would need the scores, which the
+        public capture does not carry. It instead leans on the empirical
+        regularity that frequently-chosen experts win better slots -- so a capture
+        that is genuinely ordered but where a very frequent expert always lands
+        last would be misread as unordered. That direction is the safe one: the
+        engine falls back to plain counts and says so, rather than applying a rank
+        weighting it cannot justify.
+        """
+        if self.positions is None:
+            return float("nan")
+        from ..surgery.inspect import spearman
+
+        top_k = self.positions.shape[2]
+        slots = np.arange(top_k)
+        values = []
+        for slot in range(len(self.moe_layers)):
+            counts = self.positions[slot].sum(axis=1)
+            live = counts > 0
+            if live.sum() < 2:
+                continue
+            mean_position = (self.positions[slot] * slots).sum(axis=1) / np.maximum(
+                counts, 1
+            )
+            values.append(spearman(mean_position[live], counts[live]))
+        finite = [v for v in values if np.isfinite(v)]
+        return float(np.mean(finite)) if finite else float("nan")
+
+    @property
+    def positions_look_ordered(self) -> bool:
+        """Whether rank weighting is defensible on this capture."""
+        rho = self.position_order_correlation()
+        return bool(np.isfinite(rho) and rho <= -0.3)
+
+    def importance(self, rank_weights: np.ndarray | None = None) -> np.ndarray:
+        """Per-(layer, expert) importance, ``(len(moe_layers), num_experts)``.
+
+        With no weights this is the plain selection count -- what every earlier
+        measurement used. With weights it is a rank-weighted count, which is a
+        proxy for contribution rather than frequency: a top-k output is a
+        gate-weighted sum, so an expert selected constantly at the last slot moves
+        the output far less than one selected at the first.
+
+        Refuses when the capture is not ordered, rather than returning a number
+        that looks like a measurement.
+        """
+        if rank_weights is None:
+            return self.tokens.astype(np.float64)
+        if self.positions is None:
+            raise ValueError(
+                "no position histogram in this profile; re-profile with top_k set"
+            )
+        if not self.positions_look_ordered:
+            raise ValueError(
+                "the router's top-k ids do not look score-ordered on this capture "
+                f"(mean position/count correlation "
+                f"{self.position_order_correlation():+.3f}, expected <= -0.3), so "
+                "rank weighting would be noise"
+            )
+        weights = np.asarray(rank_weights, dtype=np.float64)
+        if weights.shape != (self.positions.shape[2],):
+            raise ValueError(
+                f"rank_weights must have shape ({self.positions.shape[2]},)"
+            )
+        return (self.positions * weights).sum(axis=2)
+
     def layer_share(self) -> np.ndarray:
         """Per-layer expert share, rows summing to 1 (0 for silent layers)."""
         totals = self.tokens.sum(axis=1, keepdims=True)
@@ -215,6 +312,10 @@ class ExpertStats:
             self.cooc += other.cooc
         elif other.cooc is not None:
             self.cooc = other.cooc.copy()
+        if self.positions is not None and other.positions is not None:
+            self.positions += other.positions
+        elif other.positions is not None:
+            self.positions = other.positions.copy()
 
 
 def accumulate(
@@ -248,10 +349,11 @@ def from_hf_config(
     config: Mapping[str, object], *, with_cooc: bool = False
 ) -> ExpertStats:
     """Build an empty accumulator sized from an HF config mapping."""
-    from .layers import get_num_experts, resolve_moe_layers
+    from .layers import get_num_experts, get_top_k, resolve_moe_layers
 
     return ExpertStats.empty(
         get_num_experts(config),
         resolve_moe_layers(config),
         with_cooc=with_cooc,
+        top_k=get_top_k(config),
     )

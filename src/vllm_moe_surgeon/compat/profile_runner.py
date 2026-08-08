@@ -73,7 +73,9 @@ def profile_offline(
         list(prompts), SamplingParams(max_tokens=max_tokens, temperature=0.0)
     )
 
-    stats = ExpertStats.empty(num_experts, moe_layers, with_cooc=with_cooc)
+    stats = ExpertStats.empty(
+        num_experts, moe_layers, with_cooc=with_cooc, top_k=top_k
+    )
     missing = 0
     for request in outputs:
         for completion in request.outputs:
@@ -112,6 +114,8 @@ def summarize(stats: ExpertStats) -> str:
         f"dropped rows:     {stats.dropped_degenerate_rows} degenerate, "
         f"{stats.dropped_sentinels} sentinels",
         f"silent layers:    {sorted(stats.silent_layers) or 'none'}",
+        f"position order:   {stats.position_order_correlation():+.3f}  "
+        f"({'ranked' if stats.positions_look_ordered else 'NOT ordered'})",
         "",
         "per-layer expert concentration:",
         f"  {'layer':>5}  {'rows':>7}  {'used':>5}  {'top1%':>6}  {'top25%':>7}",

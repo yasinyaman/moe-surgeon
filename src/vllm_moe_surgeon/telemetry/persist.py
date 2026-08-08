@@ -39,6 +39,7 @@ def save(
         "dropped_sentinels": stats.dropped_sentinels,
         "silent_layers": sorted(stats.silent_layers),
         "mean_experts_per_token": stats.top_k_hint,
+        "position_order_correlation": stats.position_order_correlation(),
         **(extra or {}),
     }
     arrays = {
@@ -48,6 +49,8 @@ def save(
     }
     if stats.cooc is not None:
         arrays["cooc"] = stats.cooc
+    if stats.positions is not None:
+        arrays["positions"] = stats.positions
     np.savez_compressed(path, **arrays)
 
 
@@ -66,6 +69,7 @@ def load(path: str) -> tuple[ExpertStats, dict[str, Any]]:
             tokens=data["tokens"],
             layer_token_rows=data["layer_token_rows"],
             cooc=data["cooc"] if "cooc" in data else None,
+            positions=data["positions"] if "positions" in data else None,
             n_sequences=int(meta["n_sequences"]),
             dropped_degenerate_rows=int(meta["dropped_degenerate_rows"]),
             dropped_sentinels=int(meta["dropped_sentinels"]),

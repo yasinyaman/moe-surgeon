@@ -378,3 +378,104 @@ def test_successful_merges_produce_no_such_warning():
         _hot_profile(), Budget(core_experts=3), similarity={0: similarity}
     )
     assert not any("no merge cleared the bar" in w for w in plan.warnings)
+
+
+# --------------------------------------------------- rank-weighted importance
+
+
+def _ranked_stats(counts, positions):
+    """counts: [E]; positions: [E, top_k] histogram."""
+    import numpy as np
+
+    top_k = np.asarray(positions).shape[1]
+    stats = ExpertStats.empty(E, [0], top_k=top_k)
+    stats.tokens[0] = np.asarray(counts, dtype=np.int64)
+    stats.positions[0] = np.asarray(positions, dtype=np.int64)
+    stats.layer_token_rows[0] = int(np.sum(counts) // top_k) or 1
+    stats.finalize()
+    return stats
+
+
+def _ordered_positions(counts, top_k=4, promote=None):
+    """A position histogram that looks ordered at the population level.
+
+    Hotter experts get more of their mass at slot 0, which is the regularity
+    ``position_order_correlation`` keys on. ``promote`` names one mid-ranked expert
+    whose mass is concentrated at slot 0 anyway, so rank-1 importance can disagree
+    with total count without making the whole capture look unordered.
+    """
+    import numpy as np
+
+    counts = np.asarray(counts, dtype=np.int64)
+    order = np.argsort(counts)[::-1]
+    positions = np.zeros((len(counts), top_k), dtype=np.int64)
+    for rank, expert in enumerate(order):
+        # Hottest expert concentrates at slot 0, coldest at the last slot.
+        favourite = min(rank * top_k // max(len(counts), 1), top_k - 1)
+        positions[expert, favourite] = counts[expert]
+    if promote is not None:
+        positions[promote] = 0
+        positions[promote, 0] = counts[promote]
+    return positions
+
+
+def test_rank_one_ranking_can_disagree_with_count():
+    """The finding this default exists for.
+
+    Measured on OLMoE: ranking by rank-1 frequency instead of total count picked a
+    keep-set that discarded MORE raw routing load (21.6% vs 14.6%) and cost LESS
+    perplexity (1.30x vs 1.74x). So the two rankings must be able to differ.
+    """
+    import numpy as np
+
+    counts = [9000, 6000, 3000, 2500, 2000, 1500, 1000, 500]
+    # Expert 5 is mid-count but always the top choice when chosen.
+    positions = _ordered_positions(counts, promote=5)
+    stats = _ranked_stats(counts, positions)
+    assert stats.positions_look_ordered, "fixture must look ordered, or the gate fires"
+
+    by_count = list(np.argsort(stats.importance()[0])[::-1])
+    by_rank1 = list(np.argsort(stats.importance(np.eye(4)[0])[0])[::-1])
+    assert by_count != by_rank1, "the two definitions must be able to disagree"
+    assert by_rank1.index(5) < by_count.index(5), "rank-1 must promote expert 5"
+
+
+def test_build_plan_defaults_to_rank_one_and_records_it():
+    counts = [9000, 6000, 3000, 2500, 2000, 1500, 1000, 500]
+    stats = _ranked_stats(counts, _ordered_positions(counts, promote=5))
+
+    plan = build_plan(stats, Budget(core_experts=3))
+    assert plan.provenance["ranked_by"] == "rank-1 selection frequency"
+    core = {p.expert for p in plan.by_layer(0) if p.action == "merge_into_core"}
+    # Expert 5 is only 6th by count but always chosen first, so rank-1 keeps it.
+    assert 5 in core
+
+
+def test_unordered_capture_falls_back_to_counts_and_says_so():
+    """Rank weighting on arbitrary-order ids would be noise, so it is refused."""
+    import numpy as np
+
+    # Every expert spread evenly over all slots -> no ordering signal.
+    positions = np.full((E, 4), 100, dtype=np.int64)
+    stats = _ranked_stats(positions.sum(axis=1), positions)
+    assert not stats.positions_look_ordered
+
+    plan = build_plan(stats, Budget(core_experts=2))
+    assert "not score-ordered" in plan.provenance["ranked_by"]
+
+    with pytest.raises(ValueError, match="not look score-ordered"):
+        stats.importance(np.eye(4)[0])
+
+
+def test_profile_without_positions_still_works():
+    stats = _hot_profile()
+    assert stats.positions is None
+    plan = build_plan(stats, Budget(core_experts=3))
+    assert "no position data" in plan.provenance["ranked_by"]
+
+
+def test_importance_shape_is_validated():
+    import numpy as np
+
+    with pytest.raises(ValueError, match="importance has shape"):
+        build_plan(_hot_profile(), Budget(core_experts=3), importance=np.zeros((2, 2)))

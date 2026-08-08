@@ -218,10 +218,42 @@ def coverage(stats: ExpertStats) -> float:
     return float(stats.tokens[live].sum() / (live.sum() * stats.num_experts))
 
 
+#: Rank weights that measured best on OLMoE. Concentrating importance on the
+#: first top-k slot beat plain selection count by a wide margin: it nominated a
+#: keep-set that discarded *more* raw routing load (21.6% vs 14.6%) while costing
+#: *less* perplexity (1.30x vs 1.74x), which is the clearest evidence that count
+#: is the wrong quantity for pruning. A top-k output is a gate-weighted sum, and
+#: an expert selected constantly at the last slot barely moves it.
+def rank1_weights(top_k: int) -> np.ndarray:
+    weights = np.zeros(top_k, dtype=np.float64)
+    weights[0] = 1.0
+    return weights
+
+
+def default_importance(stats: ExpertStats) -> tuple[np.ndarray, str]:
+    """The ranking to prune by, and the name of what was used.
+
+    Prefers rank-1 selection frequency, falling back to plain counts when the
+    profile carries no position histogram or the router's ids are not
+    score-ordered -- in which case rank weighting would be noise, and saying so is
+    better than silently using a worse ranking that looks the same.
+    """
+    if stats.positions is None:
+        return stats.tokens.astype(np.float64), "token count (no position data)"
+    if not stats.positions_look_ordered:
+        return (
+            stats.tokens.astype(np.float64),
+            "token count (router ids not score-ordered)",
+        )
+    top_k = stats.positions.shape[2]
+    return stats.importance(rank1_weights(top_k)), "rank-1 selection frequency"
+
+
 def build_plan(
     stats: ExpertStats,
     budget: Budget,
     *,
+    importance: np.ndarray | None = None,
     similarity: dict[int, np.ndarray] | None = None,
     model: str | None = None,
     revision: str | None = None,
@@ -236,6 +268,14 @@ def build_plan(
     """
     slots = coverage(stats)
     warnings: list[str] = []
+    if importance is None:
+        importance, importance_name = default_importance(stats)
+    else:
+        importance_name = "caller-supplied"
+    if importance.shape != stats.tokens.shape:
+        raise ValueError(
+            f"importance has shape {importance.shape}, expected {stats.tokens.shape}"
+        )
     if slots < budget.min_slots_per_expert:
         message = (
             f"profile carries {slots:.1f} token slots per expert, below the "
@@ -262,6 +302,7 @@ def build_plan(
 
     for slot, layer in enumerate(stats.moe_layers):
         counts = stats.tokens[slot]
+        rank_by = importance[slot]
 
         if stats.layer_token_rows[slot] == 0:
             untouched[layer] = (
@@ -282,8 +323,9 @@ def build_plan(
             continue
 
         # Ties broken by expert id so a plan is reproducible.
+        # Ranked by importance, not by raw count -- see default_importance.
         order = sorted(
-            range(stats.num_experts), key=lambda e: (-int(counts[e]), e)
+            range(stats.num_experts), key=lambda e: (-float(rank_by[e]), e)
         )
         core = order[: budget.core_experts]
         core_set = set(core)
@@ -417,6 +459,7 @@ def build_plan(
             "moe_layers": stats.moe_layers,
             "silent_layers": sorted(stats.silent_layers),
             "forced": bool(force and slots < budget.min_slots_per_expert),
+            "ranked_by": importance_name,
             **(provenance or {}),
         },
     )
@@ -485,6 +528,7 @@ def summarize_plan(plan: Plan) -> str:
         f"{counts['keep_on_disk']} on disk, {counts['drop']} dropped",
         f"slots/expert in profile: "
         f"{plan.provenance.get('slots_per_expert', float('nan')):.1f}",
+        f"ranked by:  {plan.provenance.get('ranked_by', 'unknown')}",
     ]
     merged = [p for p in plan.placements if p.merge_target is not None]
     deleted = [

@@ -245,6 +245,28 @@ def run_study(
     return study
 
 
+def arms_from_importance(
+    stats: Any,
+    keep: int,
+    importance: Any,
+    label: str,
+) -> tuple[str, dict[int, list[int]]]:
+    """One ablation arm: the coldest ``num_experts - keep`` under ``importance``.
+
+    ``importance`` is ``(len(moe_layers), num_experts)``. Different importance
+    definitions produce different keep-sets at the same budget, which is the
+    point: the ablation, not the theory, decides which definition is better.
+    """
+    import numpy as np
+
+    drop = stats.num_experts - keep
+    spec: dict[int, list[int]] = {}
+    for slot, layer in enumerate(stats.moe_layers):
+        order = np.argsort(importance[slot], kind="stable")
+        spec[layer] = [int(e) for e in order[:drop]]
+    return (f"{label} (drop {drop})", spec)
+
+
 def arms_from_profile(
     stats: Any,
     keep: int,

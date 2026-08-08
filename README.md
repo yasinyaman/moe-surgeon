@@ -216,18 +216,51 @@ zeroing, which is the predicted ordering: deletion lets the renormalised gate ma
 flow to survivors while zeroing discards it. That ordering is also the check that
 `apply_plan` is not damaging the model beyond the loss of experts.
 
-So the comparison that decides the project is not "works vs broken", it is a
-tradeoff with numbers on both sides, at roughly the same VRAM:
+### Selection count is the wrong quantity — rank-1 frequency is better
+
+A top-k output is a gate-weighted sum, so an expert selected constantly at the
+*last* slot moves it far less than one selected first. Every ranking above used
+plain selection count. The position histogram in a capture lets us do better at no
+extra cost, and the ablation decides which weighting is right rather than an
+argument:
+
+| ranking | keep-set overlap with count | raw load deleted | perplexity |
+|---|---|---|---|
+| count (all ranks equal) | 100% | 14.6% | 16.90 (1.74×) |
+| linear, K−j | 88.5% | 15.3% | 15.34 (1.58×) |
+| harmonic, 1/(j+1) | 85.7% | 15.7% | 14.56 (1.50×) |
+| **rank-1 only** | **67.2%** | **21.6%** | **12.65 (1.30×)** |
+
+Read the middle column with the last: **rank-1's keep-set discards half again as
+much raw routing load and costs 43% less perplexity.** That is the clearest
+statement that count ≠ contribution. Four points moving monotonically as weight
+concentrates on the top slot make it a trend, not noise.
+
+Applied end to end, ranking by rank-1 frequency instead of count cuts the pruning
+cost from **1.57× to 1.25×** — excess perplexity 5.55 → 2.42, a 56% reduction, from
+reading data already being collected. `build_plan` uses it by default.
+
+It self-checks rather than assuming. vLLM's fused `topk_softmax` carries no
+ordering contract (only the grouped and bias routers honour a `sorted` flag), so
+`position_order_correlation()` measures whether frequently-chosen experts really do
+occupy better slots — −0.48 on OLMoE — and the engine falls back to plain counts,
+saying so in the plan, when they do not. That check is a population-level proxy,
+not a direct test: verifying slot *j* holds the *j*-th best score would need the
+scores, which the public capture does not carry.
+
+### Where that leaves the two paths
 
 | approach | experts kept | resident | perplexity |
 |---|---|---|---|
-| delete 24 | 40 | 40 | 15.26 (1.57×) |
+| delete 24, count-ranked | 40 | 40 | 15.26 (1.57×) |
+| delete 24, **rank-1 ranked** | 40 | 40 | **12.13 (1.25×)** |
 | **disk tier** | **64** | **24** | **~9.71 (same tokens as base)** |
 
-Same resident footprint, and the tier keeps every expert available for when the
-router asks. That is why Artifact B is the answer here rather than the fallback.
-Closing the 1.57× gap by deletion would need distillation, which this pipeline
-deliberately does not do.
+The tier still wins — fewer resident experts *and* better quality, because every
+expert is there when the router asks. But pruning is now a defensible option
+rather than a broken one: 1.25× perplexity for a 34% smaller artifact. Closing the
+remaining gap would need distillation, which this pipeline deliberately does not
+do.
 
 ## Tiering — where the win actually is
 
