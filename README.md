@@ -643,6 +643,64 @@ mechanism. None of it overturns the rest — the tier still halves load time (98
 45.2 s) at 1.003× perplexity, and pruned+tier still decodes 1.32× faster than tier
 alone.
 
+## Amplitude: half of pruning's damage was a constant
+
+The largest quality win in the project, and it is one multiply.
+
+Deleting experts changes the *amplitude* of what survives. With `renormalize=False` —
+OLMoE's setting — a surviving gate is the raw softmax probability, so restricting the
+softmax from 64 rows to 40 inflates every one of them by `1 / (1 - P_D(x))`, where
+`P_D` is the mass the deleted set used to carry. The model was never trained to receive
+an inflated MoE branch.
+
+Two things follow, and both were checked before any code was written:
+
+**A router refit cannot fix it, and cannot help pure deletion at all.** Softmax over
+the survivors is exactly Bayes conditioning: `softmax_K(W_R x)_e = p(e | chosen ∈ R)`
+for every token, so the *unchanged* rows already minimise the divergence from the
+teacher's conditional routing — at zero loss, on any corpus, with no calibration data.
+Restriction-then-softmax is monotone, so the selected set is also already the teacher's
+best available. A row refit here can only be a no-op or a regression.
+
+**The correction belongs in `down_proj`.** A softmax sums to one over whatever rows
+remain, so a uniform amplitude change is unrepresentable in the router — the same
+obstruction as the gate having no bias term. But the layer's output is *linear* in
+`down_proj`, so scaling it is exactly scaling the gate. `gate_proj` and `up_proj` must
+not be touched: SwiGLU is nonlinear in them, so scaling those changes the function
+rather than its amplitude.
+
+```bash
+surgeon calibrate --checkpoint ./pruned --corpus heldout.jsonl --limit 50
+surgeon apply --plan plan.json --source model --out ./pruned --amplitude 0.85
+```
+
+OLMoE-1B-7B pruned 64 → 40 experts, every figure a fresh load:
+
+| corpus | baseline, 64 | pruned, 40 | **pruned + amplitude 0.85** | damage removed |
+|---|---|---|---|---|
+| gsm8k, 2863 tokens | 9.6230 | 11.8754 (1.234×) | **10.5306 (1.094×)** | **60%** |
+| hellaswag, 1685 tokens | 24.5961 | 34.5260 (1.404×) | **29.0684 (1.182×)** | **55%** |
+
+hellaswag is the corpus the scalar was **not** fitted on, and 0.85 wins there too — and
+beats 0.90 there as well, so the optimum is not an artefact of the fitting set. Roughly
+half to three-fifths of pruning's perplexity cost was a systematic amplitude error, and
+0.85 ≈ the mass the 24 deleted experts used to carry.
+
+`surgeon calibrate` finds the value by measuring held-out perplexity at several scales
+on one engine, rather than by estimating `P_D` from captured activations: it optimises
+the thing being claimed instead of a proxy for it, and needs no capture path. What it
+gives up is stated in the output — the points share one engine, and successive in-place
+multiplies accumulate bf16 rounding. Measured drift: the sweep read 10.5087 where a
+fresh load of the folded artifact reads 10.5306, 0.2% apart. So the sweep locates the
+optimum and the artifact is re-measured after folding. That check also confirms folding
+at write time and scaling at serve time agree: 10.5306 and 29.0684 on both corpora,
+matching the in-place numbers exactly.
+
+The search reports the whole curve, refuses an empty or negative bracket before loading
+anything, warns when the best point sits at an edge (the true optimum would be outside
+what was measured), and declines to credit a win under 1% — several times the rounding
+drift, because a one-parameter fit deserves no more.
+
 ## The quality gate
 
 ```bash

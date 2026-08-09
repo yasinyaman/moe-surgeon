@@ -133,6 +133,14 @@ decide rather than guessing. Deletion quality is always deferred to `surgeon gat
 - **fp8 and streaming load in the out-of-tree runtime.** `compat/runtime.py` covers
   the unquantized path with `--enforce-eager`; fp8 needs `Fp8MoEMethod` substituted
   with the cache installed before the quant config captures scale tensors.
-- **Router least-squares refit** for merged clusters. The gate has `bias=False`, so a
-  merged cluster's combined selection mass has no additive term to live in; the
-  current rewrite is a usage-weighted mean.
+- ~~Router least-squares refit.~~ **Settled, and replaced by something better.** A row
+  refit provably cannot help pure deletion: softmax over survivors is exactly Bayes
+  conditioning, so the unchanged rows already minimise divergence from the teacher's
+  conditional routing at zero loss, on any corpus. What deletion *does* leave is an
+  amplitude error — surviving gates inflated by `1/(1 - P_D(x))` under
+  `renormalize=False` — and a softmax cannot carry a uniform amplitude, so the fix goes
+  in `down_proj`, where the output is linear. Measured on OLMoE pruned to 40 experts,
+  fresh loads: gsm8k 11.8754 → **10.5306** (60% of the deletion damage removed),
+  hellaswag 34.5260 → **29.0684** (55%), the second corpus not fitted on. `surgeon
+  calibrate` finds the scalar, `surgeon apply --amplitude` folds it in. The refit for
+  *merged* clusters remains unbuilt and is now moot: merging is worse than deleting.

@@ -111,10 +111,13 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         args.out,
         shard_bytes=int(args.shard_gb * 1024**3),
         require_gate=not args.skip_gate,
+        amplitude=args.amplitude,
     )
     print(f"experts: {manifest['experts_before']} -> {manifest['experts_after']}")
     print(f"top_k:   {manifest['top_k_before']} -> {manifest['top_k_after']}")
     print(f"merges applied: {manifest['merges_applied']}")
+    if manifest.get("amplitude") is not None:
+        print(f"amplitude: down_proj scaled by {manifest['amplitude']}")
     print(f"router:  {manifest['router_rewrite']}")
     print(f"shards:  {len(manifest['shards'])}")
     print(f"\nwrote {args.out}")
@@ -314,6 +317,42 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    from .compat.calibrate import calibrate_amplitude, to_dict
+    from .compat.profile_runner import iter_prompts_from_jsonl
+
+    prompts = list(iter_prompts_from_jsonl(args.corpus, args.field))
+    if args.limit:
+        prompts = prompts[: args.limit]
+    scales = (
+        tuple(float(x) for x in args.scales.split(","))
+        if args.scales
+        else None
+    )
+    kwargs = {"enforce_eager": True}
+    if args.llm_kwargs:
+        kwargs.update(json.loads(args.llm_kwargs))
+
+    result = calibrate_amplitude(
+        args.checkpoint,
+        prompts,
+        **({"scales": scales} if scales else {}),
+        llm_kwargs=kwargs,
+    )
+    print(result.report())
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(to_dict(result), f, indent=2)
+        print(f"\nwritten to  {args.out}")
+    print(
+        "\nfold it in with:  surgeon apply --plan <plan> --source <base> "
+        f"--out <dir> --amplitude {result.best_scale:.3f}"
+        if result.worth_applying
+        else "\nnothing to fold in."
+    )
+    return 0
+
+
 def _cmd_vram_floor(args: argparse.Namespace) -> int:
     from .compat.bisect_vram import bisect_floor, to_dict
 
@@ -413,6 +452,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--source", required=True, help="the base model directory")
     p.add_argument("--out", required=True, help="output checkpoint directory")
     p.add_argument("--shard-gb", type=float, default=4.0)
+    p.add_argument(
+        "--amplitude",
+        type=float,
+        help="fold this scalar into every survivor's down_proj; measure it with "
+        "`surgeon calibrate`",
+    )
     p.add_argument(
         "--skip-gate",
         action="store_true",
@@ -517,6 +562,23 @@ def main(argv: list[str] | None = None) -> int:
         help="kill a stage that exceeds this many seconds",
     )
     p.set_defaults(func=_cmd_serve)
+
+    p = sub.add_parser(
+        "calibrate",
+        help="find the down_proj amplitude a pruned checkpoint should carry",
+    )
+    p.add_argument("--checkpoint", required=True, help="the PRUNED checkpoint")
+    p.add_argument("--corpus", required=True, help="HELD-OUT JSONL to score on")
+    p.add_argument("--field", default="text")
+    p.add_argument("--limit", type=int)
+    p.add_argument(
+        "--scales",
+        help="comma-separated scales to try; deletion inflates, so the useful "
+        "bracket is below 1.0 (default 0.75..1.00)",
+    )
+    p.add_argument("--llm-kwargs", help="extra LLM() kwargs as JSON")
+    p.add_argument("--out", help="write the curve as JSON here")
+    p.set_defaults(func=_cmd_calibrate)
 
     p = sub.add_parser(
         "vram-floor",

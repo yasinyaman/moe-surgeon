@@ -311,6 +311,7 @@ def apply_plan(
     shard_bytes: int = DEFAULT_SHARD_BYTES,
     copy_extra_files: bool = True,
     require_gate: bool = True,
+    amplitude: float | None = None,
 ) -> dict[str, Any]:
     """Write the operated-on checkpoint. Returns the manifest.
 
@@ -318,6 +319,10 @@ def apply_plan(
     Deletion is the one irreversible step in the pipeline, and its cost is
     measurable before it is paid -- so paying it unmeasured is a choice that has to
     be made explicitly, not by default.
+
+    ``amplitude`` folds a scalar into every survivor's ``down_proj``, correcting the
+    gate inflation deletion introduces. See :func:`fold_amplitude` for why that is the
+    only place it can go, and `surgeon calibrate` for how to find the value.
     """
     import torch
 
@@ -409,6 +414,9 @@ def apply_plan(
             else:
                 gate, up, down = target
 
+            if amplitude is not None:
+                down = fold_amplitude(down, amplitude)
+
             if index.layout == "stacked":
                 produced.append((gate, up, down))
                 continue
@@ -454,6 +462,13 @@ def apply_plan(
         "top_k_before": _top_k(config),
         "top_k_after": _top_k(new_config),
         "merges_applied": n_merged,
+        "amplitude": amplitude,
+        "amplitude_note": (
+            "down_proj scaled by this scalar to correct the gate inflation deletion "
+            "introduces. Already folded in -- do not apply it again at serve time."
+            if amplitude is not None
+            else "not applied; run `surgeon calibrate` to measure one"
+        ),
         "router_rewrite": (
             "usage-weighted mean of member rows; the gate has no bias term, so "
             "the combined selection mass of a merged cluster is NOT represented "
@@ -478,6 +493,33 @@ def apply_plan(
     with open(os.path.join(out_dir, "surgeon_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     return manifest
+
+
+def fold_amplitude(down: Any, scale: float) -> Any:
+    """Scale one expert's ``down_proj``, which is where a gate correction can live.
+
+    Deleting experts changes the amplitude of what survives. With
+    ``renormalize=False`` -- OLMoE's setting -- a surviving gate is the raw softmax
+    probability, so restricting the softmax from E rows to K inflates every one of them
+    by ``1 / (1 - P_D(x))``, where ``P_D`` is the mass the deleted set used to carry.
+    The model was never trained to receive an inflated MoE branch.
+
+    The correction cannot go in the router. ``softmax_K(W'x)`` sums to one over
+    survivors for *any* rows, so a uniform amplitude change is unrepresentable there --
+    the same obstruction as the gate having no bias term. But the layer's output is
+    **linear** in ``down_proj``, so scaling it is exactly scaling the gate.
+
+    ``gate_proj`` and ``up_proj`` must not be touched: SwiGLU is nonlinear in them, so
+    scaling them changes the function rather than its amplitude.
+
+    Measured on OLMoE pruned 64 -> 40 experts, held-out perplexity, fresh load per
+    point: 11.8754 at 1.0 against 10.5306 at 0.85 on gsm8k (baseline 9.6230), and
+    34.5260 against 29.0684 on hellaswag (baseline 24.5961) -- a corpus the scalar was
+    not fitted on. Roughly 55-60% of deletion's perplexity cost, for one multiply.
+    """
+    if not scale > 0:
+        raise ValueError(f"amplitude must be positive, got {scale}")
+    return down * float(scale)
 
 
 def _read_torch(index: CheckpointIndex, name: str):
