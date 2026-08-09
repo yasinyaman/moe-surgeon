@@ -314,6 +314,27 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_vram_floor(args: argparse.Namespace) -> int:
+    from .compat.bisect_vram import bisect_floor, to_dict
+
+    result = bisect_floor(
+        args.model,
+        name=args.name,
+        low=args.low,
+        high=args.high,
+        tolerance=args.tolerance,
+        llm_kwargs=json.loads(args.llm_kwargs) if args.llm_kwargs else None,
+        timeout=args.timeout,
+    )
+    print(result.report())
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(to_dict(result), f, indent=2)
+        print(f"\nwritten to  {args.out}")
+    # A configuration that boots nowhere is a failure, not a floor of zero.
+    return 0 if result.floor_fraction is not None else 1
+
+
 def _cmd_seams(args: argparse.Namespace) -> int:
     from .compat.seams import SEAMS, check, check_all_static
 
@@ -496,6 +517,25 @@ def main(argv: list[str] | None = None) -> int:
         help="kill a stage that exceeds this many seconds",
     )
     p.set_defaults(func=_cmd_serve)
+
+    p = sub.add_parser(
+        "vram-floor",
+        help="bisect the smallest memory budget a model boots and serves in",
+    )
+    p.add_argument("--model", required=True, help="model or checkpoint directory")
+    p.add_argument("--name", help="label for the report")
+    p.add_argument("--low", type=float, default=0.05)
+    p.add_argument("--high", type=float, default=0.90)
+    p.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.01,
+        help="stop when the bracket is this narrow, as a fraction of the device",
+    )
+    p.add_argument("--timeout", type=float, default=900.0, help="per boot attempt")
+    p.add_argument("--llm-kwargs", help="extra LLM() kwargs as JSON")
+    p.add_argument("--out", help="write the result as JSON here")
+    p.set_defaults(func=_cmd_vram_floor)
 
     p = sub.add_parser("seams", help="check the vLLM seams this package holds")
     p.add_argument("--source", help="check a vLLM source tree instead of the install")

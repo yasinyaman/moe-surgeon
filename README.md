@@ -440,6 +440,50 @@ For reference, what deletion alone costs at 40/64, so the tradeoff is on the rec
 Deletion is worth doing where an expert is genuinely worthless — it shrinks the
 store and the candidate set for free. It is not worth doing to *replace* the tier.
 
+## Feasibility: the measured floor, not the preallocated pool
+
+`bench.py`'s peak-VRAM reading was never a floor. vLLM claims
+`gpu_memory_utilization` of the device up front, so on a unified-memory box the
+number tracks the fraction it was told to take — asking for 35% of 122 GiB reports
+~45 GiB whether the model is 7 B or 3 B. `surgeon budget`'s arithmetic is right about
+weights and silent about activation peaks, the graph pool and fragmentation.
+
+`surgeon vram-floor` measures the quantity directly: boot at a budget, generate a
+token, bisect for the smallest budget that survives. One process per attempt, because
+an engine does not release device memory when its Python object goes out of scope.
+
+```bash
+surgeon vram-floor --model ./pruned --low 0.03 --high 0.10 --tolerance 0.003
+```
+
+Granite 3.0-3b-a800m on GB10 (122 GiB device), pruned from 40 experts to 30:
+
+| arm | boot floor | resident weights (arithmetic) | overhead |
+|---|---|---|---|
+| baseline, 40 experts | **7.37 GiB** (failed 0.058, booted 0.061) | 6.29 GiB | 1.08 GiB |
+| pruned, 30 experts | **6.04 GiB** (failed 0.048, booted 0.050) | 4.88 GiB | 1.16 GiB |
+
+Deleting 25% of the experts lowered the floor by **1.33 GiB**, against 1.41 GiB
+predicted by `surgeon budget` — agreement inside the ±0.36 GiB tolerance, with a
+consistent ~1.1 GiB of non-weight overhead on both arms. That is the calibration the
+feasibility axis was missing: the arithmetic is trustworthy, plus about a gigabyte.
+
+Two traps this measurement exposed, both of which produce a confident wrong number:
+
+**A search that never fails has not found a floor.** The first run reported both arms
+at "floor 0.059" — identical, suggesting pruning bought nothing. Nothing had failed;
+the bisection hit its tolerance while still above the boundary, so 0.059 was just the
+smallest budget probed. An unbracketed result now says `UNBRACKETED` and reports
+`<=`. The arms are 1.33 GiB apart, and the first run showed them as equal.
+
+**Checkpoint dtype is not serving dtype.** Granite stores fp32 and its config names no
+dtype at all, so `surgeon budget` counted 12.57 GiB against a measured 7.37 GiB
+floor — an apparent contradiction. HF treats a silent config as fp32 and vLLM's
+`_resolve_auto_dtype` downcasts fp32 to the platform's preferred 16-bit width, so
+resident weights are 6.29 GiB. `surgeon budget` now says so, and only ever narrows —
+an fp8 checkpoint whose config says `bfloat16` keeps fp8 weights resident, and
+costing those at 2 bytes would be the same error inverted.
+
 ## The quality gate
 
 ```bash

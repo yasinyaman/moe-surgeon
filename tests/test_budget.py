@@ -308,3 +308,73 @@ def test_stacked_layout_expert_bytes_are_not_misfiled(tmp_path):
     assert g.router_bytes == 2 * experts * hidden
     # The experts must dominate, as they do in every real MoE checkpoint.
     assert g.routed_expert_bytes > g.other_bytes
+
+
+# ------------------------------------- checkpoint dtype is not always serving dtype
+
+
+def test_an_fp32_checkpoint_is_costed_at_the_width_vllm_downcasts_to():
+    """Granite 3.0 stores fp32 weights and its config names no dtype at all.
+
+    Measured: 12.57 GiB of checkpoint bytes against a 7.37 GiB boot floor, which only
+    reconciles if resident weights are 6.29 GiB. vLLM's `_resolve_auto_dtype` does
+    "Downcast for float32 models", and HF treats a silent config as fp32 -- so
+    silence means downcast too. Trusting the checkpoint width here sizes a deployment
+    twice too large and makes the arithmetic contradict the measurement.
+    """
+    from vllm_moe_surgeon.surgery.budget import _serving_dtype_bytes
+
+    # The motivating case: fp32 file, config says nothing.
+    assert _serving_dtype_bytes({}, 4) == 2
+    assert _serving_dtype_bytes({"torch_dtype": "float32"}, 4) == 2
+    assert _serving_dtype_bytes({"torch_dtype": None}, 4) == 2
+    # An explicit 16-bit request, however it is spelled.
+    assert _serving_dtype_bytes({"torch_dtype": "bfloat16"}, 4) == 2
+    assert _serving_dtype_bytes({"torch_dtype": "torch.bfloat16"}, 4) == 2
+    assert _serving_dtype_bytes({"dtype": "float16"}, 4) == 2
+    # A 16-bit checkpoint is already at the serving width: nothing to say.
+    assert _serving_dtype_bytes({"torch_dtype": "bfloat16"}, 2) == 2
+    assert _serving_dtype_bytes({}, 2) == 2
+
+
+def test_a_quantized_checkpoint_is_never_inflated_to_16_bit():
+    """The same error in the other direction, and it would overstate the cost.
+
+    fp8 checkpoints carry ``torch_dtype: bfloat16`` in their config, but vLLM keeps
+    the fp8 weights resident. Costing them at 2 bytes would double the estimate.
+    """
+    from vllm_moe_surgeon.surgery.budget import _serving_dtype_bytes
+
+    assert _serving_dtype_bytes({"torch_dtype": "bfloat16"}, 1) == 1
+    assert _serving_dtype_bytes({}, 1) == 1
+
+
+def test_the_scale_is_only_applied_when_the_dtypes_differ():
+    from vllm_moe_surgeon.surgery.budget import CheckpointGeometry
+
+    def geom(checkpoint_bytes, serving_bytes):
+        return CheckpointGeometry(
+            num_experts=4,
+            top_k=2,
+            moe_layers=[0],
+            hidden=8,
+            intermediate=4,
+            expert_bytes=1,
+            routed_expert_bytes=100,
+            shared_expert_bytes=0,
+            router_bytes=0,
+            other_bytes=0,
+            checkpoint_dtype_bytes=checkpoint_bytes,
+            serving_dtype_bytes=serving_bytes,
+        )
+
+    same = geom(2, 2)
+    assert same.serving_scale == 1.0
+    assert not same.dtype_differs
+
+    halved = geom(4, 2)
+    assert halved.serving_scale == 0.5
+    assert halved.dtype_differs
+
+    # An unset serving width must not silently scale anything to zero.
+    assert geom(4, 0).serving_scale == 1.0

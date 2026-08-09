@@ -111,6 +111,22 @@ class CheckpointGeometry:
     #: Everything else: embeddings, attention, norms, lm_head.
     other_bytes: int
     checkpoint_dtype_bytes: int
+    #: Bytes per element vLLM will actually hold weights at. Usually the
+    #: checkpoint's own width -- but Granite stores fp32 and names no dtype, and vLLM
+    #: downcasts fp32, so every byte figure here is twice what becomes resident.
+    #: Sizing a deployment off the checkpoint number would reserve double.
+    serving_dtype_bytes: int = 0
+
+    @property
+    def serving_scale(self) -> float:
+        """Multiply a checkpoint byte figure by this to get resident bytes."""
+        if not self.serving_dtype_bytes or not self.checkpoint_dtype_bytes:
+            return 1.0
+        return self.serving_dtype_bytes / self.checkpoint_dtype_bytes
+
+    @property
+    def dtype_differs(self) -> bool:
+        return self.serving_scale != 1.0
 
     @property
     def total_bytes(self) -> int:
@@ -208,7 +224,51 @@ def analyze(checkpoint: str) -> CheckpointGeometry:
         router_bytes=router,
         other_bytes=other,
         checkpoint_dtype_bytes=dtype_bytes,
+        serving_dtype_bytes=_serving_dtype_bytes(config, dtype_bytes),
     )
+
+
+#: What ``dtype="auto"`` resolves to when the config asks for fp32 -- bf16 or fp16,
+#: two bytes either way on every current accelerator. Not a guess: vLLM's
+#: ``_resolve_auto_dtype`` does ``if config_dtype == torch.float32: config_dtype =
+#: preferred_dtype`` under the comment "Downcast for float32 models".
+PREFERRED_DTYPE_BYTES = 2
+
+
+def _serving_dtype_bytes(config: dict, checkpoint_dtype_bytes: int) -> int:
+    """Width vLLM will actually hold weights at, which is not always the file's.
+
+    Measured on Granite 3.0, whose weights are fp32 and whose config names no dtype
+    at all: 12.57 GiB of checkpoint bytes, but a measured boot floor of 7.37 GiB --
+    only reconcilable if resident weights are 6.29 GiB. vLLM downcasts fp32 under
+    ``dtype="auto"``, and a config that names nothing is fp32 by HF's default, so
+    *silence means downcast* too. Getting this backwards sizes a deployment twice too
+    large and makes the arithmetic contradict the measurement.
+
+    Only ever narrows. An fp8 checkpoint whose config says ``bfloat16`` keeps its fp8
+    weights resident -- claiming 2 bytes there would inflate the estimate, which is
+    the same error in the other direction.
+    """
+    name = config.get("torch_dtype") or config.get("dtype")
+    if isinstance(name, str):
+        width = _TORCH_DTYPE_BYTES.get(name.replace("torch.", ""))
+        if width is not None and width != 4:
+            return min(width, checkpoint_dtype_bytes)
+    # fp32 by declaration, by absence, or by a name we do not know: vLLM downcasts.
+    return min(PREFERRED_DTYPE_BYTES, checkpoint_dtype_bytes)
+
+
+_TORCH_DTYPE_BYTES = {
+    "float32": 4,
+    "float": 4,
+    "bfloat16": 2,
+    "float16": 2,
+    "half": 2,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
+    "int8": 1,
+    "uint8": 1,
+}
 
 
 @dataclass
@@ -347,6 +407,17 @@ def report(
         f"  everything else   {_gib(geometry.other_bytes):>10}"
         "   attention, embeddings, norms",
         f"  total             {_gib(geometry.total_bytes):>10}",
+    ]
+    if geometry.dtype_differs:
+        lines += [
+            "",
+            f"  vLLM serves this at {geometry.serving_dtype_bytes} bytes, not the "
+            f"checkpoint's {geometry.checkpoint_dtype_bytes} (auto downcasts "
+            "fp32) -- so resident",
+            f"  weights are {_gib(int(geometry.total_bytes * geometry.serving_scale))}"
+            f", not {_gib(geometry.total_bytes)}. Size the deployment off that.",
+        ]
+    lines += [
         "",
         "one cache slot / store record:",
         f"  GPU slot (model dtype)   {_gib(geometry.resident_gpu_record_bytes):>10}"

@@ -93,9 +93,11 @@ decide rather than guessing. Deletion quality is always deferred to `surgeon gat
 
 ## Open
 
-- **Peak-VRAM measurement** in `bench.py` reports the preallocated pool on a
-  unified-memory device, so the feasibility axis leans on `surgeon budget`'s
-  arithmetic rather than a measured minimum. A boot-bisection would close it.
+- **The boot floor is only measured for prune-vs-baseline.** `surgeon vram-floor`
+  closes the feasibility axis for deletion (1.33 GiB measured against 1.41 GiB
+  predicted on Granite). The tiered arm's floor is not measured yet: it needs the
+  store and plugin config threaded through the probe, which the harness supports but
+  no run has exercised.
 - **Merging is unexercised on real candidates.** The machinery is exact on
   synthetic ones; no model measured so far offers a real pair.
 - **fp8 and streaming load in the out-of-tree runtime.** `compat/runtime.py` covers
