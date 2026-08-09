@@ -9,6 +9,8 @@ measured on the GPU boxes and recorded in the README.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from vllm_moe_surgeon.compat import bisect_vram
@@ -197,3 +199,29 @@ def test_a_silent_failure_still_says_something():
     from vllm_moe_surgeon.compat.bisect_vram import _diagnose
 
     assert _diagnose(_Completed(returncode=137), 0.05) == "exit 137"
+
+
+def test_the_result_records_what_it_was_booted_with(monkeypatch):
+    """A floor without its configuration is not interpretable.
+
+    Three arms were once written up as "tiered, ram_cache 0" when that setting had
+    turned the disk tier off entirely. Nothing in the saved result could have
+    contradicted the label, so the label went unchallenged into the README.
+    """
+    monkeypatch.setattr(bisect_vram, "probe", _fake_probe(0.42))
+    kwargs = {
+        "enforce_eager": True,
+        "additional_config": {"surgeon": {"expert_cache_size": 24, "ram_cache": 48}},
+    }
+    result = bisect_floor("m", low=0.05, high=0.90, tolerance=0.02, llm_kwargs=kwargs)
+
+    assert result.llm_kwargs == kwargs
+    assert "ram_cache" in result.report()
+    assert "ram_cache" in json.dumps(bisect_vram.to_dict(result))
+
+
+def test_an_unconfigured_run_does_not_invent_a_config_line(monkeypatch):
+    monkeypatch.setattr(bisect_vram, "probe", _fake_probe(0.42))
+    result = bisect_floor("m", low=0.05, high=0.90, tolerance=0.02)
+    assert result.llm_kwargs == {}
+    assert "booted with" not in result.report()

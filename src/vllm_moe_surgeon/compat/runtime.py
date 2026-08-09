@@ -103,14 +103,61 @@ def read_config() -> RuntimeConfig:
     )
 
 
+def check_config(config: RuntimeConfig) -> None:
+    """Refuse contradictory configurations. No vLLM, no layer, no device.
+
+    Split out from :func:`validate` deliberately: these are questions about the
+    request alone, so they can be answered on a host with no vLLM installed and
+    *before* an engine boots -- the same reason the job server rejects an unrunnable
+    request instead of starting a pipeline that will fail three stages in.
+    """
+    if not config.enabled:
+        return
+
+    if config.store_dir and config.ram_cache <= 0:
+        # This combination silently produced a mislabelled measurement. Three
+        # boot-floor arms were recorded as "tiered, ram_cache 0" when `use_disk` had
+        # turned the disk tier off entirely, leaving the provider in full-DRAM mode
+        # with every expert page-locked for the process lifetime -- 31.10 GiB against
+        # the genuine tiered arm's 23.40 GiB. Both modes logged the same "expert cache
+        # active" line, so nothing gave it away. A store_dir asks for a disk tier and
+        # ram_cache=0 refuses to build one: say so rather than silently picking the
+        # more expensive of the two.
+        raise ValueError(
+            f"store_dir={config.store_dir!r} asks for the disk tier, but "
+            "ram_cache=0 disables it -- the provider would hold every expert in "
+            "pinned host memory instead, which costs more, not less. Set "
+            "ram_cache >= expert_cache_size, or drop store_dir to ask for "
+            "full-DRAM mode deliberately."
+        )
+
+    if config.use_disk and config.ram_cache < config.expert_cache_size:
+        # The warm tier feeds the GPU slots. A pool smaller than the resident set
+        # cannot hold what the GPU already has, so every eviction becomes a disk read.
+        raise ValueError(
+            f"ram_cache={config.ram_cache} is below expert_cache_size="
+            f"{config.expert_cache_size}: the warm tier would be smaller than the "
+            "resident set it feeds, so every eviction would go to disk."
+        )
+
+    if config.fp8_store and not config.use_disk:
+        raise ValueError(
+            "fp8_store only describes how the disk store encodes records, and no "
+            "store is being built. Set store_dir and ram_cache, or drop fp8_store."
+        )
+
+
 def validate(config: RuntimeConfig, layer: Any) -> None:
     """Refuse the combinations this port does not implement, by name.
 
     Each of these is a case where proceeding would produce wrong output rather than
-    an error, so they are checked before a single weight is allocated.
+    an error, so they are checked before a single weight is allocated. Pure-config
+    contradictions are delegated to :func:`check_config`.
     """
     if not config.enabled:
         return
+
+    check_config(config)
 
     moe = layer.moe_config
     top_k = moe.experts_per_token
@@ -322,11 +369,22 @@ def install() -> bool:
                     experts_cls=self.experts_cls,
                     routing_tables=layer._expert_routing_tables(),
                 )
+            # Naming the mode is not cosmetic: full-DRAM and disk-backed differ by
+            # whether the full expert set stays page-locked for the process lifetime,
+            # and an earlier measurement was misattributed because one line covered
+            # both. The prototype logged the distinction; the port had dropped it.
             logger.info(
-                "out-of-tree expert cache active on %s: %d slots of %d experts",
+                "out-of-tree expert cache active on %s: %d slots of %d experts, "
+                "%s",
                 layer.layer_name,
                 min(config.expert_cache_size, layer.local_num_experts),
                 layer.local_num_experts,
+                (
+                    f"disk-backed (ram_cache={config.ram_cache}"
+                    f"{', fp8' if config.fp8_store else ''})"
+                    if config.use_disk
+                    else "full-DRAM: every expert stays pinned in host memory"
+                ),
             )
 
         def apply(self, layer, x, topk_weights, topk_ids, shared_experts,

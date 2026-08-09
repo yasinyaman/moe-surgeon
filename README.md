@@ -484,40 +484,78 @@ resident weights are 6.29 GiB. `surgeon budget` now says so, and only ever narro
 an fp8 checkpoint whose config says `bfloat16` keeps fp8 weights resident, and
 costing those at 2 bytes would be the same error inverted.
 
-### Measured: the tier raises the boot floor, it does not lower it
+### Measured: the tier raises the boot floor, and why
 
 The uncomfortable result, and the reason the feasibility axis was worth building an
-instrument for. OLMoE-1B-7B on GB10, every arm bracketed by an observed failure:
+instrument for. OLMoE-1B-7B on GB10 (121.63 GiB unified memory), every arm bracketed
+by an observed failure:
 
 | arm | boot floor | bracket |
 |---|---|---|
 | untiered, 64 resident | **14.60 GiB** | failed 0.116, booted 0.120 |
-| tier 24/64, `ram_cache` 48 | **23.40 GiB** | failed 0.190, booted 0.192 |
-| tier 24/64, `ram_cache` 0 | **31.10 GiB** | failed 0.254, booted 0.256 |
-| tier 10/64, `ram_cache` 0 | **28.53 GiB** | failed 0.232, booted 0.235 |
+| disk tier, 24 slots, `ram_cache` 48, fp8 store | **23.40 GiB** | failed 0.190, booted 0.192 |
+| full-DRAM, 24 slots (`ram_cache` 0) | **31.10 GiB** | failed 0.254, booted 0.256 |
+| full-DRAM, 10 slots (`ram_cache` 0) | **28.53 GiB** | failed 0.232, booted 0.235 |
 
-Capacity moves the floor in the direction it should — 10 slots needs less than 24 —
-so the resident cache is being sized as designed. But every tiered arm sits well
-*above* the untiered one, which is the opposite of the intuition the tier exists to
-serve.
+**Correction to an earlier version of this table.** Rows three and four were first
+written up as *tiered* arms with `ram_cache 0`, and they are not tiered at all.
+`RuntimeConfig.use_disk` is `bool(store_dir) and ram_cache > 0`, so `ram_cache 0`
+builds no store: the provider takes its full-DRAM branch and keeps `_cpu_w13` /
+`_cpu_w2`, every expert page-locked for the process lifetime, where the disk branch
+sets both to `None`. Both modes logged the same "expert cache active" line, so
+nothing distinguished them. Three fixes came out of that, all in this repo now: the
+combination is **refused** rather than silently resolved, the log **names the mode**,
+and `BisectResult` **records the kwargs each arm booted with** — a floor without its
+configuration is a number whose label nothing can check.
 
-The likely cause is a scope limit already recorded above: **streaming the checkpoint
-into the store is not ported.** The loader therefore materialises every expert before
-the provider releases `w13_weight` to `numel() == 0`, so the boot peak can never fall
-below the untiered peak, and the cache slots are added on top of it. That is
-inference from the capacity trend plus the known gap, not a measurement of the
-allocation itself.
+So there was never a `ram_cache` anomaly. The 7.7 GiB was the difference between
+*building a bounded store* and *holding all 64 experts pinned forever* — the opposite
+direction from "less host cache is cheaper".
 
-The `ram_cache` direction is not explained. A *larger* pinned host pool lowered the
-floor by 7.7 GiB, when "less host cache" should if anything mean less memory. That
-is recorded as observed and undiagnosed rather than rationalised.
+What remains is real: the genuine tiered arm still needs **23.40 GiB against 14.60
+untiered**. The accounting closes on known allocations (OLMoE: 16 layers × 64 experts,
+12 MiB/expert, 12.0 GiB of expert weights):
 
-What this does not overturn: the tier still halves load time (98.6 s → 45.2 s) at
-1.003× perplexity, and pruned+tier still decodes 1.32× faster than tier alone. The
-tier earns its place on those axes. It simply does not yet earn it on feasibility,
-which is exactly the per-axis rule this project is built on — and it makes streaming
-load the highest-value open item rather than a nicety, because a steady-state
-residency win that a boot peak cancels is not a win anyone can deploy.
+| term | tiered, `ram_cache` 48 fp8 | full-DRAM, 24 slots |
+|---|---|---|
+| pinned set from `create_weights` | 12.0 | 12.0 |
+| provider's own full mirror | — | 12.0 |
+| warm pool (48 × 6.02 MiB × 16) | 4.5 | — |
+| device slot buffers (12 MiB × cap × 16) | 4.5 | 4.5 |
+| non-expert weights and overhead | ~2.6 | ~2.6 |
+| **predicted** | **~23.6** | **~31.1** |
+| measured | 23.40 | 31.10 |
+
+The capacity axis checks independently: 24 → 10 slots predicts 2.63 GiB, measured
+2.57 GiB.
+
+**Why host bytes show up in a device floor.** On GB10, `MemorySnapshot.measure`
+substitutes `psutil` available memory for `cudaMemGetInfo`'s free value on integrated
+GPUs, so page-locked host memory is charged against `gpu_memory_utilization`. That is
+what makes the 12.0 GiB pinned set from `create_weights` — allocated on the host
+precisely so loading would *not* need device capacity — land in the floor anyway.
+
+**And a second mechanism, which the port did not account for.** `create_weights`
+allocates `device="cpu"` on purpose (`runtime.py`: "so loading never needs device
+capacity for the full expert set"), but vLLM wraps `process_weights_after_loading` in
+`device_loading_context`, which hoists every `cpu`-typed parameter to the device
+first. So `build_provider` reads a **CUDA** `w13_weight` holding all 64 experts, alive
+until `replace_parameter`. It is per-module, so ~768 MiB for one layer at a time
+rather than 12 GiB — but it also means the provider's `_pinned_cpu_copy` copies *from
+device*, which is why full-DRAM mode allocates a second full pinned mirror instead of
+reusing the one already there.
+
+The fix is therefore **streaming load** — intercepting the weight loader so experts go
+straight into the store and the `[num_experts, ...]` tensor never exists. It removes
+the 12.0 GiB term and, with zero-expert placeholders, leaves nothing to hoist and
+nothing to release. Note what it is *not*: on a discrete GPU it saves no device bytes
+at all, because under the tier the full set was never on the device to begin with. It
+is a host-memory feature that only becomes a device-memory feature on unified memory.
+
+What none of this overturns: the tier still halves load time (98.6 s → 45.2 s) at
+1.003× perplexity, and pruned+tier still decodes 1.32× faster than tier alone. It
+earns its place on those axes and not yet on feasibility — which is the per-axis rule
+working as intended.
 
 ## The quality gate
 

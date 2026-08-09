@@ -93,16 +93,28 @@ decide rather than guessing. Deletion quality is always deferred to `surgeon gat
 
 ## Open
 
-- **Streaming load, now the highest-value open item.** Measured: the tier's boot
-  floor is 23.40 GiB against 14.60 GiB untiered (OLMoE, capacity 24, GB10). Because
-  the checkpoint is not streamed into the store, every expert is materialised before
-  `w13_weight` is released, so the boot peak cannot fall below the untiered peak and
-  the cache slots land on top. A steady-state residency win that the boot peak
-  cancels cannot be deployed. Deletion's floor *is* closed: 1.33 GiB measured against
-  1.41 GiB predicted on Granite.
-- **Undiagnosed:** a larger pinned host pool *lowered* the tier's boot floor by
-  7.7 GiB (`ram_cache` 48 → 23.40 GiB, `ram_cache` 0 → 31.10 GiB). The direction is
-  backwards and the mechanism is not known.
+- **Streaming load, the highest-value open item.** Measured: the tier's boot floor is
+  23.40 GiB against 14.60 GiB untiered (OLMoE, capacity 24, GB10). The dominant term
+  is the 12.0 GiB page-locked expert set that `create_weights` allocates and the
+  loader fills; on this device host bytes are charged to `gpu_memory_utilization`
+  (`MemorySnapshot.measure` substitutes psutil availability on integrated GPUs).
+  Intercepting the weight loader removes that term outright, and zero-expert
+  placeholders leave nothing for `device_loading_context` to hoist. Stated precisely
+  because it is easy to oversell: on a **discrete** GPU this buys zero device bytes,
+  since the full set was already never device-resident under the tier. Deletion's
+  floor *is* closed: 1.33 GiB measured against 1.41 GiB predicted on Granite.
+- **`device_loading_context` defeats the host allocation.** vLLM hoists every
+  `cpu`-typed parameter to the device before `process_weights_after_loading`, so the
+  port's deliberate `device="cpu"` allocation is device-resident by the time
+  `build_provider` reads it (per-module: ~768 MiB at a time, not 12 GiB). A UVA
+  accelerator view reports `device.type == "cuda"` and is how vLLM's own offloader
+  carries host params through untouched — `get_accelerator_view_from_cpu_tensor` is
+  public, so this is fixable out-of-tree. Second-order once streaming load lands.
+- ~~Undiagnosed `ram_cache` anomaly.~~ **Diagnosed and closed.** `ram_cache 0` did not
+  shrink the pool, it disabled the disk tier (`use_disk` requires `ram_cache > 0`),
+  leaving the provider holding all 64 experts pinned for the process lifetime. Now
+  refused outright, the log names the mode, and `BisectResult` records each arm's
+  kwargs.
 - **Merging is unexercised on real candidates.** The machinery is exact on
   synthetic ones; no model measured so far offers a real pair.
 - **fp8 and streaming load in the out-of-tree runtime.** `compat/runtime.py` covers

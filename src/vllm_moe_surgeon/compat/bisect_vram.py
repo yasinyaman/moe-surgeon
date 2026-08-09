@@ -78,6 +78,11 @@ class BisectResult:
     device_total_gib: float
     attempts: list[Attempt] = field(default_factory=list)
     tolerance: float = DEFAULT_TOLERANCE
+    #: The kwargs every probe was booted with. Recorded because a result without them
+    #: is not interpretable: three arms were once written up as "tiered, ram_cache 0"
+    #: when that setting had turned the disk tier off entirely, and nothing in the
+    #: saved result could have contradicted the label.
+    llm_kwargs: dict[str, Any] = field(default_factory=dict)
 
     @property
     def floor_gib(self) -> float | None:
@@ -126,6 +131,11 @@ class BisectResult:
             )
         lines.append(f"  {len(self.attempts)} boots: ")
         lines.append("    " + "  ".join(a.summary for a in self.attempts))
+        if self.llm_kwargs:
+            # Printed, not just stored: an arm's label is a claim about its
+            # configuration, and the configuration is the only thing that can check it.
+            booted = json.dumps(self.llm_kwargs, sort_keys=True)
+            lines.append(f"  booted with: {booted}")
         return "\n".join(lines)
 
 
@@ -251,6 +261,7 @@ def bisect_floor(
         highest_failure=None,
         device_total_gib=device_total_gib(),
         tolerance=tolerance,
+        llm_kwargs=dict(llm_kwargs or {}),
     )
 
     ceiling = probe(model, high, llm_kwargs=llm_kwargs, timeout=timeout, env=env)
