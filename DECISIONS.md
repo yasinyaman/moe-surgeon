@@ -93,9 +93,6 @@ decide rather than guessing. Deletion quality is always deferred to `surgeon gat
 
 ## Open
 
-- **Writing a stacked (Granite) checkpoint.** Reading is supported; `apply` refuses
-  to write one, because emitting per-expert tensors for a loader expecting stacked
-  ones fails to load and emitting them under stacked names loads wrong.
 - **Peak-VRAM measurement** in `bench.py` reports the preallocated pool on a
   unified-memory device, so the feasibility axis leans on `surgeon budget`'s
   arithmetic rather than a measured minimum. A boot-bisection would close it.

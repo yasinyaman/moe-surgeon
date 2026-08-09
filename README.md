@@ -339,6 +339,48 @@ zeroing, which is the predicted ordering: deletion lets the renormalised gate ma
 flow to survivors while zeroing discards it. That ordering is also the check that
 `apply_plan` is not damaging the model beyond the loss of experts.
 
+### Writing back the stacked (Granite) layout
+
+Checkpoints disagree on how expert weights are stored, and the difference is
+structural. The per-expert layout (OLMoE, Qwen, DeepSeek, Mixtral exports) gives one
+tensor per expert per projection. The stacked layout (IBM Granite) puts a whole
+layer in `input_linear.weight` of shape `[E, 2I, H]` with gate and up already fused,
+plus `output_linear.weight` of `[E, H, I]`.
+
+The output keeps the source's layout, and that is not a preference. Per-expert
+tensors written for a loader that expects stacked ones fail to load; the same
+tensors written under stacked names load **wrong**. Two things have to be exact:
+
+- **Half order.** Gate before up in each expert's slab — the order vLLM's granitemoe
+  loader assumes when it does `w1, w3 = p[e].chunk(2, dim=0)`. Swapped, the
+  checkpoint loads without a complaint and computes a different function.
+- **Slab order.** New id *i* holds the *i*-th survivor, and the router rows must be
+  reordered by the same mapping.
+
+Streaming survives this only partly. A stacked tensor cannot be written
+incrementally, so that path buffers one layer's survivors — peak cost is one layer
+of experts, not one model.
+
+Verified end to end on `granite-3.0-3b-a800m-base` (40 experts, top-8, 32 layers,
+stacked, shipped in fp32): pruned to 30 experts, written back stacked, and **loaded
+and generated in vLLM** — 13.5 GiB → 9.8 GiB, `num_local_experts` 40 → 30, routers
+`[30, 1536]`.
+
+| | perplexity | vs baseline |
+|---|---|---|
+| baseline, 40 experts | 2.2543 | — |
+| pruned to 30, applied | 5.2835 | **2.34×** |
+| gate's zeroing proxy predicted | — | 2.68× |
+
+The proxy over-predicted the damage by 0.34×, in the same direction as on OLMoE
+(1.30× predicted, 1.25× applied). Zeroing an expert leaves its gate mass stranded
+while deletion redistributes it across the renormalised survivors, so the gate is
+conservative by construction — on two families and both layouts now.
+
+A per-layer share threshold is refused here rather than approximated: dropping
+"everything below 1.8%" ended layers at 30, 32 and 33 survivors, and the HF config
+has a single `num_experts` that cannot express that. Uniform budgets only.
+
 ### Selection count is the wrong quantity — rank-1 frequency is better
 
 A top-k output is a gate-weighted sum, so an expert selected constantly at the

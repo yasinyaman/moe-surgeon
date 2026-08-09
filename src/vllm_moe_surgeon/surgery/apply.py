@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Apply a plan to a checkpoint, producing a smaller one that vLLM can serve.
 
-Streaming throughout: tensors are read one at a time through
+Mostly streaming: tensors are read one at a time through
 :class:`~.descriptors.CheckpointIndex` and flushed into output shards as a byte
-budget fills, so a model far larger than host RAM can be operated on.
+budget fills, so a model far larger than host RAM can be operated on. The one
+exception is structural -- a *stacked* checkpoint (Granite) stores a layer's experts
+in a single ``[E, 2I, H]`` tensor, which cannot be written incrementally, so that
+path buffers one layer's survivors. Peak cost is one layer of experts, not one model.
+
+The output keeps the source's layout, per-expert or stacked. That is not a
+preference: per-expert tensors written for a loader that expects stacked ones fail
+to load, and the same tensors written under stacked names load *wrong*.
 
 Three things have to stay consistent or the result loads but is wrong:
 
@@ -37,7 +44,7 @@ from typing import Any
 import numpy as np
 
 from .._logging import init_logger
-from .descriptors import CheckpointIndex
+from .descriptors import LAYOUTS, CheckpointIndex
 from .plan import Plan, deletes_anything, gate_passed, validate_plan
 
 logger = init_logger(__name__)
@@ -215,12 +222,74 @@ class ShardWriter:
 
 
 def _expert_tensors(index: CheckpointIndex, layer: int, expert: int):
-    """``(gate, up, down)`` as float32 numpy."""
+    """``(gate, up, down)`` as float32 numpy, whatever the source layout.
+
+    Through ``read_expert``, not ``read(tensor_name(...))``: those two coincide only
+    for the per-expert layout. For a stacked checkpoint ``tensor_name`` names the
+    whole ``[E, 2I, H]`` tensor, so reading it directly would hand every caller all
+    the experts at once instead of the one it asked for.
+
+    Both layouts yield the same per-expert shapes -- gate/up ``[I, H]``, down
+    ``[H, I]`` -- which is why alignment and merging need no layout awareness at all.
+    """
     return (
-        index.read(index.tensor_name(layer, expert, "gate_proj")),
-        index.read(index.tensor_name(layer, expert, "up_proj")),
-        index.read(index.tensor_name(layer, expert, "down_proj")),
+        index.read_expert(layer, expert, "gate_proj"),
+        index.read_expert(layer, expert, "up_proj"),
+        index.read_expert(layer, expert, "down_proj"),
     )
+
+
+def _expert_tensor_names(index: CheckpointIndex, layer: int) -> set[str]:
+    """Every source tensor holding this layer's expert weights.
+
+    These are the names ``apply_plan`` must *not* copy through, because it rewrites
+    them. For the per-expert layout it is a whole prefix; for the stacked layout it
+    is exactly two tensors.
+    """
+    if index.layout == "stacked":
+        return {
+            index.tensor_name(layer, 0, "gate_proj"),
+            index.tensor_name(layer, 0, "down_proj"),
+        }
+    prefix = f"model.layers.{layer}.mlp.experts."
+    return {name for name in index.weight_map if name.startswith(prefix)}
+
+
+def _write_experts_stacked(
+    writer: ShardWriter,
+    index: CheckpointIndex,
+    layer: int,
+    experts: list[tuple[Any, Any, Any]],
+    dtype,
+) -> None:
+    """Re-stack survivors into ``input_linear`` / ``output_linear``.
+
+    ``input_linear`` is ``[K, 2I, H]`` with gate before up in each expert's slab --
+    the order vLLM's granitemoe loader assumes when it does
+    ``w1, w3 = p[e].chunk(2, dim=0)``. Getting that order backwards would produce a
+    checkpoint that loads without complaint and computes the wrong function, which is
+    why the two halves are concatenated here explicitly rather than by reusing
+    whatever order they arrived in.
+    """
+    import torch
+
+    fused = torch.stack(
+        [
+            torch.cat(
+                (
+                    torch.from_numpy(np.ascontiguousarray(gate)),
+                    torch.from_numpy(np.ascontiguousarray(up)),
+                ),
+                dim=0,
+            )
+            for gate, up, _ in experts
+        ]
+    ).to(dtype)
+    down = torch.stack(
+        [torch.from_numpy(np.ascontiguousarray(d)) for _, _, d in experts]
+    ).to(dtype)
+    writer.add(index.tensor_name(layer, 0, "gate_proj"), fused)
+    writer.add(index.tensor_name(layer, 0, "down_proj"), down)
 
 
 def _iter_source_tensors(index: CheckpointIndex) -> Iterator[str]:
@@ -256,16 +325,10 @@ def apply_plan(
 
     surgery = derive_surgery(plan)
     index = CheckpointIndex.open(source)
-    if index.layout != "per_expert":
-        # Reading a stacked checkpoint works; writing one back does not, since the
-        # experts would have to be re-stacked and the router renamed. Refusing is
-        # the only safe option: emitting per-expert tensors for a model whose
-        # loader expects stacked ones produces a checkpoint that fails to load, and
-        # emitting them under stacked names would produce one that loads wrong.
+    if index.layout not in LAYOUTS:
         raise NotImplementedError(
-            f"{source} uses the {index.layout!r} expert layout. Reading it is "
-            "supported (inspect, budget, tier), but writing an operated-on "
-            "checkpoint back in that layout is not implemented."
+            f"{source} uses the {index.layout!r} expert layout, which cannot be "
+            f"written; known layouts are {list(LAYOUTS)}"
         )
 
     with open(os.path.join(source, "config.json")) as f:
@@ -273,16 +336,16 @@ def apply_plan(
     new_config = rewrite_config(config, surgery)
 
     writer = ShardWriter(out_dir, shard_bytes)
-    expert_prefixes = {
-        f"model.layers.{layer}.mlp.experts." for layer in surgery
-    }
-    router_names = {index.router_name(layer) for layer in surgery}
+    # The output keeps the source's layout. Emitting per-expert tensors for a model
+    # whose loader expects stacked ones produces a checkpoint that fails to load;
+    # emitting them under stacked names produces one that loads wrong.
+    rewritten = {index.router_name(layer) for layer in surgery}
+    for layer in surgery:
+        rewritten |= _expert_tensor_names(index, layer)
 
     n_merged = 0
     for name in _iter_source_tensors(index):
-        if name in router_names:
-            continue  # rewritten below, per layer
-        if any(name.startswith(prefix) for prefix in expert_prefixes):
+        if name in rewritten:
             continue  # rewritten below, per layer
         # Everything else -- embeddings, attention, norms, lm_head -- passes
         # through untouched and in its original dtype.
@@ -291,8 +354,13 @@ def apply_plan(
     for layer, edit in surgery.items():
         first = index.tensor_name(layer, edit.survivors[0], "gate_proj")
         dtype = _read_torch(index, first).dtype
+        # Survivors in new-id order. Per-expert writes each one as it is produced;
+        # stacked has to concatenate them, so the order is what carries the remap and
+        # is established once, here, for both paths.
+        in_new_order = sorted(edit.survivors, key=lambda old: edit.remap[old])
+        produced: list[tuple[Any, Any, Any]] = []
 
-        for old_id in edit.survivors:
+        for old_id in in_new_order:
             new_id = edit.remap[old_id]
             donors = edit.merges.get(old_id, [])
             target = _expert_tensors(index, layer, old_id)
@@ -317,6 +385,10 @@ def apply_plan(
             else:
                 gate, up, down = target
 
+            if index.layout == "stacked":
+                produced.append((gate, up, down))
+                continue
+
             base = f"model.layers.{layer}.mlp.experts.{new_id}"
             for suffix, array in (
                 ("gate_proj", gate),
@@ -327,6 +399,9 @@ def apply_plan(
                     f"{base}.{suffix}.weight",
                     torch.from_numpy(np.ascontiguousarray(array)).to(dtype),
                 )
+
+        if index.layout == "stacked":
+            _write_experts_stacked(writer, index, layer, produced, dtype)
 
         writer.add(
             index.router_name(layer),

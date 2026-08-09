@@ -306,22 +306,163 @@ def test_descriptors_work_on_a_stacked_checkpoint(tmp_path):
     np.testing.assert_allclose(np.diag(matrix), 1.0, atol=1e-5)
 
 
-def test_writing_a_stacked_checkpoint_is_refused(tmp_path):
-    """Reading is supported; writing one back is not, and must say so."""
-    import pytest
-
-    from vllm_moe_surgeon.surgery import Plan
-    from vllm_moe_surgeon.surgery.apply import apply_plan
-    from vllm_moe_surgeon.surgery.plan import ExpertPlacement
-
-    _write_stacked_checkpoint(tmp_path / "src")
+def _stacked_source(tmp_path, num_experts=4):
+    """A stacked checkpoint plus the config Granite carries."""
     import json
 
+    gate, up, down = _write_stacked_checkpoint(tmp_path / "src", num_experts)
     with open(tmp_path / "src" / "config.json", "w") as f:
         json.dump(
-            {"num_hidden_layers": 1, "num_local_experts": 3, "num_experts_per_tok": 2},
+            {
+                "num_hidden_layers": 1,
+                "num_local_experts": num_experts,
+                "num_experts_per_tok": 2,
+            },
             f,
         )
+    return gate, up, down
+
+
+def _drop_plan(dropped, kept):
+    from vllm_moe_surgeon.surgery import Plan
+    from vllm_moe_surgeon.surgery.plan import ExpertPlacement
+
+    return Plan(
+        model="m",
+        revision=None,
+        budget={},
+        placements=[
+            ExpertPlacement(0, e, "merge_into_core", tokens=10, share=0.5)
+            for e in kept
+        ]
+        + [
+            ExpertPlacement(0, e, "drop", tokens=1, share=0.0, merge_target=None)
+            for e in dropped
+        ],
+        gate={"passed": True, "reason": "test"},
+    )
+
+
+def test_a_stacked_checkpoint_is_written_back_stacked(tmp_path):
+    """The output keeps the source layout, and keeps the halves in Granite's order.
+
+    Emitting per-expert tensors here would produce a checkpoint the granitemoe
+    loader cannot load; emitting them with the halves swapped would produce one that
+    loads silently and computes the wrong function. So this checks the surviving
+    experts survive *bit-exactly* in the right half of the right slab.
+    """
+    from vllm_moe_surgeon.surgery.apply import apply_plan
+    from vllm_moe_surgeon.surgery.descriptors import CheckpointIndex
+
+    gate, up, down = _stacked_source(tmp_path, num_experts=4)
+    kept = [0, 2, 3]
+    manifest = apply_plan(
+        _drop_plan(dropped=[1], kept=kept), str(tmp_path / "src"), str(tmp_path / "out")
+    )
+
+    out = CheckpointIndex.open(str(tmp_path / "out"))
+    assert out.layout == "stacked", "a stacked source must not become per-expert"
+    assert out.expert_ids(0) == [0, 1, 2]
+    assert manifest["experts_before"] == 4
+    assert manifest["experts_after"] == 3
+
+    # new id i holds old id kept[i], gate still gate and up still up
+    for new_id, old_id in enumerate(kept):
+        np.testing.assert_allclose(
+            out.read_expert(0, new_id, "gate_proj"), gate[old_id].numpy(), atol=0
+        )
+        np.testing.assert_allclose(
+            out.read_expert(0, new_id, "up_proj"), up[old_id].numpy(), atol=0
+        )
+        np.testing.assert_allclose(
+            out.read_expert(0, new_id, "down_proj"), down[old_id].numpy(), atol=0
+        )
+    assert not np.allclose(gate[0].numpy(), up[0].numpy())  # guard the guard
+
+
+def test_a_stacked_write_carries_the_router_through_the_same_remap(tmp_path):
+    """A router row left at its old index routes to the wrong expert, silently."""
+    from vllm_moe_surgeon.surgery.apply import apply_plan
+    from vllm_moe_surgeon.surgery.descriptors import CheckpointIndex
+
+    _stacked_source(tmp_path, num_experts=4)
+    src = CheckpointIndex.open(str(tmp_path / "src"))
+    before = src.read(src.router_name(0))
+
+    kept = [0, 2, 3]
+    apply_plan(
+        _drop_plan(dropped=[1], kept=kept), str(tmp_path / "src"), str(tmp_path / "out")
+    )
+    out = CheckpointIndex.open(str(tmp_path / "out"))
+    after = out.read(out.router_name(0))
+
+    assert after.shape == (3, H)
+    for new_id, old_id in enumerate(kept):
+        np.testing.assert_allclose(after[new_id], before[old_id], atol=1e-6)
+
+
+def test_stacked_and_per_expert_surgery_agree(tmp_path):
+    """Same weights in two layouts, same plan -- the survivors must match.
+
+    The layouts differ only in storage, so any divergence here is the writer
+    disagreeing with itself rather than a property of either format.
+    """
+    import json
+
+    import torch
+    from safetensors.torch import save_file
+
+    from vllm_moe_surgeon.surgery.apply import apply_plan
+    from vllm_moe_surgeon.surgery.descriptors import CheckpointIndex
+
+    gate, up, down = _stacked_source(tmp_path, num_experts=4)
+    router = CheckpointIndex.open(str(tmp_path / "src")).read(
+        "model.layers.0.block_sparse_moe.router.layer.weight"
+    )
+
+    # the same tensors, per-expert
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    tensors = {"model.layers.0.mlp.gate.weight": torch.from_numpy(router)}
+    for e in range(4):
+        base = f"model.layers.0.mlp.experts.{e}"
+        tensors[f"{base}.gate_proj.weight"] = gate[e]
+        tensors[f"{base}.up_proj.weight"] = up[e]
+        tensors[f"{base}.down_proj.weight"] = down[e]
+    save_file(tensors, str(mirror / "model.safetensors"), metadata={"format": "pt"})
+    with open(mirror / "config.json", "w") as f:
+        json.dump(
+            {"num_hidden_layers": 1, "num_local_experts": 4, "num_experts_per_tok": 2},
+            f,
+        )
+
+    plan = _drop_plan(dropped=[1], kept=[0, 2, 3])
+    apply_plan(plan, str(tmp_path / "src"), str(tmp_path / "out_stacked"))
+    apply_plan(plan, str(mirror), str(tmp_path / "out_per_expert"))
+
+    a = CheckpointIndex.open(str(tmp_path / "out_stacked"))
+    b = CheckpointIndex.open(str(tmp_path / "out_per_expert"))
+    assert a.layout == "stacked" and b.layout == "per_expert"
+    for new_id in range(3):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            np.testing.assert_allclose(
+                a.read_expert(0, new_id, projection),
+                b.read_expert(0, new_id, projection),
+                atol=0,
+            )
+    np.testing.assert_allclose(
+        a.read(a.router_name(0)), b.read(b.router_name(0)), atol=0
+    )
+
+
+def test_stacked_merging_averages_into_the_right_slab(tmp_path):
+    """A merge on the stacked path must land in the target's slab, not a new one."""
+    from vllm_moe_surgeon.surgery import Plan
+    from vllm_moe_surgeon.surgery.apply import apply_plan
+    from vllm_moe_surgeon.surgery.descriptors import CheckpointIndex
+    from vllm_moe_surgeon.surgery.plan import ExpertPlacement
+
+    _stacked_source(tmp_path, num_experts=3)
     plan = Plan(
         model="m",
         revision=None,
@@ -329,9 +470,21 @@ def test_writing_a_stacked_checkpoint_is_refused(tmp_path):
         placements=[
             ExpertPlacement(0, 0, "merge_into_core", tokens=10, share=0.5),
             ExpertPlacement(0, 1, "merge_into_core", tokens=10, share=0.5),
-            ExpertPlacement(0, 2, "drop", tokens=1, share=0.0),
+            ExpertPlacement(
+                0, 2, "drop", tokens=10, share=0.0, merge_target=0, similarity=0.99
+            ),
         ],
         gate={"passed": True, "reason": "test"},
     )
-    with pytest.raises(NotImplementedError, match="stacked"):
-        apply_plan(plan, str(tmp_path / "src"), str(tmp_path / "out"))
+    manifest = apply_plan(plan, str(tmp_path / "src"), str(tmp_path / "out"))
+
+    assert manifest["merges_applied"] == 1
+    out = CheckpointIndex.open(str(tmp_path / "out"))
+    assert out.layout == "stacked"
+    assert out.expert_ids(0) == [0, 1]
+    # Shapes stay a valid stacked layer: [K, 2I, H] and [K, H, I].
+    fused = out.read("model.layers.0.block_sparse_moe.input_linear.weight")
+    assert fused.shape == (2, 2 * INTER, H)
+    assert out.read(
+        "model.layers.0.block_sparse_moe.output_linear.weight"
+    ).shape == (2, H, INTER)
