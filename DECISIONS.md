@@ -93,9 +93,6 @@ decide rather than guessing. Deletion quality is always deferred to `surgeon gat
 
 ## Open
 
-- **Faz 5, the job server.** `server/` is empty. The CLI covers every stage, so this
-  is packaging rather than capability — a FastAPI wrapper that runs the stages as
-  subprocesses and keeps an artifact registry.
 - **Writing a stacked (Granite) checkpoint.** Reading is supported; `apply` refuses
   to write one, because emitting per-expert tensors for a loader expecting stacked
   ones fails to load and emitting them under stacked names loads wrong.
