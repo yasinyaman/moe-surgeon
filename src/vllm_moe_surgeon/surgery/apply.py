@@ -45,7 +45,13 @@ import numpy as np
 
 from .._logging import init_logger
 from .descriptors import LAYOUTS, CheckpointIndex
-from .plan import Plan, deletes_anything, gate_passed, validate_plan
+from .plan import (
+    Plan,
+    deletes_anything,
+    gate_passed,
+    merges_anything,
+    validate_plan,
+)
 
 logger = init_logger(__name__)
 
@@ -321,6 +327,24 @@ def apply_plan(
             "this plan deletes experts but has not passed the quality gate "
             f"({verdict}). Run `surgeon gate` to measure what the deletions cost, "
             "or pass require_gate=False to accept an unmeasured plan."
+        )
+
+    if merges_anything(plan):
+        # A passing gate is not evidence about merges. The gate zeroes experts,
+        # which emulates deletion; a merge instead rewrites a *surviving* expert's
+        # weights, and no amount of zeroing reaches that. Loud rather than fatal:
+        # the merge machinery is exact on synthetic candidates, and refusing would
+        # block the only way to measure it on real ones.
+        merged = sum(
+            1
+            for p in plan.placements
+            if p.action == "drop" and p.merge_target is not None
+        )
+        logger.warning(
+            "%d merges in this plan are NOT covered by the quality gate: zeroing "
+            "cannot emulate a merge, so the verdict speaks only for the deletions. "
+            "Measure the applied checkpoint's perplexity before trusting it.",
+            merged,
         )
 
     surgery = derive_surgery(plan)

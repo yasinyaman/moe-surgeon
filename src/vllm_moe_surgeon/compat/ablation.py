@@ -318,21 +318,41 @@ def gate_plan(
     a plan that passes here will do at least as well once applied. Measured on
     OLMoE: zeroed 12.65 vs deleted 12.13.
 
-    Only deletions are gated. Merges change weights in a way zeroing cannot
-    emulate, and are covered instead by the exactness tests in
-    :mod:`..surgery.align`.
+    Only deletions are gated, and merge donors are excluded rather than swept in.
+    A donor carries ``action == "drop"`` with a ``merge_target``, but it is not
+    deleted -- its weights are folded into a survivor. Zeroing it would measure the
+    cost of throwing it away, which is not what the plan does, and would then report
+    a verdict on a plan whose merges were never measured at all. Merge exactness is
+    covered by the tests in :mod:`..surgery.align`; merge *quality* on real
+    non-redundant experts is not something zeroing can reach, so the verdict says so
+    by name instead of implying coverage it does not have.
     """
     dropped: dict[int, list[int]] = {}
+    merged = 0
     for placement in plan.placements:
-        if placement.action == "drop":
-            dropped.setdefault(placement.layer, []).append(placement.expert)
+        if placement.action != "drop":
+            continue
+        if getattr(placement, "merge_target", None) is not None:
+            merged += 1
+            continue
+        dropped.setdefault(placement.layer, []).append(placement.expert)
+
+    ungated = (
+        f" {merged} merge donors are folded into survivors, not deleted, and are "
+        "excluded from this measurement -- zeroing cannot emulate a merge"
+        if merged
+        else ""
+    )
 
     if not dropped:
         return {
             "passed": True,
-            "reason": "plan deletes nothing, so there is nothing to measure",
+            "reason": (
+                "plan deletes nothing, so there is nothing to measure." + ungated
+            ),
             "ratio": 1.0,
             "max_ratio": max_ratio,
+            "merges_not_gated": merged,
         }
 
     study = run_study(
@@ -363,7 +383,7 @@ def gate_plan(
 
     verdict = {
         "passed": bool(passed),
-        "reason": f"{ratio:.3f}x {'<=' if passed else '>'} {max_ratio}x",
+        "reason": f"{ratio:.3f}x {'<=' if passed else '>'} {max_ratio}x" + ungated,
         "baseline_perplexity": base,
         "perplexity": arm.perplexity,
         "ratio": ratio,
@@ -371,6 +391,7 @@ def gate_plan(
         "held_out_tokens": study.baseline.tokens,
         "experts_zeroed": arm.experts_zeroed,
         "method": "zeroed weights, router held fixed (pessimistic vs deletion)",
+        "merges_not_gated": merged,
     }
     if note:
         verdict["note"] = note

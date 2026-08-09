@@ -282,6 +282,42 @@ small subspace, and two experts could act almost identically there while spannin
 different global subspaces. Activation-based similarity would settle it, and this
 result promotes that from optional to necessary if merging is to be pursued.
 
+
+#### And when merging is forced anyway, it is worse than deleting
+
+The similarity finding says no pair *qualifies*. It does not say what merging would
+cost if the threshold were lowered until pairs did — so that was measured, because
+"unexercised" is not the same as "unnecessary".
+
+Dropping the threshold from 0.85 to 0.10 makes 233 of 384 removals merges (pair
+similarity 0.10–0.29) instead of deletions. Same profile (6006 token slots per expert,
+30× the minimum), same budget of 40 core experts, same 384 removals; the only
+difference is whether a removed expert is deleted or folded into a survivor. All three
+arms scored in one harness on the same 20 held-out gsm8k prompts, 1122 tokens:
+
+| arm | perplexity | vs baseline |
+|---|---|---|
+| baseline, 64 experts | 10.3579 | — |
+| delete only, 384 removals | 12.7026 | 1.226× |
+| **merge 233 + delete 151** | **14.6689** | **1.416×** |
+
+Merging costs **15% more perplexity than deleting the very same experts**. Folding a
+weakly-similar expert into a survivor damages the survivor — it was carrying its own
+function — where deletion at least leaves the remaining experts intact and lets the
+renormalised gate mass flow to them. So the 0.85 threshold is not conservatism for its
+own sake: below it, merging is worse than the thing it is meant to improve on.
+
+This also exercises the merge path end-to-end on real weights for the first time:
+permutation alignment, usage-weighted averaging and the router rewrite all ran over 233
+real clusters, and the result loads and scores. The machinery is correct; the operation
+is simply not worth doing on these models.
+
+One gap this exposed, now fixed: the quality gate zeroes experts, which emulates
+deletion. A merge donor also carries `action == "drop"`, so it was being swept into the
+zeroed set — measuring the cost of discarding an expert the plan does not discard, and
+then attaching a verdict to a plan whose merges were never examined. Donors are now
+excluded, the verdict reports `merges_not_gated`, and `apply_plan` warns that a passing
+gate says nothing about merges.
 ## Surgery
 
 ```bash

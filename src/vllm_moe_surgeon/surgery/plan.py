@@ -223,8 +223,26 @@ def deletes_anything(plan: Plan) -> bool:
 
     A plan that only re-places experts (core vs disk) loses nothing, so it needs
     no quality gate. Only deletions are irreversible.
+
+    A merge donor counts: the plan still ends with fewer experts than it started
+    with, and its removal is just as irreversible. What differs is how the *cost*
+    can be measured -- see :func:`merges_anything`.
     """
     return any(p.action == "drop" for p in plan.placements)
+
+
+def merges_anything(plan: Plan) -> bool:
+    """Whether any expert is folded into a survivor rather than deleted outright.
+
+    Worth its own predicate because the quality gate cannot measure it. The gate
+    zeroes experts, which emulates deletion pessimistically but says nothing about
+    a merge: a merge *changes the surviving expert's weights*, and zeroing the donor
+    models throwing it away instead. So a plan with merges can pass a gate that
+    never examined the thing most likely to hurt.
+    """
+    return any(
+        p.action == "drop" and p.merge_target is not None for p in plan.placements
+    )
 
 
 def gate_passed(plan: Plan) -> bool:

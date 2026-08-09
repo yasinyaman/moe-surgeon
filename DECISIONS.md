@@ -116,8 +116,20 @@ decide rather than guessing. Deletion quality is always deferred to `surgeon gat
   leaving the provider holding all 64 experts pinned for the process lifetime. Now
   refused outright, the log names the mode, and `BisectResult` records each arm's
   kwargs.
-- **Merging is unexercised on real candidates.** The machinery is exact on
-  synthetic ones; no model measured so far offers a real pair.
+- ~~Merging is unexercised on real candidates.~~ **Exercised and measured, and the
+  answer is no.** Lowering the threshold to 0.10 makes 233 of 384 removals merges
+  (similarity 0.10–0.29). Against a delete-only control at the same budget: baseline
+  10.3579, delete-only 12.7026 (1.226×), **merge 14.6689 (1.416×)**. Merging costs 15%
+  more perplexity than deleting the same experts, because folding a weakly-similar
+  expert into a survivor damages the survivor. The machinery is correct — alignment,
+  averaging and router rewrite ran over 233 real clusters and the artifact loads and
+  scores — the operation is just not worth doing on these models. The 0.85 default is
+  now an empirical floor, not caution.
+- **The gate cannot measure merges, and no longer pretends to.** Zeroing emulates
+  deletion; a merge rewrites a *surviving* expert's weights. Donors were being swept
+  into the zeroed set (they carry `action == "drop"` too), which measured a deletion
+  the plan does not perform and then attached the verdict to unexamined merges. Donors
+  are excluded, the verdict carries `merges_not_gated`, and `apply_plan` warns.
 - **fp8 and streaming load in the out-of-tree runtime.** `compat/runtime.py` covers
   the unquantized path with `--enforce-eager`; fp8 needs `Fp8MoEMethod` substituted
   with the cache installed before the quant config captures scale tensors.

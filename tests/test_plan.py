@@ -479,3 +479,61 @@ def test_importance_shape_is_validated():
 
     with pytest.raises(ValueError, match="importance has shape"):
         build_plan(_hot_profile(), Budget(core_experts=3), importance=np.zeros((2, 2)))
+
+
+# ------------------------------------- merges are not what the quality gate measures
+
+
+def _merge_plan():
+    from vllm_moe_surgeon.surgery import Plan
+    from vllm_moe_surgeon.surgery.plan import ExpertPlacement
+
+    return Plan(
+        model="m",
+        revision=None,
+        budget={},
+        placements=[
+            ExpertPlacement(0, 0, "merge_into_core", tokens=10, share=0.5),
+            ExpertPlacement(0, 1, "merge_into_core", tokens=10, share=0.4),
+            ExpertPlacement(
+                0, 2, "drop", tokens=5, share=0.1, merge_target=0, similarity=0.9
+            ),
+            ExpertPlacement(0, 3, "drop", tokens=1, share=0.0),
+        ],
+    )
+
+
+def test_merges_and_deletions_are_distinguished():
+    """The gate can measure one and not the other, so they need separate predicates."""
+    from vllm_moe_surgeon.surgery.plan import deletes_anything, merges_anything
+
+    plan = _merge_plan()
+    assert deletes_anything(plan), "a merged-away expert is still gone"
+    assert merges_anything(plan)
+
+    # Deletion only.
+    plan.placements = [p for p in plan.placements if p.merge_target is None]
+    assert deletes_anything(plan)
+    assert not merges_anything(plan)
+
+
+def test_the_gate_excludes_merge_donors_from_what_it_zeroes():
+    """Zeroing a donor measures throwing it away -- not what the plan does with it.
+
+    A donor's weights are folded into a survivor. Zeroing it reports the cost of a
+    deletion that never happens, and then attaches a verdict to a plan whose merges
+    were never measured. Both halves are wrong, in opposite directions.
+    """
+    pytest.importorskip("vllm", reason="gate_plan imports the ablation harness")
+    from vllm_moe_surgeon.compat.ablation import gate_plan
+
+    plan = _merge_plan()
+    # Only expert 3 is a true deletion, so with expert 3 removed there is nothing
+    # left to zero -- and the verdict must say the merges went unmeasured.
+    plan.placements = [p for p in plan.placements if p.expert != 3]
+    verdict = gate_plan(plan, prompts=["unused"], max_ratio=1.3)
+
+    assert verdict["passed"] is True
+    assert verdict["merges_not_gated"] == 1
+    assert "zeroing cannot emulate a merge" in verdict["reason"]
+    assert "deletes nothing" in verdict["reason"]
