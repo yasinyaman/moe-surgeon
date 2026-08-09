@@ -78,12 +78,12 @@ strategy per target and per model.
 
 Measured on OLMoE-1B-7B, GB10, held-out gsm8k:
 
-| configuration | load | decode | perplexity |
-|---|---|---|---|
-| baseline, 64 resident | 98.6 s | 689.4/s | 9.703 |
-| disk tier, 24/64 resident | 45.2 s | 265.1/s | 9.734 (1.003×) |
-| pruned to 40, no tier | 83.4 s | 695.1/s | 12.115 (1.249×) |
-| **pruned 40 + tier, 24/40** | **44.5 s** | **350.8/s** | 12.145 (1.252×) |
+| configuration | boot floor | load | decode | perplexity |
+|---|---|---|---|---|
+| baseline, 64 resident | 14.60 GiB | 98.6 s | 689.4/s | 9.703 |
+| disk tier, 24/64 resident | 23.40 GiB | 45.2 s | 265.1/s | 9.734 (1.003×) |
+| pruned to 40, no tier | not measured | 83.4 s | 695.1/s | 12.115 (1.249×) |
+| **pruned 40 + tier, 24/40** | not measured | **44.5 s** | **350.8/s** | 12.145 (1.252×) |
 
 The fourth row is why surgery exists: **pruned+tier decodes 1.32× faster than tier
 alone** at the same capacity, because a 24-slot cache covers more of a 40-expert
@@ -483,6 +483,41 @@ floor — an apparent contradiction. HF treats a silent config as fp32 and vLLM'
 resident weights are 6.29 GiB. `surgeon budget` now says so, and only ever narrows —
 an fp8 checkpoint whose config says `bfloat16` keeps fp8 weights resident, and
 costing those at 2 bytes would be the same error inverted.
+
+### Measured: the tier raises the boot floor, it does not lower it
+
+The uncomfortable result, and the reason the feasibility axis was worth building an
+instrument for. OLMoE-1B-7B on GB10, every arm bracketed by an observed failure:
+
+| arm | boot floor | bracket |
+|---|---|---|
+| untiered, 64 resident | **14.60 GiB** | failed 0.116, booted 0.120 |
+| tier 24/64, `ram_cache` 48 | **23.40 GiB** | failed 0.190, booted 0.192 |
+| tier 24/64, `ram_cache` 0 | **31.10 GiB** | failed 0.254, booted 0.256 |
+| tier 10/64, `ram_cache` 0 | **28.53 GiB** | failed 0.232, booted 0.235 |
+
+Capacity moves the floor in the direction it should — 10 slots needs less than 24 —
+so the resident cache is being sized as designed. But every tiered arm sits well
+*above* the untiered one, which is the opposite of the intuition the tier exists to
+serve.
+
+The likely cause is a scope limit already recorded above: **streaming the checkpoint
+into the store is not ported.** The loader therefore materialises every expert before
+the provider releases `w13_weight` to `numel() == 0`, so the boot peak can never fall
+below the untiered peak, and the cache slots are added on top of it. That is
+inference from the capacity trend plus the known gap, not a measurement of the
+allocation itself.
+
+The `ram_cache` direction is not explained. A *larger* pinned host pool lowered the
+floor by 7.7 GiB, when "less host cache" should if anything mean less memory. That
+is recorded as observed and undiagnosed rather than rationalised.
+
+What this does not overturn: the tier still halves load time (98.6 s → 45.2 s) at
+1.003× perplexity, and pruned+tier still decodes 1.32× faster than tier alone. The
+tier earns its place on those axes. It simply does not yet earn it on feasibility,
+which is exactly the per-axis rule this project is built on — and it makes streaming
+load the highest-value open item rather than a nicety, because a steady-state
+residency win that a boot peak cancels is not a win anyone can deploy.
 
 ## The quality gate
 

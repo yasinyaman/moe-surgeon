@@ -93,11 +93,16 @@ decide rather than guessing. Deletion quality is always deferred to `surgeon gat
 
 ## Open
 
-- **The boot floor is only measured for prune-vs-baseline.** `surgeon vram-floor`
-  closes the feasibility axis for deletion (1.33 GiB measured against 1.41 GiB
-  predicted on Granite). The tiered arm's floor is not measured yet: it needs the
-  store and plugin config threaded through the probe, which the harness supports but
-  no run has exercised.
+- **Streaming load, now the highest-value open item.** Measured: the tier's boot
+  floor is 23.40 GiB against 14.60 GiB untiered (OLMoE, capacity 24, GB10). Because
+  the checkpoint is not streamed into the store, every expert is materialised before
+  `w13_weight` is released, so the boot peak cannot fall below the untiered peak and
+  the cache slots land on top. A steady-state residency win that the boot peak
+  cancels cannot be deployed. Deletion's floor *is* closed: 1.33 GiB measured against
+  1.41 GiB predicted on Granite.
+- **Undiagnosed:** a larger pinned host pool *lowered* the tier's boot floor by
+  7.7 GiB (`ram_cache` 48 → 23.40 GiB, `ram_cache` 0 → 31.10 GiB). The direction is
+  backwards and the mechanism is not known.
 - **Merging is unexercised on real candidates.** The machinery is exact on
   synthetic ones; no model measured so far offers a real pair.
 - **fp8 and streaming load in the out-of-tree runtime.** `compat/runtime.py` covers
