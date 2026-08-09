@@ -294,6 +294,26 @@ def _cmd_recommend(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    try:
+        import uvicorn
+    except ImportError:
+        print(
+            "the job server needs the 'server' extra: pip install -e '.[server]'",
+            file=sys.stderr,
+        )
+        return 2
+
+    from .server.app import create_app
+
+    uvicorn.run(
+        create_app(args.state, timeout=args.stage_timeout),
+        host=args.host,
+        port=args.port,
+    )
+    return 0
+
+
 def _cmd_seams(args: argparse.Namespace) -> int:
     from .compat.seams import SEAMS, check, check_all_static
 
@@ -465,6 +485,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--restarts-often", action="store_true")
     p.add_argument("--latency-sensitive", action="store_true")
     p.set_defaults(func=_cmd_recommend)
+
+    p = sub.add_parser("serve", help="run the job server")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--state", default="./surgeon-state", help="where jobs are recorded")
+    p.add_argument(
+        "--stage-timeout",
+        type=float,
+        help="kill a stage that exceeds this many seconds",
+    )
+    p.set_defaults(func=_cmd_serve)
 
     p = sub.add_parser("seams", help="check the vLLM seams this package holds")
     p.add_argument("--source", help="check a vLLM source tree instead of the install")
