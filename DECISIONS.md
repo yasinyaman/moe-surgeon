@@ -101,16 +101,25 @@ decide rather than guessing. Deletion quality is always deferred to `surgeon gat
   Precise about what it is: on a **discrete** GPU it buys zero device bytes, since
   under the tier the full set was never device-resident. Deletion's floor was already
   closed: 1.33 GiB measured against 1.41 GiB predicted on Granite.
-- **`device_loading_context` defeats the host allocation** on the non-streaming path.
-  Second-order now that streaming load is in (with zero-expert placeholders there is
-  nothing to hoist), but it still applies whenever `stream_load` is off. vLLM hoists
-  every
-  `cpu`-typed parameter to the device before `process_weights_after_loading`, so the
-  port's deliberate `device="cpu"` allocation is device-resident by the time
-  `build_provider` reads it (per-module: ~768 MiB at a time, not 12 GiB). A UVA
-  accelerator view reports `device.type == "cuda"` and is how vLLM's own offloader
-  carries host params through untouched — `get_accelerator_view_from_cpu_tensor` is
-  public, so this is fixable out-of-tree. Second-order once streaming load lands.
+- ~~UVA view to escape `device_loading_context`.~~ **Decided against, with the reason
+  recorded.** vLLM hoists every `cpu`-typed parameter to the device before
+  `process_weights_after_loading`, so the port's deliberate `device="cpu"` allocation is
+  device-resident by the time `build_provider` reads it. A UVA accelerator view reports
+  `device.type == "cuda"` and would carry it through untouched —
+  `get_accelerator_view_from_cpu_tensor` is public, so it is buildable out-of-tree. It
+  is not worth it. The hoist is **per-module**, so it costs one layer's expert set in
+  transient device memory: 0.75 GiB on OLMoE, 3.2% of the non-streaming floor, and
+  **zero** on the streaming path (there is no cpu-typed parameter left to hoist).
+  Against that, `get_accelerator_view_from_cpu_tensor` returns a *copy* rather than a
+  view when the tensor is not pinned — the loader would fill the copy, the stashed host
+  tensor would stay zeroed, and the store would receive 64 zeroed experts, which serve
+  silently wrong output. 3.2% of a superseded path is not worth a silent-corruption
+  mode. If it is ever revisited, the guards are `assert host.is_pinned()` and
+  `assert view.data_ptr() == host.data_ptr()`.
+  What was done instead: **streaming load is now the default whenever the disk tier is
+  on**, so the expensive path is not reachable by leaving a flag unset. Non-act-and-mul
+  layers, whose record layout streaming cannot express, fall back with a warning rather
+  than failing.
 - ~~Undiagnosed `ram_cache` anomaly.~~ **Diagnosed and closed.** `ram_cache 0` did not
   shrink the pool, it disabled the disk tier (`use_disk` requires `ram_cache > 0`),
   leaving the provider holding all 64 experts pinned for the process lifetime. Now
@@ -130,9 +139,21 @@ decide rather than guessing. Deletion quality is always deferred to `surgeon gat
   into the zeroed set (they carry `action == "drop"` too), which measured a deletion
   the plan does not perform and then attached the verdict to unexamined merges. Donors
   are excluded, the verdict carries `merges_not_gated`, and `apply_plan` warns.
-- **fp8 and streaming load in the out-of-tree runtime.** `compat/runtime.py` covers
-  the unquantized path with `--enforce-eager`; fp8 needs `Fp8MoEMethod` substituted
-  with the cache installed before the quant config captures scale tensors.
+- **fp8 in the out-of-tree runtime — blocked on a checkpoint, not on a design.**
+  `compat/runtime.py` covers the unquantized path; fp8 needs `Fp8MoEMethod` substituted
+  with the cache installed before `get_fused_moe_quant_config` captures the scale
+  tensors. What blocks it is that **no fp8-serialized MoE checkpoint exists on either
+  machine** — checked, not assumed: this laptop holds two models, neither MoE nor
+  quantized; the GB10 holds eight MoE checkpoints and every one reports
+  `quantization_config: None`. The one the in-tree fix was verified against,
+  `RedHatAI/DeepSeek-Coder-V2-Lite-Instruct-FP8` (16 GiB), was deleted from the GB10 on
+  2026-08-08. Writing the substitution untested would be worse than not writing it,
+  because the failure mode produces **no exception**: get the ordering wrong and every
+  expert is scaled by whichever one occupies its cache slot, so "it booted and made
+  tokens" is not evidence. To unblock: re-download a 16 GiB fp8 MoE checkpoint (the
+  GB10 now has 284 GiB free) and verify against the in-tree implementation like-for-like,
+  the way the unquantized path was.
+  (Streaming load, which shared this bullet, is done — see above.)
 - ~~Router least-squares refit.~~ **Settled, and replaced by something better.** A row
   refit provably cannot help pure deletion: softmax over survivors is exactly Bayes
   conditioning, so the unchanged rows already minimise divergence from the teacher's

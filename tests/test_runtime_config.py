@@ -143,3 +143,46 @@ def test_bias_and_parallelism_are_refused_by_name():
     layer.moe_config = _MoEEP()
     with pytest.raises(ValueError, match="expert parallelism"):
         validate(RuntimeConfig(expert_cache_size=24, ram_cache=0), layer)
+
+
+# ------------------------------------- streaming is the default when there is a store
+
+
+def test_streaming_is_on_by_default_whenever_the_disk_tier_is_on():
+    """The non-streaming path costs 12.0 GiB of page-locked host memory for nothing.
+
+    Measured on OLMoE: boot floor 23.40 GiB without streaming against 11.35 with it.
+    Nobody should reach the expensive path by leaving a flag unset, so "unset" means
+    "stream if there is a store to stream into".
+    """
+    tiered = RuntimeConfig(expert_cache_size=24, store_dir="/s", ram_cache=48)
+    assert tiered.stream_load is None, "the field itself stays unset"
+    assert tiered.streams is True
+
+    # No store to stream into: nothing to do.
+    assert RuntimeConfig(expert_cache_size=24, ram_cache=0).streams is False
+
+
+def test_explicitly_off_is_distinguishable_from_unset():
+    """Forcing the old path has to remain possible, and has to look different."""
+    forced_off = RuntimeConfig(
+        expert_cache_size=24, store_dir="/s", ram_cache=48, stream_load=False
+    )
+    assert forced_off.stream_load is False
+    assert forced_off.streams is False
+
+    forced_on = RuntimeConfig(expert_cache_size=24, store_dir="/s", ram_cache=48,
+                              stream_load=True)
+    assert forced_on.streams is True
+
+
+def test_the_tri_state_reader_keeps_unset_unset():
+    from vllm_moe_surgeon.compat.runtime import _tri_state
+
+    assert _tri_state(None) is None
+    assert _tri_state("") is None
+    assert _tri_state(True) is True
+    assert _tri_state(False) is False
+    assert _tri_state("1") is True
+    assert _tri_state("true") is True
+    assert _tri_state("0") is False

@@ -594,8 +594,14 @@ is the experts in flight, not the model. It also leaves nothing for
 ```bash
 vllm serve allenai/OLMoE-1B-7B-0924 --enforce-eager \
   --additional-config '{"surgeon": {"expert_cache_size": 24, "store_dir": "./store",
-      "ram_cache": 48, "fp8_store": true, "stream_load": true}}'
+      "ram_cache": 48, "fp8_store": true}}'
 ```
+
+Streaming is **on by default whenever the disk tier is on** — the non-streaming path
+costs 12.0 GiB of page-locked host memory and buys nothing, so it is not somewhere to
+land by leaving a flag unset. `"stream_load": false` forces the old path; a layer that
+is not act-and-mul, whose record layout streaming cannot express, falls back with a
+warning rather than failing.
 
 | arm | boot floor | bracket |
 |---|---|---|

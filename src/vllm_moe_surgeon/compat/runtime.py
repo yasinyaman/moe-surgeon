@@ -52,7 +52,11 @@ class RuntimeConfig:
     hot_experts: str | None = None
     #: Write experts into the store as the checkpoint arrives, so the full
     #: ``[num_experts, ...]`` tensor is never materialised. See :mod:`.stream_load`.
-    stream_load: bool = False
+    #: ``None`` means "on whenever the disk tier is on", which is the useful default:
+    #: the non-streaming path pays 12.0 GiB of page-locked host memory (measured on
+    #: OLMoE) and buys nothing, so nobody should land on it by accident. Set it
+    #: explicitly to False to force the old path.
+    stream_load: bool | None = None
 
     @property
     def enabled(self) -> bool:
@@ -61,6 +65,13 @@ class RuntimeConfig:
     @property
     def use_disk(self) -> bool:
         return bool(self.store_dir) and self.ram_cache > 0
+
+    @property
+    def streams(self) -> bool:
+        """Whether to intercept the loader. Unset means yes, if there is a store."""
+        if self.stream_load is None:
+            return self.use_disk
+        return bool(self.stream_load)
 
 
 def read_config() -> RuntimeConfig:
@@ -103,13 +114,19 @@ def read_config() -> RuntimeConfig:
             )
         ),
         hot_experts=payload.get("hot_experts", os.environ.get("VLLM_MOE_HOT_EXPERTS")),
-        stream_load=bool(
-            payload.get(
-                "stream_load",
-                os.environ.get("VLLM_MOE_STREAM_LOAD", "") in ("1", "true"),
-            )
+        stream_load=_tri_state(
+            payload.get("stream_load", os.environ.get("VLLM_MOE_STREAM_LOAD")),
         ),
     )
+
+
+def _tri_state(value: Any) -> bool | None:
+    """``None`` when unset, so "unset" and "explicitly off" stay distinguishable."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in ("1", "true", "yes")
 
 
 def check_config(config: RuntimeConfig) -> None:
@@ -352,16 +369,24 @@ def install() -> bool:
             )
 
             streamer = None
-            if config.stream_load:
-                if not self.moe.is_act_and_mul:
-                    # The record layout is w13 = [2 * inter, hidden] with gate and up
-                    # in known halves. A layer without act-and-mul has no w3 shard to
-                    # place, so the halves would be undefined rather than merely
-                    # wrong-sized.
+            if config.streams and not self.moe.is_act_and_mul:
+                # The record layout is w13 = [2 * inter, hidden] with gate and up in
+                # known halves. A layer without act-and-mul has no w3 shard to place,
+                # so the halves would be undefined rather than merely wrong-sized.
+                # Asked for explicitly that is an error; reached by the default it is
+                # a reason to take the other path.
+                if config.stream_load:
                     raise ValueError(
                         "stream_load assumes the gate/up record layout, and this "
                         f"layer ({layer.layer_name}) is not act-and-mul."
                     )
+                logger.warning(
+                    "%s is not act-and-mul, so the loader cannot be streamed; "
+                    "falling back to materialising the full expert set, which costs "
+                    "page-locked host memory for every expert",
+                    layer.layer_name,
+                )
+            elif config.streams:
                 from .stream_load import StreamLoader
 
                 identity = _identity(layer)
@@ -449,7 +474,7 @@ def install() -> bool:
                 (
                     f"disk-backed (ram_cache={config.ram_cache}"
                     f"{', fp8' if config.fp8_store else ''}"
-                    f"{', streamed' if config.stream_load else ''})"
+                    f"{', streamed' if config.streams else ''})"
                     if config.use_disk
                     else "full-DRAM: every expert stays pinned in host memory"
                 ),
