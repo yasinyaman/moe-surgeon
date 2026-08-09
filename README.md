@@ -642,8 +642,11 @@ are *more* orthogonal than OLMoE's.
 
 Faz 0–5 complete: the out-of-tree runtime is verified against the implementation it
 replaces, and the full `profile → plan → gate → tier` pipeline has run end-to-end
-through the job server from nothing but a repository id. `DECISIONS.md` lists the
-remaining open items with reasons.
+through the job server from nothing but a repository id. Both expert layouts are now
+written as well as read, and all three axes are measured — feasibility last, with the
+instrument that produced this project's one clearly negative result (the tier's boot
+floor). `DECISIONS.md` lists the remaining open items with reasons, streaming load
+first.
 
 Three expert-storage layouts read (per-expert and stacked), three model families
 measured (OLMoE, Qwen3-30B, DeepSeek-V2-Lite, Granite).
