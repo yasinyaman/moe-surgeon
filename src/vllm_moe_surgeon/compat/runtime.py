@@ -50,6 +50,9 @@ class RuntimeConfig:
     ram_cache: int = 0
     fp8_store: bool = False
     hot_experts: str | None = None
+    #: Write experts into the store as the checkpoint arrives, so the full
+    #: ``[num_experts, ...]`` tensor is never materialised. See :mod:`.stream_load`.
+    stream_load: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -100,6 +103,12 @@ def read_config() -> RuntimeConfig:
             )
         ),
         hot_experts=payload.get("hot_experts", os.environ.get("VLLM_MOE_HOT_EXPERTS")),
+        stream_load=bool(
+            payload.get(
+                "stream_load",
+                os.environ.get("VLLM_MOE_STREAM_LOAD", "") in ("1", "true"),
+            )
+        ),
     )
 
 
@@ -138,6 +147,12 @@ def check_config(config: RuntimeConfig) -> None:
             f"ram_cache={config.ram_cache} is below expert_cache_size="
             f"{config.expert_cache_size}: the warm tier would be smaller than the "
             "resident set it feeds, so every eviction would go to disk."
+        )
+
+    if config.stream_load and not config.use_disk:
+        raise ValueError(
+            "stream_load writes experts into the disk store as they arrive, and no "
+            "store is being built. Set store_dir and ram_cache, or drop stream_load."
         )
 
     if config.fp8_store and not config.use_disk:
@@ -228,7 +243,13 @@ def build_provider(layer: Any, config: RuntimeConfig) -> Any:
 
     capacity = min(config.expert_cache_size, layer.local_num_experts)
     disk_store = None
-    if config.use_disk:
+    streamer = getattr(layer, "_surgeon_streamer", None)
+    if streamer is not None:
+        # Already written, record by record, while the checkpoint was arriving. There
+        # are no full weight tensors left to build a store *from* -- that is the point.
+        disk_store = streamer.finalize()
+        layer._surgeon_streamer = None
+    elif config.use_disk:
         assert config.store_dir is not None
         os.makedirs(config.store_dir, exist_ok=True)
         from ..surgery.tiered import store_path
@@ -330,21 +351,67 @@ def install() -> bool:
                 else intermediate_size_per_partition
             )
 
+            streamer = None
+            if config.stream_load:
+                if not self.moe.is_act_and_mul:
+                    # The record layout is w13 = [2 * inter, hidden] with gate and up
+                    # in known halves. A layer without act-and-mul has no w3 shard to
+                    # place, so the halves would be undefined rather than merely
+                    # wrong-sized.
+                    raise ValueError(
+                        "stream_load assumes the gate/up record layout, and this "
+                        f"layer ({layer.layer_name}) is not act-and-mul."
+                    )
+                from .stream_load import StreamLoader
+
+                identity = _identity(layer)
+                streamer = StreamLoader.open(
+                    store_dir=config.store_dir,
+                    layer_name=layer.layer_name,
+                    num_experts=num_experts,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size_per_partition,
+                    params_dtype=params_dtype,
+                    fp8=config.fp8_store,
+                    model=identity["model"],
+                    revision=identity["revision"],
+                    map_expert_id=getattr(
+                        layer, "_map_global_expert_id_to_local_expert_id", None
+                    ),
+                )
+                layer._surgeon_streamer = streamer
+
             def empty(*shape):
+                if streamer is not None:
+                    # Zero experts: nothing to fill, nothing for
+                    # device_loading_context to hoist, nothing to release. The
+                    # trailing dims survive because the provider sizes its device
+                    # buffers from shape[1:].
+                    return torch.empty(0, *shape[1:], dtype=params_dtype, device="cpu")
                 host = torch.empty(*shape, dtype=params_dtype, device="cpu")
                 return host.pin_memory()
+
+            attrs = dict(extra_weight_attrs)
+            if streamer is not None:
+                inner = attrs.get("weight_loader")
+                if inner is None:
+                    raise ValueError(
+                        "stream_load needs the loader vLLM would have used, and "
+                        "create_weights received no weight_loader to wrap"
+                    )
+                attrs["weight_loader"] = streamer.wrap(inner)
 
             w13 = torch.nn.Parameter(
                 empty(num_experts, up_dim, hidden_size), requires_grad=False
             )
             layer.register_parameter("w13_weight", w13)
-            set_weight_attrs(w13, extra_weight_attrs)
+            set_weight_attrs(w13, attrs)
             w2 = torch.nn.Parameter(
                 empty(num_experts, hidden_size, intermediate_size_per_partition),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight", w2)
-            set_weight_attrs(w2, extra_weight_attrs)
+            set_weight_attrs(w2, attrs)
 
         def process_weights_after_loading(self, layer) -> None:
             config = getattr(layer, "_surgeon_config", None)
@@ -381,7 +448,8 @@ def install() -> bool:
                 layer.local_num_experts,
                 (
                     f"disk-backed (ram_cache={config.ram_cache}"
-                    f"{', fp8' if config.fp8_store else ''})"
+                    f"{', fp8' if config.fp8_store else ''}"
+                    f"{', streamed' if config.stream_load else ''})"
                     if config.use_disk
                     else "full-DRAM: every expert stays pinned in host memory"
                 ),

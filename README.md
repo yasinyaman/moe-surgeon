@@ -82,6 +82,7 @@ Measured on OLMoE-1B-7B, GB10, held-out gsm8k:
 |---|---|---|---|---|
 | baseline, 64 resident | 14.60 GiB | 98.6 s | 689.4/s | 9.703 |
 | disk tier, 24/64 resident | 23.40 GiB | 45.2 s | 265.1/s | 9.734 (1.003×) |
+| **disk tier + streaming load** | **11.35 GiB** | — | — | — |
 | pruned to 40, no tier | not measured | 83.4 s | 695.1/s | 12.115 (1.249×) |
 | **pruned 40 + tier, 24/40** | not measured | **44.5 s** | **350.8/s** | 12.145 (1.252×) |
 
@@ -484,7 +485,7 @@ resident weights are 6.29 GiB. `surgeon budget` now says so, and only ever narro
 an fp8 checkpoint whose config says `bfloat16` keeps fp8 weights resident, and
 costing those at 2 bytes would be the same error inverted.
 
-### Measured: the tier raises the boot floor, and why
+### Measured: without streaming load, the tier raises the boot floor
 
 The uncomfortable result, and the reason the feasibility axis was worth building an
 instrument for. OLMoE-1B-7B on GB10 (121.63 GiB unified memory), every arm bracketed
@@ -545,17 +546,66 @@ rather than 12 GiB — but it also means the provider's `_pinned_cpu_copy` copie
 device*, which is why full-DRAM mode allocates a second full pinned mirror instead of
 reusing the one already there.
 
-The fix is therefore **streaming load** — intercepting the weight loader so experts go
-straight into the store and the `[num_experts, ...]` tensor never exists. It removes
-the 12.0 GiB term and, with zero-expert placeholders, leaves nothing to hoist and
-nothing to release. Note what it is *not*: on a discrete GPU it saves no device bytes
-at all, because under the tier the full set was never on the device to begin with. It
-is a host-memory feature that only becomes a device-memory feature on unified memory.
+### Streaming load: the tier now wins on feasibility too
 
-What none of this overturns: the tier still halves load time (98.6 s → 45.2 s) at
-1.003× perplexity, and pruned+tier still decodes 1.32× faster than tier alone. It
-earns its place on those axes and not yet on feasibility — which is the per-axis rule
-working as intended.
+The fix follows from the accounting: intercept the weight loader so each expert goes
+straight into the store and the `[num_experts, ...]` tensor never exists. Parameters are
+allocated with **zero** experts, each arriving shard is written into a staging record,
+and the record is pwritten and dropped the moment its three shards complete — peak cost
+is the experts in flight, not the model. It also leaves nothing for
+`device_loading_context` to hoist and nothing for `replace_parameter` to release.
+
+```bash
+vllm serve allenai/OLMoE-1B-7B-0924 --enforce-eager \
+  --additional-config '{"surgeon": {"expert_cache_size": 24, "store_dir": "./store",
+      "ram_cache": 48, "fp8_store": true, "stream_load": true}}'
+```
+
+| arm | boot floor | bracket |
+|---|---|---|
+| untiered, 64 resident | 14.60 GiB | failed 0.116, booted 0.120 |
+| tier 24/64, fp8 store | 23.40 GiB | failed 0.190, booted 0.192 |
+| **tier 24/64, fp8 store, streamed** | **11.35 GiB** | failed 0.091, booted 0.093 |
+
+Streaming removed **12.05 GiB** where the accounting attributed 12.0 GiB to the
+page-locked expert set — prediction and measurement agree to 0.05 GiB. The tier is now
+**22% below untiered** rather than 60% above it, so it finally earns the feasibility
+axis as well as the load-time one. Boots got faster too, 16–19 s per probe against
+26–28 s, because the checkpoint is no longer read into host memory in full.
+
+Where the port differs from the prototype: the prototype intercepted inside
+`RoutedExperts.weight_loader`, which meant subclassing a 1700-line class. Here the
+loader vLLM would have used arrives in `create_weights`'s `extra_weight_attrs` and is
+stamped on each parameter, so wrapping it needs no subclass — and anything that is not
+one of the three expert shards passes through to vLLM's own loader untouched. A
+positional call is delegated rather than guessed, because guessing an argument order
+would write a shard into the wrong half of the wrong expert and nothing downstream
+would object.
+
+Two things checked rather than assumed:
+
+- **A streamed store and an offline-built one are byte-identical.** Same record specs,
+  same identity, same fingerprint — verified in-process on a real expert: identical
+  scales, identical quantised bytes, reconstruction delta 0.0. So `surgeon tier` and a
+  streamed boot are interchangeable, and a second boot reuses the first boot's store
+  rather than restreaming it. (An *older* store left on the GB10 does differ, by one
+  e4m3 step: it predates the current code, and the fingerprint covers geometry and
+  identity rather than the code that wrote the bytes.)
+- **Sealing refuses an incomplete expert.** A record whose three shards never all
+  arrived would be zeroed, and a zeroed expert is silent — the model loads and its
+  output is quietly wrong for every token routed there.
+
+What it is *not*: on a **discrete** GPU this saves zero device bytes, because under the
+tier the full set was never device-resident — `create_weights` allocates `device="cpu"`
+deliberately. It is a host-memory feature that becomes a device-memory feature only
+where host and device draw on one pool. Stated plainly because the opposite is the easy
+assumption to make.
+
+The non-streaming numbers are kept rather than replaced: they are what the tier costs
+without this, and the 23.40 → 11.35 GiB gap is the measurement that justifies the
+mechanism. None of it overturns the rest — the tier still halves load time (98.6 s →
+45.2 s) at 1.003× perplexity, and pruned+tier still decodes 1.32× faster than tier
+alone.
 
 ## The quality gate
 
@@ -678,8 +728,9 @@ are *more* orthogonal than OLMoE's.
 
 ## Status
 
-Faz 0–5 complete: the out-of-tree runtime is verified against the implementation it
-replaces, and the full `profile → plan → gate → tier` pipeline has run end-to-end
+Faz 0–5 complete, and the tier now costs **less** memory than not using it: streaming
+load took its boot floor from 23.40 GiB to 11.35 GiB against 14.60 GiB untiered. The
+out-of-tree runtime is verified against the implementation it replaces, and the full `profile → plan → gate → tier` pipeline has run end-to-end
 through the job server from nothing but a repository id. Both expert layouts are now
 written as well as read, and all three axes are measured — feasibility last, with the
 instrument that produced this project's one clearly negative result (the tier's boot

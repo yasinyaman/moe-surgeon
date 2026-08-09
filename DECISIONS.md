@@ -93,17 +93,18 @@ decide rather than guessing. Deletion quality is always deferred to `surgeon gat
 
 ## Open
 
-- **Streaming load, the highest-value open item.** Measured: the tier's boot floor is
-  23.40 GiB against 14.60 GiB untiered (OLMoE, capacity 24, GB10). The dominant term
-  is the 12.0 GiB page-locked expert set that `create_weights` allocates and the
-  loader fills; on this device host bytes are charged to `gpu_memory_utilization`
-  (`MemorySnapshot.measure` substitutes psutil availability on integrated GPUs).
-  Intercepting the weight loader removes that term outright, and zero-expert
-  placeholders leave nothing for `device_loading_context` to hoist. Stated precisely
-  because it is easy to oversell: on a **discrete** GPU this buys zero device bytes,
-  since the full set was already never device-resident under the tier. Deletion's
-  floor *is* closed: 1.33 GiB measured against 1.41 GiB predicted on Granite.
-- **`device_loading_context` defeats the host allocation.** vLLM hoists every
+- ~~Streaming load.~~ **Done and measured.** The tier's boot floor went 23.40 GiB →
+  **11.35 GiB**, against 14.60 GiB untiered — the tier is now 22% below untiered
+  instead of 60% above. Removed 12.05 GiB where the accounting predicted 12.0 GiB for
+  the page-locked expert set. `stream_load: true` in the surgeon config; records are
+  byte-identical to an offline `surgeon tier` build, so the two are interchangeable.
+  Precise about what it is: on a **discrete** GPU it buys zero device bytes, since
+  under the tier the full set was never device-resident. Deletion's floor was already
+  closed: 1.33 GiB measured against 1.41 GiB predicted on Granite.
+- **`device_loading_context` defeats the host allocation** on the non-streaming path.
+  Second-order now that streaming load is in (with zero-expert placeholders there is
+  nothing to hoist), but it still applies whenever `stream_load` is off. vLLM hoists
+  every
   `cpu`-typed parameter to the device before `process_weights_after_loading`, so the
   port's deliberate `device="cpu"` allocation is device-resident by the time
   `build_provider` reads it (per-module: ~768 MiB at a time, not 12 GiB). A UVA
