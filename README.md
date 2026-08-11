@@ -82,7 +82,41 @@ goes through a `Fp8Config` shadowing the `"fp8"` config, and the override copies
 costs three more (optional) internal seams, the price recorded in
 [DECISIONS.md](DECISIONS.md).
 
-## Sizing it: the only knob that matters, and what it costs
+## Sizing it automatically
+
+`surgeon autoconfig` reads the checkpoint's geometry from headers, measures free
+device memory, host RAM and disk, applies the rules below, and prints a command you
+can paste:
+
+```bash
+surgeon autoconfig --checkpoint /path/to/model --max-num-seqs 8
+```
+
+```
+probed (13c48f4333d97fc8): NVIDIA GB10, 41.2 GiB free VRAM, 122 GiB host RAM, 180 GiB free disk
+
+  - a batch of 8 at top_k=8 can route to at most 64 experts per layer, so that is the capacity to aim for
+  - memory fits 64 slots, at or above the bound, so capacity is 64 and no step should have to re-fetch
+  - host RAM holds all 64 experts (12.6 GiB), so nothing spills to disk in steady state
+
+serve with:
+  vllm serve /path/to/model --additional-config '{"surgeon": {"expert_cache_size": 64, "store_dir": "./store", "ram_cache": 64}}'
+```
+
+`--start` runs that command instead of printing it, and `--json` emits just the
+config for a deployment script. **The answer is cached**, keyed on the checkpoint,
+the serving batch and the machine's resources — so an unchanged deployment does not
+re-probe on every boot. The resource figures are bucketed before they reach the key,
+because free VRAM moves by a few MiB between two reads and an exact key would never
+hit. `--refresh` forces a re-probe.
+
+It states its reasoning line by line, and it says what it could not measure rather
+than defaulting silently: a probe that reported zero free VRAM would quietly size the
+tier for a machine with no memory. Where the numbers do not allow a good answer it
+says so — a capacity below `top_k` comes with the warning that the expert split is
+not bit-exact, and a target that cannot fit at all is an error naming the shortfall.
+
+## Sizing it by hand: the only knob that matters, and what it costs
 
 Everything else in this README is a mechanism. This is the number to get right, and it
 was measured after the mechanisms were built — which is how it came to be a surprise.

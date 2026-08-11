@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
+import subprocess
 import sys
 
 
@@ -194,6 +196,56 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         args.checkpoint, layers, profile=profile, spectra=args.spectra
     )
     print(report(results, model=model or args.checkpoint))
+    return 0
+
+
+def _cmd_autoconfig(args: argparse.Namespace) -> int:
+    from .surgery.autoconfig import autoconfigure
+
+    try:
+        config = autoconfigure(
+            args.checkpoint,
+            store_dir=args.store,
+            max_num_seqs=args.max_num_seqs,
+            kv_reserve_gib=args.kv_reserve,
+            vram_gib=args.vram,
+            refresh=args.refresh,
+        )
+    except ValueError as exc:
+        # "this will not fit" is an answer, not a crash. The message already names
+        # the numbers and what to change, so a traceback only buries it.
+        print(f"cannot configure the tier here: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(config.surgeon))
+        return 0
+
+    env = config.environment
+    source = "cached" if config.cached else "probed"
+    print(f"{source} ({config.fingerprint}): {env.device}, "
+          f"{env.vram_gib:.1f} GiB free VRAM, {env.host_ram_gib:.0f} GiB host RAM, "
+          f"{env.disk_free_gib:.0f} GiB free disk")
+    for item in env.unknown:
+        print(f"  could not measure: {item}")
+    print()
+    for line in config.why:
+        print(f"  - {line}")
+    for line in config.warnings:
+        print(f"  ! {line}")
+    print()
+    argv = config.serve_args(args.model or args.checkpoint)
+    print("serve with:")
+    print("  " + " ".join(shlex.quote(a) for a in argv))
+    if config.cached:
+        print()
+        print("  (cached; the probe re-runs when the machine, model or batch changes,")
+        print("   or pass --refresh)")
+
+    if args.start:
+        print()
+        print("starting:", " ".join(shlex.quote(a) for a in argv))
+        return subprocess.call(argv)
     return 0
 
 
@@ -513,6 +565,22 @@ def main(argv: list[str] | None = None) -> int:
         help="add per-expert SVD spectra (slow: tens of seconds per layer)",
     )
     p.set_defaults(func=_cmd_inspect)
+
+    p = sub.add_parser(
+        "autoconfig",
+        help="probe this machine and size the tier for it, once",
+    )
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--model", help="model id to serve; defaults to --checkpoint")
+    p.add_argument("--store", default="./store")
+    p.add_argument("--max-num-seqs", type=int, default=8,
+                   help="serving batch; it sets how many experts a layer can reach")
+    p.add_argument("--kv-reserve", type=float, default=2.0, help="KV cache GiB")
+    p.add_argument("--vram", type=float, help="override the measured free VRAM")
+    p.add_argument("--refresh", action="store_true", help="ignore the cached answer")
+    p.add_argument("--json", action="store_true", help="print only the surgeon config")
+    p.add_argument("--start", action="store_true", help="run `vllm serve` with it")
+    p.set_defaults(func=_cmd_autoconfig)
 
     p = sub.add_parser(
         "budget", help="least GPU memory this model can be served in (headers only)"
