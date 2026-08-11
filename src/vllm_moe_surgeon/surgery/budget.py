@@ -141,23 +141,41 @@ class CheckpointGeometry:
     def num_moe_layers(self) -> int:
         return len(self.moe_layers)
 
+    def _dense_record_bytes(self, width: int) -> int:
+        inter, hidden = self.intermediate, self.hidden
+        return _align_up(width * ((2 * inter * hidden) + (hidden * inter)))
+
     def record_bytes(self, *, fp8: bool) -> int:
         """One store record: w13 + w2 (+ fp8 row scales), ALIGN-padded.
 
-        Matches :mod:`.tiered` so the number is the one the store actually uses.
+        Matches :mod:`.tiered` so the number is the one the store actually uses. This
+        is a *store* (disk / host RAM) figure, so it stays at the checkpoint's own
+        width -- the store does not downcast. The GPU-resident figure is
+        :attr:`resident_gpu_record_bytes`.
         """
         inter, hidden = self.intermediate, self.hidden
         if fp8:
             payload = (2 * inter * hidden) + (hidden * inter) + 4 * (2 * inter + hidden)
-        else:
-            width = self.checkpoint_dtype_bytes
-            payload = width * ((2 * inter * hidden) + (hidden * inter))
-        return _align_up(payload)
+            return _align_up(payload)
+        return self._dense_record_bytes(self.checkpoint_dtype_bytes)
 
     @property
     def resident_gpu_record_bytes(self) -> int:
-        """A GPU cache slot, which is always model dtype even with an fp8 store."""
-        return self.record_bytes(fp8=False)
+        """A GPU cache slot, held at the **serving** dtype.
+
+        vLLM dequantizes an fp8 store into model-dtype slots, and downcasts an fp32
+        checkpoint under ``dtype="auto"`` -- so a resident slot is the serving width,
+        which is not the checkpoint width for an fp32 model. Costing it at the
+        checkpoint width doubled every actionable number for Granite.
+        """
+        return self._dense_record_bytes(
+            self.serving_dtype_bytes or self.checkpoint_dtype_bytes
+        )
+
+    def resident_scale(self, nbytes: int) -> int:
+        """Scale a checkpoint byte figure (routers, shared experts, other) to what
+        it costs resident on the device, i.e. at the serving width."""
+        return int(nbytes * self.serving_scale)
 
 
 def analyze(checkpoint: str) -> CheckpointGeometry:
@@ -314,7 +332,10 @@ def plan_for_vram(
     ``headroom`` leaves room for activations, workspaces and fragmentation; the
     tool is for planning, and a plan that only fits with zero slack is not a plan.
     """
-    fixed = geometry.other_bytes + geometry.shared_expert_bytes + geometry.router_bytes
+    # Everything non-expert is resident at the serving width, not the checkpoint's.
+    fixed = geometry.resident_scale(
+        geometry.other_bytes + geometry.shared_expert_bytes + geometry.router_bytes
+    )
     available = int(vram_bytes * headroom) - fixed - kv_cache_bytes
     per_slot = geometry.num_moe_layers * geometry.resident_gpu_record_bytes
     if available <= 0 or per_slot <= 0:
@@ -350,7 +371,9 @@ def floor_plan(
     smaller has to accept the expert split's rounding.
     """
     per_slot = geometry.num_moe_layers * geometry.resident_gpu_record_bytes
-    fixed = geometry.other_bytes + geometry.shared_expert_bytes + geometry.router_bytes
+    fixed = geometry.resident_scale(
+        geometry.other_bytes + geometry.shared_expert_bytes + geometry.router_bytes
+    )
     capacity = geometry.top_k
     record = geometry.record_bytes(fp8=fp8_store)
     return TierPlan(
@@ -477,9 +500,56 @@ def report(
                     "  cannot serve a token: the expert split is required, and it",
                     "  rounds each group's partial sum rather than being bit-exact.",
                 ]
+            lines += _capacity_advice(geometry, plan, fp8_store)
             lines += ["", "  serve with:"]
             lines += [f"    {line}" for line in plan.env()]
     return "\n".join(lines)
+
+
+def _capacity_advice(
+    geometry: CheckpointGeometry, plan: TierPlan, fp8_store: bool
+) -> list[str]:
+    """What the numbers above do *not* say, measured rather than reasoned.
+
+    Two things surprised us on hardware and neither is visible in the arithmetic:
+
+    1. **Capacity is paid out of KV cache, not out of free VRAM.** vLLM sizes the KV
+       cache to fill whatever ``gpu_memory_utilization`` leaves, so raising the slot
+       count does not raise peak device memory -- it shortens the context. Measured on
+       OLMoE/GB10: capacity 24/32/40/48 reported peak VRAM 29.29/29.29/29.41/29.25 GiB,
+       flat, while decode went 55.3 -> 143.0 tok/s. This report solves the *floor*
+       question (a fixed KV reserve, how much capacity fits), which is the right frame
+       for "will it run at all" and the wrong one for "what should I set when serving".
+    2. **Capacity, not policy or prefetch, is the throughput lever.** Same measurements:
+       2.59x from capacity alone, against 1.068x for a perfect (Belady) cache policy.
+       The mechanism is bytes -- each slot short of the batch's per-layer expert union
+       is re-fetched over the host->device link every step.
+    """
+    per_slot = geometry.num_moe_layers * geometry.resident_gpu_record_bytes
+    per_slot_gib = per_slot / 1024**3
+    out = [
+        "",
+        "  sizing notes (measured, not derived):",
+        f"    each slot costs {per_slot_gib:.3f} GiB, taken from the KV cache at a",
+        "    fixed gpu_memory_utilization -- capacity buys throughput and spends",
+        "    context. Set it against the per-layer expert union of your serving",
+        "    batch, not against free VRAM; below that union every step re-fetches",
+        "    the shortfall.",
+    ]
+    if plan.capacity < geometry.num_experts:
+        out += [
+            f"    (capacity {plan.capacity} < {geometry.num_experts} experts, so a",
+            "    batch wide enough to route to more than that many experts per",
+            "    layer will split and re-fetch.)",
+        ]
+    if fp8_store:
+        out += [
+            "    fp8_store halves disk and host RAM but is a SPACE mechanism: on a",
+            "    non-fp8 checkpoint it costs a dequantise per load (measured 1.11x",
+            "    slower decode) and is not bit-exact. Leave it off if the store and",
+            "    RAM tier fit without it.",
+        ]
+    return out
 
 
 def analyze_and_report(checkpoint: str, **kwargs: Any) -> str:

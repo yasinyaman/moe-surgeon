@@ -1,15 +1,21 @@
 # moe-surgeon
 
-Permanent MoE expert pruning and merging for domain-specialised vLLM deployments.
+Fit a domain-specialised MoE deployment into less memory: an NVMe expert tier,
+with permanent offline pruning and merging where a model supports it.
 
 A general MoE model carries experts for every domain it was trained on. A
 deployment that only ever sees one domain pays for all of them. This package
-measures which experts that deployment actually uses, then produces a smaller
-checkpoint — permanently, offline — by dropping the unused ones and merging the
-redundant ones. Experts too cold to keep resident but too useful to delete go to
-an NVMe tier instead of being thrown away.
+measures which experts that deployment actually uses, then makes it cheaper to
+serve — primarily by tiering cold experts to NVMe, and, where the measurements
+justify it, by dropping the genuinely unused ones and merging redundant ones into
+a smaller checkpoint.
 
-The gain is a smaller model, not a runtime tradeoff.
+**On the models measured here (OLMoE, Qwen3-30B) the disk tier is the primary
+mechanism, not pruning** — they have no dead tail and no mergeable pairs, so
+deletion costs quality (measured below) and exists to *support* the tier: a
+smaller candidate set and store. Redundancy is a per-model property, so the
+pruning and merging machinery is kept and tested; it is simply not the win on
+these two families. See [DECISIONS.md](DECISIONS.md).
 
 ## Why it is a separate package
 
@@ -36,7 +42,7 @@ moved.
 
 ```bash
 pip install -e .   # registers a vllm.general_plugins entry point
-vllm serve allenai/OLMoE-1B-7B-0924 --enforce-eager \
+vllm serve allenai/OLMoE-1B-7B-0924 \
   --additional-config '{"surgeon": {"expert_cache_size": 24,
       "store_dir": "./store", "ram_cache": 48, "fp8_store": true}}'
 ```
@@ -63,10 +69,57 @@ not evidence of anything.
 Activation is deliberately not `--moe-expert-cache-size`, which drives the in-tree
 path; the two can therefore run side by side and be compared.
 
-Scope, stated rather than implied: unquantized checkpoints, `--enforce-eager`
-required, and streaming the checkpoint into the store is not ported. fp8 checkpoints
-still need `Fp8MoEMethod` substituted, and its cache must be installed before
-`get_fused_moe_quant_config` captures the scale tensors.
+Scope, stated rather than implied: tensor parallelism is refused (the store identity
+carries no rank component). `--enforce-eager` is **no longer required** —
+see [Piecewise CUDA graphs](#piecewise-cuda-graphs-the-last-in-tree-only-capability).
+Streaming the checkpoint into the store **is** ported and on by default —
+see [Streaming load](#streaming-load-the-tier-now-wins-on-feasibility-too). **fp8
+checkpoints are served too** (`compat/fp8_runtime.py`): verified token-identical to the
+untiered fp8 baseline on `DeepSeek-Coder-V2-Lite-Instruct-FP8`. fp8 could not be the
+unquantized path's one clean substitution — `Fp8MoEMethod` is not a `CustomOp`, so it
+goes through a `Fp8Config` shadowing the `"fp8"` config, and the override copies
+`_setup_kernel` to install the cache before the quant config captures the scales — so it
+costs three more (optional) internal seams, the price recorded in
+[DECISIONS.md](DECISIONS.md).
+
+## Sizing it: the only knob that matters, and what it costs
+
+Everything else in this README is a mechanism. This is the number to get right, and it
+was measured after the mechanisms were built — which is how it came to be a surprise.
+
+| `expert_cache_size` (of 64) | decode | GPU expert bytes | peak VRAM |
+|---|---|---|---|
+| 24 | 55.3/s | 4.50 GiB | 29.29 GiB |
+| 32 | 75.5/s | 6.00 GiB | 29.29 GiB |
+| 40 | 107.9/s | 7.50 GiB | 29.41 GiB |
+| **48** | **143.0/s** | 9.00 GiB | 29.25 GiB |
+| *untiered* | *218.2/s* | *12.00 GiB* | — |
+
+OLMoE-1B-7B on GB10, `ram_cache 64`, eager, 8 prompts × 256 tokens, 3 repeats.
+**2.59× across one integer.** Held-out perplexity is 11.6253 on every row including the
+untiered one; the stronger check — a seed-pinned greedy run hashed to the token id — was
+run at capacity 48 and matched untiered exactly, three repeats each.
+
+Two things that are not obvious from the table:
+
+- **Set it against the per-layer expert union of your serving batch, not against free
+  VRAM.** At batch 8 that union measured 35.3 mean / 46 max, so 24 slots are 47%
+  oversubscribed: every step re-fetches the shortfall over the host→device link, and the
+  forward additionally splits into chunks. Roughly 80% of the 2.59× is simply moving
+  fewer bytes (663 → 117 MB per token); the rest is the split. The runtime now warns,
+  once per layer, when a decode step routes to more experts than there are slots.
+- **The slots are paid for out of KV cache, not out of device memory.** The peak-VRAM
+  column is flat: vLLM sizes KV to fill whatever `gpu_memory_utilization` leaves, so
+  capacity buys throughput and spends context. `surgeon budget` prints the per-slot cost
+  so the trade is explicit.
+
+Corollaries worth stating because each was measured rather than assumed: `ram_cache`
+below the expert count turns every eviction into a disk read (48 → 64 was 1.66× and cut
+the median decode time markedly); `fp8_store` on a non-fp8 checkpoint is a **space**
+mechanism, costing 1.11× decode and bit-exactness to halve disk and host RAM; and no
+cache policy or prefetch substitutes for capacity — Belady's optimum is worth 1.068× and
+known-future prefetch measured 1.03–1.075×, because residency is a byte count and
+scheduling does not change how many bytes must cross the link.
 
 ## Three axes, and why nothing is judged on one
 
@@ -90,6 +143,14 @@ The fourth row is why surgery exists: **pruned+tier decodes 1.32× faster than t
 alone** at the same capacity, because a 24-slot cache covers more of a 40-expert
 candidate set than a 64-expert one. And the tier **halves load time**, which no
 accuracy or throughput number would have surfaced.
+
+Two honesties about these numbers. Each is a **single run** — no repeats, no variance
+(boot-floor probes vary ~15% in this very environment). And the `decode` column is
+output tokens over **prefill+decode** wall time by construction (`compat/bench.py`
+sets `prefill_seconds=0.0` and times the whole generate), with short prompts chosen so
+prefill is ~1% of it; the contamination is not perfectly arm-neutral, since the tier
+arms pay their prefill through disk reads inside that denominator. So read 0.38× and
+1.32× as ratios with a few-percent error bar, not to three figures.
 
 Two examples of the per-axis rule doing real work. Static gate geometry is
 worthless for *choosing* experts (ρ ≈ 0.00) and genuinely useful for *sizing* them
@@ -132,8 +193,14 @@ A large `skipped` count on a laptop is expected, not a warning sign.
 ## The job server
 
 ```bash
-surgeon serve --host 0.0.0.0 --port 8300 --state ./surgeon-state
+surgeon serve --port 8300 --state ./surgeon-state   # binds 127.0.0.1
 ```
+
+The server runs subprocesses from request fields, so it binds loopback by default.
+Exposing it on a non-loopback host requires `--token` (or `$MOE_SURGEON_TOKEN`),
+which every request then carries in an `X-Surgeon-Token` header; `/health` stays
+open. Engine kwargs in a request are allow-listed (`trust_remote_code` is refused),
+and a stage never fetches an uncached model unless the job sets `allow_download`.
 
 ```bash
 curl -sX POST localhost:8300/jobs -H 'content-type: application/json' -d '{
@@ -360,6 +427,20 @@ the refusal claimed.
 model "badly degraded", read off three greedy samples. Measured on held-out
 gsm8k[400:500] it is **9.71 → 15.26 perplexity, 1.57×** — a real cost, but not the
 collapse three samples suggested. The qualitative read overstated it.
+
+Every pruning number here is **in-domain** (profiled and evaluated on gsm8k). A
+permanent artifact is served on whatever traffic arrives, and deletion is
+irreversible, so the number that matters for a real deployment is the cost under
+distribution shift — which is larger: the same pruned-40 artifact scores **1.404× on
+hellaswag** against 1.234× in-domain (the amplitude section below, where the
+out-of-domain cost is also what the amplitude fix is validated against). Read the
+in-domain ratios as a floor on the cost, not the cost.
+
+All perplexity figures below are single measurements without a confidence interval,
+and the eval slice size varies by section (gsm8k[400:500] here, 20 prompts for the
+merge arm, `--limit 50` for amplitude), so each carries its own baseline — labelled
+where they are juxtaposed. There is no downstream **task**-accuracy measurement
+anywhere in this document; "accuracy" throughout means held-out perplexity, a proxy.
 
 The ablation study puts that number in context (`surgeon ablate`):
 
@@ -592,7 +673,7 @@ is the experts in flight, not the model. It also leaves nothing for
 `device_loading_context` to hoist and nothing for `replace_parameter` to release.
 
 ```bash
-vllm serve allenai/OLMoE-1B-7B-0924 --enforce-eager \
+vllm serve allenai/OLMoE-1B-7B-0924 \
   --additional-config '{"surgeon": {"expert_cache_size": 24, "store_dir": "./store",
       "ram_cache": 48, "fp8_store": true}}'
 ```
@@ -648,6 +729,86 @@ without this, and the 23.40 → 11.35 GiB gap is the measurement that justifies 
 mechanism. None of it overturns the rest — the tier still halves load time (98.6 s →
 45.2 s) at 1.003× perplexity, and pruned+tier still decodes 1.32× faster than tier
 alone.
+
+### Piecewise CUDA graphs: the last in-tree-only capability
+
+The one thing the prototype did that the plugin could not: run under CUDA graphs. The
+cache's `prepare()` is dynamic host code — LFRU bookkeeping, a D2H routing sync, H2D
+weight copies — and none of it may be captured into a graph. The in-tree version
+handled this in two places: a `VllmConfig` post-init that adds `vllm::moe_forward` to
+`compilation_config.splitting_ops` so the MoE op is *carved out* of the captured region
+and runs eager, and a `MoERunner` that copies the eager op's output to a
+**capture-stable address** so the next graph piece reads a fixed location. Neither is a
+method substitution, so out of tree the plugin simply required `--enforce-eager`.
+
+`compat/graph_runtime.py` pulls both in. The split is injected at config time by
+**wrapping `VllmConfig.__post_init__`** — a plugin has no `offload_config` field to gate
+on and cannot edit the config class, and the plugin entry point runs inside
+`EngineArgs.__post_init__`, before any `VllmConfig` is built, so the wrap is in place
+when the config that matters is post-initialised. (Injecting later, from the runner's
+`__init__`, is too late: the split points are fixed before the runner is constructed,
+and the MoE op ends up captured — it aborts with `operation not permitted when stream is
+capturing`. That failed attempt is why the injection lives at config time.) The output
+stabilisation is a genuine `MoERunner` substitution via `register_oot`, copying the MoE
+output into a persistent per-shape buffer on piecewise passes.
+
+Verified on GB10, OLMoE-1B-7B, greedy, four prompts, against three controls:
+
+| arm | stabilised copies | output |
+|---|---|---|
+| tier, eager | 0 (no graphs) | **token-identical to untiered eager, all 4 prompts** |
+| tier, piecewise graphs | 2464 | 3/4 prompts identical to tier-eager; 1 diverges in its tail |
+| tier, graphs, **stabilisation off** | 0 | **garbage — one token id repeated 24×** on every prompt |
+
+The three rows are the whole argument. Row 1: the cache is numerically transparent —
+in eager mode the tier reconstructs weights bit-exactly, so it matches the untiered
+baseline token-for-token. Row 3 is the control: split the MoE op out but *don't*
+stabilise its address, and the captured downstream piece reads a frozen workspace view
+— every step yields the same logits, so greedy decoding repeats one token. That is the
+bug the stabilisation exists to prevent, and turning it off reproduces it exactly. Row
+2 is the feature working: 2464 stabilised copies prove the piecewise path actually ran,
+and the output tracks the eager tier except in one greedy-unstable tail — where
+*untiered* graphs also diverge from *untiered* eager (CUDA graphs are not bit-identical
+to eager in stock vLLM either), so the divergence is graph-vs-eager float noise, not the
+tier. `--enforce-eager` is now optional; if `graph_runtime` fails to install (MoERunner
+moved), `validate()` reinstates the requirement rather than risk a silent
+capture-address bug.
+
+**What it buys, measured — and it is not throughput.** Benchmarked on GB10 (OLMoE, 8
+prompts × 256 tokens, 3 repeats) and on a 4 GiB laptop GPU:
+
+| arm | decode | load | note |
+|---|---|---|---|
+| untiered, eager | 218.2/s (σ 0.001) | 117.9 s | |
+| untiered, **graphs** | 226.4/s (σ 0.008) | 119.9 s | graphs buy the baseline **+3.8%** |
+| tier 24/64, ram 64, eager | 55.8/s (σ 0.044) | 13.0 s | (undersized cache — see below) |
+| tier 24/64, ram 64, **graphs** | 55.2/s (σ 0.044) | 35.0 s | graphs buy the tier **nothing** |
+
+Those tier rows run a 24-slot cache against a measured 46-expert per-layer working set, which
+is the wrong configuration; sized correctly (48 slots) the tier decodes at **143.0 tok/s**.
+That does not change the graphs-vs-eager conclusion — it is the same MoE op staying eager
+either way — but do not read 55.8 as what the tier costs. See
+[DECISIONS.md](DECISIONS.md#the-capacity-sweep-and-the-finding-that-dominates-everything-else-here).
+
+Graphs speed the *baseline* up by 3.8% and the *tier* not at all — which is the design
+working as intended rather than a disappointment: the whole point of the split is that
+the MoE op stays **eager**, so the part of the step that dominates under the tier is
+exactly the part no graph can capture. Graph mode also costs ~22 s of capture at load
+(13.0 → 35.0 s).
+
+It costs device memory too, and the 4 GiB laptop GPU puts a number on it. At
+`gpu_memory_utilization` 0.83 the tier runs fine eager (2.69 GiB peak, 7.7 tok/s, 6.6 s
+load) while the same config with graphs cannot allocate a single KV block and vLLM
+refuses at boot — loudly, with a clear message. Raise the budget to 0.90 and graphs do
+fit (2.71 GiB peak, 29.4 s load): so the requirement is roughly **7 more points of
+utilisation, ≈290 MiB of headroom, and 4.5× the load time** on that card, not an
+impossibility. The decode difference there (7.8 → 8.3 tok/s) was a single run with no
+repeats, so it is below the resolution of that measurement and no claim is made from it.
+
+So the honest framing is that S5 is a **compatibility** win — the tier now composes with
+vLLM's default (non-eager) serving mode instead of demanding a flag — and on
+memory-tight or load-latency-sensitive deployments `--enforce-eager` remains the better
+choice, now as a tuning decision rather than a hard requirement.
 
 ## Amplitude: half of pruning's damage was a constant
 
@@ -707,6 +868,41 @@ anything, warns when the best point sits at an edge (the true optimum would be o
 what was measured), and declines to credit a win under 1% — several times the rounding
 drift, because a one-parameter fit deserves no more.
 
+### Measured on downstream tasks — and this changes the reading
+
+Every number above is held-out **perplexity**. Perplexity is a proxy, so the
+rank-1 pruned-40 artifact and its amplitude-corrected version were scored on three
+downstream tasks through `lm-eval` (500 items each, GB10), with a paired **exact
+McNemar** test per task — the same instrument the fp8 store was held to
+([notes/kalite-eval.md](../../notes/kalite-eval.md)):
+
+| task (metric) | baseline | pruned-40 | Δ (McNemar p) | pruned-40 + amp 0.85 |
+|---|---|---|---|---|
+| arc_challenge (acc_norm) | 0.468 | 0.352 | **−0.116** (4.8e‑08 \*\*\*) | 0.350 |
+| hellaswag (acc_norm) | 0.662 | 0.618 | −0.044 (0.014 \*) | 0.622 |
+| gsm8k (exact, strict) | 0.100 | 0.058 | −0.042 (0.0055 \*\*) | 0.068 |
+
+Two results that perplexity alone would not have told us, and one of them is
+uncomfortable:
+
+- **Deletion costs real, statistically-significant task accuracy on every task** —
+  arc_challenge loses a quarter of its accuracy (−25% relative, p = 5e‑08). So the
+  quality gate's default 1.3× **perplexity** ceiling does **not** certify task
+  quality; a plan that clears it can still gut a benchmark. The gate is a guardrail
+  on perplexity, and this table is the reason to say so plainly rather than let
+  "1.25× perplexity" read as "1.25× as costly."
+- **The amplitude fix recovers perplexity but not task accuracy.** It removed ~60% of
+  the *perplexity* damage, yet against pruned-40 its task deltas are within noise on
+  all three tasks (arc −0.002, hellaswag +0.004, gsm8k +0.010; McNemar p = 1.0, 0.83,
+  0.53). A one-scalar `down_proj` correction fixes the average log-likelihood without
+  restoring the decisions — a concrete case of perplexity and task metrics parting
+  ways, and the reason this section exists.
+
+This is the strongest evidence in the document for the framing the rest of it
+argues: on these models deletion is a real quality cost, so the tier — which keeps
+those experts — is the primary mechanism and deletion is worth doing only where an
+expert genuinely contributes nothing.
+
 ## The quality gate
 
 ```bash
@@ -747,6 +943,14 @@ corpus it came from is scoring the answer key:
 | cold, LFRU (today's default) | 32.0% | 41.0% | 47.0% | 57.0% | 58.2% | 70.1% |
 | cold, EWMA | 32.0% | 42.0% | 50.0% | 59.6% | 60.5% | 71.3% |
 | **warm, EWMA + prior** | **42.0%** | **49.0%** | **55.0%** | **62.0%** | 61.0% | 71.3% |
+
+Three caveats before reading this table. It is a **single-tier** `store/replay.py` run
+(pure numpy) that has **no in-repo driver** — there is no `surgeon replay` subcommand,
+so the table cannot be regenerated today. The warm arm is measured with the replay's
+**prewarm placement** (experts placed resident before the first token); the shipped
+runtime seeds only the prior *bias* (`hot_experts.seed_policy` sets `policy.prior`, it
+does not place), so a real warm start realises less than the +10 shown. And +10 pts at
+N=50 is ~5 cache hits (binomial SE ≈ 6.6 pts) with no repeats — indicative, not precise.
 
 Two separable wins, and it matters not to conflate them:
 

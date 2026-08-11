@@ -130,6 +130,33 @@ def test_fp8_halves_the_record_but_not_the_gpu_slot():
     assert small.disk_bytes < full.disk_bytes
 
 
+def test_fp32_checkpoint_is_costed_resident_at_the_serving_width():
+    """A fp32 model (checkpoint 4 bytes) is served at 2 bytes; every GPU-resident
+    figure must halve, or budget doubles the true cost (the Granite case)."""
+    fp32 = _geometry(
+        checkpoint_dtype_bytes=4,
+        serving_dtype_bytes=2,
+        routed_expert_bytes=1,
+        other_bytes=1 << 20,
+        router_bytes=1 << 18,
+    )
+    half = _geometry(checkpoint_dtype_bytes=2, serving_dtype_bytes=0)
+
+    # A resident slot is the serving width, so fp32-at-2-bytes == the 2-byte model.
+    assert fp32.resident_gpu_record_bytes == half.resident_gpu_record_bytes
+    # But the store record still carries the checkpoint's own (4-byte) width.
+    assert fp32.record_bytes(fp8=False) == 2 * half.record_bytes(fp8=False)
+    # Non-expert resident bytes scale down too.
+    assert fp32.resident_scale(fp32.other_bytes) == fp32.other_bytes // 2
+
+    # And a fp32 model fits the same capacity as the equivalent 2-byte one.
+    budget = 4 << 30
+    assert (
+        plan_for_vram(fp32, budget, fp8_store=True).capacity
+        == plan_for_vram(half, budget, fp8_store=True).capacity
+    )
+
+
 def test_records_are_page_aligned():
     """The store pads to 4096 so any pool row is O_DIRECT-aligned."""
     g = _geometry(hidden=2048, intermediate=1024)
@@ -378,3 +405,33 @@ def test_the_scale_is_only_applied_when_the_dtypes_differ():
 
     # An unset serving width must not silently scale anything to zero.
     assert geom(4, 0).serving_scale == 1.0
+
+
+def test_report_says_capacity_is_paid_out_of_kv(tmp_path):
+    """The one thing the arithmetic above it cannot say.
+
+    ``plan_for_vram`` answers the floor question -- fixed KV reserve, how much
+    capacity fits -- which is right for "will it run" and wrong for "what should I
+    set when serving". Measured on OLMoE/GB10, capacity 24/32/40/48 reported peak
+    VRAM 29.29/29.29/29.41/29.25 GiB (flat) while decode went 55.3 -> 143.0 tok/s:
+    vLLM sizes KV to fill whatever utilization leaves, so slots come out of context,
+    not out of free memory. A report that omits that leads a reader to size against
+    the wrong budget.
+    """
+    _write(tmp_path)
+    text = report(analyze(str(tmp_path)), vram_gib=1.0, kv_cache_gib=0.0)
+    assert "sizing notes" in text
+    assert "KV cache" in text
+    assert "expert union" in text
+
+
+def test_report_calls_fp8_store_a_space_mechanism_only_when_it_is_on(tmp_path):
+    """fp8_store costs 1.11x decode and bit-exactness on a non-fp8 checkpoint, so the
+    advice has to appear where someone is about to turn it on -- and not otherwise,
+    because an unconditional warning is one people learn to skip."""
+    _write(tmp_path)
+    g = analyze(str(tmp_path))
+    on = report(g, vram_gib=1.0, kv_cache_gib=0.0, fp8_store=True)
+    off = report(g, vram_gib=1.0, kv_cache_gib=0.0, fp8_store=False)
+    assert "SPACE mechanism" in on
+    assert "SPACE mechanism" not in off
