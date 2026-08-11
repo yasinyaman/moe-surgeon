@@ -75,6 +75,21 @@ def test_optional_seams_are_excluded_from_the_pin_check():
         assert seam.why, f"{seam.target} must say what it would buy us"
 
 
+def test_data_couplings_are_declared_and_point_at_real_files():
+    """The offline half's non-import dependencies on vLLM are recorded, and each
+    names a file that exists -- so the 'confined to compat/' claim has its honest
+    footnote next to it rather than being quietly false."""
+    from pathlib import Path
+
+    from vllm_moe_surgeon.compat.seams import DATA_COUPLINGS
+
+    src = Path(__file__).resolve().parents[1] / "src" / "vllm_moe_surgeon"
+    assert DATA_COUPLINGS, "the offline vLLM couplings must be tracked, not implicit"
+    for location, vllm_behaviour, failure in DATA_COUPLINGS:
+        assert (src / location).exists(), f"{location} does not exist"
+        assert len(vllm_behaviour) > 20 and len(failure) > 20
+
+
 def test_no_reliance_on_fork_only_api():
     """``supports_expert_lru_cache`` was added by the in-tree prototype.
 
@@ -89,7 +104,16 @@ def test_internal_seams_are_acknowledged():
     internal = [s for s in SEAMS if s.tier == "internal"]
     assert internal, "table should not claim everything is documented API"
     # Reviewers should see the ratio move when someone adds a private seam.
-    assert len(internal) <= 14, (
+    # Raised 14 -> 17 on 2026-08-10 when the fp8 tier was wired: it adds
+    # convert_to_fp8_moe_kernel_format / make_fp8_moe_kernel / Fp8MoeBackend, the
+    # surface expansion DECISIONS.md predicted for the fp8 path. All optional.
+    # Raised 17 -> 28 on 2026-08-11 when the piecewise CUDA-graph path (S5) was
+    # wired: it holds MoERunner + _forward_impl, splitting_ops,
+    # max_cudagraph_capture_size, CUDAGraphMode, three forward_context names, and the
+    # config-time injection's VllmConfig.__post_init__ + CompilationConfig.mode +
+    # CompilationMode -- all optional, all degrade to requiring --enforce-eager
+    # rather than crashing.
+    assert len(internal) <= 28, (
         f"{len(internal)} internal seams -- if this grew on purpose, raise the "
         "bound deliberately and say why in the commit"
     )

@@ -12,6 +12,21 @@ model/module"). Everything below is therefore borrowed, not owed. When an upgrad
 moves one of these, we want a named test failure that says which seam moved and
 why we were holding it, not a ``TypeError`` sixty frames deep inside a worker.
 
+Every entry is something the runtime, the profiler or the writer actually touches.
+An entry marked ``required=False`` is one we can currently live without -- an
+emerging upstream helper we would adopt if present (``_orient_fused_weight``), or a
+name held for a path that installs itself only when reached and declines gracefully
+when the name has moved (the fp8 method substitution, and the ``MoERunner``
+substitution that lifts the ``--enforce-eager`` requirement; see ``DECISIONS.md`` and
+:mod:`.graph_runtime`). Those paths degrade rather than crash on a missing name -- fp8
+falls back to no fp8 tier, the graph path back to requiring eager -- so their seams are
+news, not a broken pin. The table is not the *plan's* wishlist: an
+``_apply_quant_method`` override the plan budgeted but the implementation never
+needed is not here, because a seam nothing calls trains you to ignore the test. The
+``MoERunner`` subclass and ``PluggableLayer`` substitution the plan also budgeted were
+unused until the piecewise CUDA-graph path (S5) was built; now that it calls them,
+they are here.
+
 Stability tiers, from the survey in the plan:
 
 ``documented``
@@ -19,7 +34,7 @@ Stability tiers, from the survey in the plan:
     ``register_quantization_config``, ``register_model_loader``).
 ``used_in_tree``
     Real mechanism, exercised in-tree, thinly documented. Mechanism is stable;
-    the classes it substitutes are not (``PluggableLayer.register_oot``).
+    the classes it substitutes are not (``CustomOp.register_oot``).
 ``internal``
     Private surface. Expected to move. Held anyway because there is no
     alternative -- each of these carries a note saying what breaks without it.
@@ -69,31 +84,22 @@ class Seam:
 
 SEAMS: tuple[Seam, ...] = (
     # ------------------------------------------------------------------
-    # Registration mechanisms. These are how we get installed at all.
+    # Registration mechanism. This is how we get installed at all.
     # ------------------------------------------------------------------
     Seam(
         target="vllm.model_executor.custom_op:CustomOp.register_oot",
         kind="method",
         tier="used_in_tree",
         why=(
-            "Substitutes UnquantizedFusedMoEMethod so the expert cache can change "
-            "where expert weights are allocated and what apply() dispatches to. "
-            "Without it the unquantized MoE path needs an in-tree patch. "
+            "Called as UnquantizedFusedMoEMethod.register_oot(SurgeonUnquantized...) "
+            "to substitute the unquantized MoE method, so the expert cache can "
+            "change where expert weights are allocated and what apply() dispatches "
+            "to. Without it the unquantized MoE path needs an in-tree patch. "
             "CONTRACT: op_registry_oot is keyed by the *class* name, because "
             "CustomOp.__new__ looks up cls.__name__ -- not by the op name given to "
             "@CustomOp.register. Registering under the op name puts the class where "
-            "nothing looks, and the substitution no-ops silently."
-        ),
-        params=("name",),
-    ),
-    Seam(
-        target="vllm.model_executor.custom_op:PluggableLayer.register_oot",
-        kind="method",
-        tier="used_in_tree",
-        why=(
-            "Substitutes RoutedExperts (weight loading, cache install) and "
-            "MoERunner (routing telemetry, output stabilization). The single "
-            "most load-bearing seam in the package."
+            "nothing looks, and the substitution no-ops silently -- with matching "
+            "tokens, which is why matching output is not evidence it engaged."
         ),
         params=("name",),
     ),
@@ -101,37 +107,33 @@ SEAMS: tuple[Seam, ...] = (
         target="vllm.model_executor.layers.quantization:register_quantization_config",
         kind="function",
         tier="documented",
+        required=False,
         why=(
-            "Registers a config under the name 'fp8', shadowing the builtin, so "
-            "Fp8MoEMethod can be swapped. Fp8MoEMethod is not a CustomOp, so "
-            "register_oot cannot reach it; custom configs override same-named "
-            "builtins, which is the only route in."
+            "WIRED for the fp8 path (compat/fp8_runtime.py): registers our Fp8Config "
+            "under the name 'fp8', shadowing the builtin, so our Fp8MoEMethod is "
+            "swapped in -- Fp8MoEMethod is not a CustomOp, so register_oot cannot "
+            "reach it. Optional: install_fp8 declines gracefully on absence, so fp8 "
+            "moving disables the fp8 tier but never fails the pin or the unquantized "
+            "path."
         ),
         params=("quantization",),
     ),
     # ------------------------------------------------------------------
-    # Classes we subclass.
+    # Classes. UnquantizedFusedMoEMethod we subclass; RoutedExperts we do NOT
+    # subclass -- the layer objects vLLM hands our method are its instances, and
+    # we read its attribute surface.
     # ------------------------------------------------------------------
     Seam(
         target="vllm.model_executor.layers.fused_moe.routed_experts:RoutedExperts",
         kind="class",
         tier="internal",
         why=(
-            "Base class for our MoE layer. Owns the expert parameters and the "
-            "weight loader. ~1700 lines with ~20 constructor kwargs; the class "
+            "The layer objects vLLM passes to our quant method are RoutedExperts "
+            "instances; we read its attribute surface (w13_weight/w2_weight, "
+            "layer_name, local_num_experts, moe_config, activation, "
+            "global_num_experts) rather than subclassing it. ~1700 lines; the class "
             "that has already been renamed once (it was FusedMoE)."
         ),
-    ),
-    Seam(
-        target="vllm.model_executor.layers.fused_moe.runner.moe_runner:MoERunner",
-        kind="class",
-        tier="internal",
-        why=(
-            "Base class for the telemetry runner. Note it carries no "
-            "@PluggableLayer.register decorator of its own; interception works "
-            "because PluggableLayer.__new__ keys on cls.__name__."
-        ),
-        params=("router",),
     ),
     Seam(
         target=(
@@ -140,64 +142,135 @@ SEAMS: tuple[Seam, ...] = (
         ),
         kind="class",
         tier="internal",
-        why="Base class for the cache-aware unquantized MoE method.",
+        why="Base class we subclass as SurgeonUnquantizedMoEMethod.",
     ),
     Seam(
         target="vllm.model_executor.layers.quantization.fp8:Fp8Config",
         kind="class",
         tier="internal",
-        why="Subclassed so get_quant_method can return our Fp8MoEMethod.",
+        required=False,
+        why="Subclassed (compat/fp8_runtime.py) so get_quant_method hands MoE layers "
+        "our Fp8MoEMethod. Optional -- fp8 tier only; install_fp8 declines on absence.",
     ),
     Seam(
         target="vllm.model_executor.layers.quantization.fp8:Fp8MoEMethod",
         kind="class",
         tier="internal",
-        why="Base class for the cache-aware fp8 MoE method.",
+        required=False,
+        why="Subclassed as SurgeonFp8MoEMethod, overriding _setup_kernel and apply. "
+        "Optional -- fp8 tier only; install_fp8 declines on absence.",
     ),
     Seam(
         target=(
-            "vllm.model_executor.layers.fused_moe.fused_moe_method_base"
-            ":FusedMoEMethodBase"
+            "vllm.model_executor.layers.fused_moe.oracle.fp8"
+            ":convert_to_fp8_moe_kernel_format"
         ),
+        kind="function",
+        tier="internal",
+        required=False,
+        why="Called in the copied _setup_kernel body to shuffle fp8 weights/scales to "
+        "runtime format before the cache takes them. Optional -- fp8 tier only.",
+    ),
+    Seam(
+        target=(
+            "vllm.model_executor.layers.fused_moe.oracle.fp8:make_fp8_moe_kernel"
+        ),
+        kind="function",
+        tier="internal",
+        required=False,
+        why="Builds the fp8 MoE kernel in the copied _setup_kernel body. Optional -- "
+        "fp8 tier only.",
+    ),
+    Seam(
+        target="vllm.model_executor.layers.fused_moe.oracle.fp8:Fp8MoeBackend",
         kind="class",
-        tier="documented",
-        why=(
-            "The contract a MoE quant method must satisfy. We only need it for "
-            "isinstance checks; note that supports_expert_lru_cache was added by "
-            "the in-tree prototype and does NOT exist upstream, so the package "
-            "keeps its own backend allowlist instead of reading that property."
-        ),
+        tier="internal",
+        required=False,
+        why="The AITER-shuffle branch of the copied _setup_kernel body tests against "
+        "it. Optional -- fp8 tier only.",
     ),
     # ------------------------------------------------------------------
-    # Methods we override. Each of these is a behaviour we replace, so a
-    # rename here means our override silently stops being called -- the worst
-    # failure mode in the package and the reason this table exists.
+    # Methods our SurgeonUnquantizedMoEMethod OVERRIDES. A rename here means our
+    # override silently stops being called and the stock path runs instead -- the
+    # worst failure mode in the package (matching tokens, no cache) and the reason
+    # this table exists. All three are defined directly on the base class.
     # ------------------------------------------------------------------
     Seam(
         target=(
-            "vllm.model_executor.layers.fused_moe.routed_experts"
-            ":RoutedExperts.weight_loader"
+            "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
+            ":UnquantizedFusedMoEMethod.create_weights"
         ),
         kind="method",
         tier="internal",
         why=(
-            "Intercepted to stream expert shards straight to the disk store so "
-            "the [num_experts, ...] tensor is never materialized. A rename means "
-            "checkpoints load normally and the store is never written -- silent."
+            "Overridden to allocate zero-expert / cpu-pinned parameters and to stamp "
+            "the streaming loader onto them. Renamed upstream -> weights allocated "
+            "the stock way, the tier never installs, silent."
         ),
+        params=("layer", "num_experts", "intermediate_size_per_partition",
+                "params_dtype"),
     ),
     Seam(
         target=(
-            "vllm.model_executor.layers.fused_moe.routed_experts"
-            ":RoutedExperts._needs_intermediate_size_param"
+            "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
+            ":UnquantizedFusedMoEMethod.process_weights_after_loading"
         ),
         kind="method",
         tier="internal",
         why=(
-            "Compares in-tree quant method CLASS NAMES as strings, so our "
-            "subclass is invisible to it. Overridden to re-add ourselves. If "
-            "this method moves, our method gets the wrong parameter set."
+            "Overridden to build the provider and hand-build the MoE kernel instead "
+            "of _setup_kernel shuffling the full weights onto the device. Renamed "
+            "upstream -> _surgeon_provider is never set, apply() takes its "
+            "provider-None fallback to the stock path, silent."
         ),
+        params=("layer",),
+    ),
+    Seam(
+        target=(
+            "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
+            ":UnquantizedFusedMoEMethod.apply"
+        ),
+        kind="method",
+        tier="internal",
+        why=(
+            "Overridden to run the forward through the expert cache. Renamed "
+            "upstream -> the stock apply runs on the (released) weights, silent."
+        ),
+        params=("layer", "topk_ids", "shared_experts"),
+    ),
+    Seam(
+        target=(
+            "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
+            ":make_unquantized_moe_kernel"
+        ),
+        kind="function",
+        tier="internal",
+        why=(
+            "Imported and called in the overridden process_weights_after_loading to "
+            "build the kernel by hand (skipping _setup_kernel's device shuffle). "
+            "Gone -> the cache-aware method cannot build its kernel."
+        ),
+    ),
+    Seam(
+        target="vllm.model_executor.utils:replace_parameter",
+        kind="function",
+        tier="internal",
+        why=(
+            "Releases the full w13/w2 parameters to torch.empty(0) once the provider "
+            "has copied what it needs. Gone -> the full expert tensors stay "
+            "resident, defeating the tier."
+        ),
+        params=("layer", "param_name", "new_data"),
+    ),
+    Seam(
+        target="vllm.model_executor.utils:set_weight_attrs",
+        kind="function",
+        tier="internal",
+        why=(
+            "Stamps the (possibly stream-wrapped) weight_loader and shard attrs onto "
+            "each parameter in the overridden create_weights."
+        ),
+        params=("weight", "weight_attrs"),
     ),
     Seam(
         target=(
@@ -210,23 +283,9 @@ SEAMS: tuple[Seam, ...] = (
         why=(
             "Upstream extracted the fused-weight orientation logic that used to "
             "be an inline branch inside weight_loader. Where it exists we should "
-            "call it instead of duplicating the transpose rule in our override; "
-            "where it does not, our override carries its own copy. Absent at the "
-            "0.26.1 merge base, present ~300 commits later -- kept optional so "
-            "the pinned version still passes."
-        ),
-    ),
-    Seam(
-        target=(
-            "vllm.model_executor.layers.fused_moe.runner.moe_runner"
-            ":MoERunner._forward_impl"
-        ),
-        kind="method",
-        tier="internal",
-        why=(
-            "Overridden to stabilize the MoE op's output address under piecewise "
-            "CUDA graphs. This replaces an in-tree patch; the underlying bug is "
-            "upstream's and should be proposed separately."
+            "call it instead of duplicating the transpose rule; where it does not, "
+            "our code carries its own copy. Absent at the 0.26.1 merge base, present "
+            "~300 commits later -- kept optional so the pinned version still passes."
         ),
     ),
     # ------------------------------------------------------------------
@@ -265,30 +324,240 @@ SEAMS: tuple[Seam, ...] = (
         target="vllm.model_executor.layers.quantization.fp8:Fp8MoEMethod._setup_kernel",
         kind="method",
         tier="internal",
+        required=False,
         why=(
-            "The cache must be installed here, BEFORE get_fused_moe_quant_config "
-            "captures the scale tensors. Getting this order wrong scales every "
-            "expert by whichever one happens to occupy its slot -- wrong output "
-            "from the first token, no exception. See notes/fp8-duzeltmesi.md."
+            "RESERVED for the fp8 path (DECISIONS.md, not yet wired). The cache must "
+            "be installed here, BEFORE get_fused_moe_quant_config captures the scale "
+            "tensors. Getting this order wrong scales every expert by whichever one "
+            "occupies its slot -- wrong output from the first token, no exception. "
+            "See notes/fp8-duzeltmesi.md."
+        ),
+    ),
+    # ------------------------------------------------------------------
+    # Piecewise CUDA-graph path (compat/graph_runtime.py). All optional: install_graph
+    # declines on any missing name and the splitting-op injection is wrapped in a
+    # try/except, so a rename here costs the non-eager speedup (validate() falls back
+    # to requiring --enforce-eager), not correctness. Two pieces: a config-time
+    # injection that carves the MoE op out of the captured region (a wrap of
+    # VllmConfig.__post_init__, because a plugin cannot edit the config class or add
+    # the fork's offload_config field), and a MoERunner substitution that stabilises
+    # the eager MoE op's output address. The whole point of the path is to remove the
+    # eager requirement, so we still want to see any of these move.
+    # ------------------------------------------------------------------
+    Seam(
+        # Definition module, not the vllm.config re-export: the static check descends
+        # into .__post_init__, which needs the ClassDef, not the re-export node.
+        target="vllm.config.vllm:VllmConfig.__post_init__",
+        kind="method",
+        tier="internal",
+        required=False,
+        why=(
+            "Wrapped so that, after the stock post-init defaults splitting_ops, we "
+            "append vllm::moe_forward(_shared) when the surgeon tier is on and the "
+            "model is not eager -- the fork does this inline, gated on its own "
+            "offload_config. Renamed -> our wrap never runs, the MoE op is captured "
+            "into the graph, and the tier is stuck on --enforce-eager (the fallback "
+            "validate() enforces). Injecting later (from the runner __init__) is too "
+            "late: the split points are fixed before the runner is built."
+        ),
+    ),
+    Seam(
+        target="vllm.config.compilation:CompilationConfig.mode",
+        kind="attribute",
+        tier="internal",
+        required=False,
+        why=(
+            "Read to confirm piecewise compilation (VLLM_COMPILE) is actually in play "
+            "before appending the MoE splitting op; a non-eager run in another mode "
+            "cannot carve the op out, so we leave it for validate() to refuse."
+        ),
+    ),
+    Seam(
+        target="vllm.config.compilation:CompilationMode",
+        kind="class",
+        tier="internal",
+        required=False,
+        why=(
+            "Its VLLM_COMPILE member is the value CompilationConfig.mode is compared "
+            "against to decide whether piecewise splitting can carry the MoE op."
+        ),
+    ),
+    Seam(
+        target=(
+            "vllm.model_executor.layers.fused_moe.runner.moe_runner:MoERunner"
+        ),
+        kind="class",
+        tier="internal",
+        required=False,
+        why=(
+            "Subclassed as SurgeonMoERunner and installed with register_oot so the "
+            "MoE op runs eager (with the cache) as a piecewise-graph splitting point "
+            "and its output is copied to a capture-stable address. Gone -> the tier "
+            "keeps requiring --enforce-eager, no non-eager path."
+        ),
+    ),
+    Seam(
+        target=(
+            "vllm.model_executor.layers.fused_moe.runner.moe_runner"
+            ":MoERunner._forward_impl"
+        ),
+        kind="method",
+        tier="internal",
+        required=False,
+        why=(
+            "Overridden to route the MoE output through _maybe_stabilize_output. The "
+            "stock _moe_forward custom op calls layer._forward_impl with no "
+            "stabilisation wrap, so the wrap must live in this override. Renamed "
+            "upstream -> our stabilisation stops being called and a non-eager run is "
+            "a silent capture-address bug, which is why the fallback refuses eager "
+            "unless this installs."
+        ),
+    ),
+    Seam(
+        target="vllm.model_executor.custom_op:PluggableLayer.register_oot",
+        kind="method",
+        tier="used_in_tree",
+        required=False,
+        why=(
+            "Called as MoERunner.register_oot(SurgeonMoERunner) to substitute the "
+            "runner. This is PluggableLayer's register_oot, a DIFFERENT method from "
+            "CustomOp.register_oot above -- both write op_registry_oot, keyed by "
+            "class name, but a rename of one is invisible to the other's seam."
+        ),
+        params=("name",),
+    ),
+    Seam(
+        # Targeted at the definition module, not the vllm.config re-export: we read
+        # the field off a CompilationConfig instance (compilation_config), and only
+        # the defining module lets the static check see the field declaration.
+        target="vllm.config.compilation:CompilationConfig.splitting_ops",
+        kind="attribute",
+        tier="internal",
+        required=False,
+        why=(
+            "The config-time injection (the VllmConfig.__post_init__ wrap) appends "
+            "vllm::moe_forward(_shared) here so the MoE op becomes a graph split "
+            "point. Gone or renamed -> the op is captured into the graph and the "
+            "cache runs inside it, the exact case the port cannot do."
+        ),
+    ),
+    Seam(
+        target="vllm.config.compilation:CompilationConfig.max_cudagraph_capture_size",
+        kind="attribute",
+        tier="internal",
+        required=False,
+        why=(
+            "Read to size the persistent output buffer (its row count bounds the "
+            "shapes we can stabilise). Gone -> no bound, and stabilisation is "
+            "skipped for every shape (falls back to returning the workspace view)."
+        ),
+    ),
+    Seam(
+        target="vllm.config:CUDAGraphMode",
+        kind="class",
+        tier="internal",
+        required=False,
+        why=(
+            "PIECEWISE and NONE members gate both the install (skip when NONE) and "
+            "the per-pass stabilisation (only on a PIECEWISE runtime pass)."
+        ),
+    ),
+    Seam(
+        target="vllm.forward_context:get_forward_context",
+        kind="function",
+        tier="internal",
+        required=False,
+        why=(
+            "Reads cudagraph_runtime_mode for the current pass, so stabilisation "
+            "runs only when the pass actually replays a piecewise graph."
+        ),
+    ),
+    Seam(
+        target="vllm.forward_context:is_forward_context_available",
+        kind="function",
+        tier="internal",
+        required=False,
+        why=(
+            "Guards the get_forward_context read: outside a forward pass (setup, "
+            "profiling) there is no context and stabilisation is a no-op."
+        ),
+    ),
+    Seam(
+        target="vllm.forward_context:ForwardContext.cudagraph_runtime_mode",
+        kind="attribute",
+        tier="internal",
+        required=False,
+        why=(
+            "The per-pass field compared against CUDAGraphMode.PIECEWISE to decide "
+            "whether the output needs a capture-stable address this pass."
         ),
     ),
     # ------------------------------------------------------------------
     # Config plumbing.
     # ------------------------------------------------------------------
     Seam(
-        target="vllm.config.vllm:get_current_vllm_config",
+        # Targeted at the import path the code actually uses (``from vllm.config
+        # import get_current_vllm_config``), a re-export of vllm.config.vllm's
+        # definition, not the definition module -- so the check tracks the name we
+        # import, which is the one that can move.
+        target="vllm.config:get_current_vllm_config",
         kind="function",
         tier="internal",
         why="Reads additional_config from inside layers that get no config passed.",
     ),
     Seam(
-        target="vllm.config.vllm:VllmConfig",
+        target="vllm.config:VllmConfig",
         kind="class",
         tier="documented",
         why=(
             "Carries additional_config, our configuration channel. The in-code "
             "comment on that field names out-of-tree config as its purpose."
         ),
+    ),
+)
+
+
+#: Behavioural couplings that live OUTSIDE ``compat/`` and import no vLLM, yet still
+#: depend on a vLLM format, layout or naming convention as *data*. The layering test
+#: proves those modules do not import vLLM; it cannot prove they do not assume things
+#: about it, and these are the assumptions. None is machine-checkable by :func:`check`
+#: -- the presence of a symbol does not verify a byte layout or a key order -- so they
+#: are recorded here for a human to re-check on an upgrade. This is the honest bound on
+#: the claim that a vLLM upgrade is confined to ``compat/``: import cost is; these are
+#: tracked separately.
+DATA_COUPLINGS: tuple[tuple[str, str, str], ...] = (
+    (
+        "telemetry/transport.py",
+        "the base64 + numpy.save wire encoding of CompletionOutput.routed_experts "
+        "in vLLM's OpenAI-compatible response",
+        "a change to the encoding decodes to garbage, not an error",
+    ),
+    (
+        "telemetry/layers.py",
+        "RoutedExptsCapturer sizes its buffer by num_hidden_layers and zeroes it each "
+        "step, so dense-layer rows read as 'expert 0 chosen by every token'; and the "
+        "MoE-layer resolver mirrors vLLM's config key order",
+        "a change to the buffer's zero-fill or layer indexing silently mis-aggregates",
+    ),
+    (
+        "surgery/tiered.py",
+        "the store key derives from RoutedExperts.layer_name -- the factory prefix "
+        "'model.layers.{L}.mlp' plus '.experts'",
+        "a rename of the layer-name scheme mis-keys the store; a mismatched store is "
+        "then rebuilt rather than reused, or (worse) reused across checkpoints",
+    ),
+    (
+        "hot_experts.py",
+        "residency priors are keyed by the same layer_name the provider looks them up "
+        "under",
+        "a key-scheme change makes every prior a miss -- cold start, not wrong output",
+    ),
+    (
+        "surgery/descriptors.py",
+        "the per-expert checkpoint tensor naming "
+        "'model.layers.{L}.mlp.experts.{e}.{gate,up,down}_proj.weight' and the stacked "
+        "(Granite) layout, which are HF export conventions vLLM also assumes",
+        "an unrecognised naming scheme raises KeyError (loud) rather than mis-reads",
     ),
 )
 

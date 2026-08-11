@@ -17,11 +17,16 @@ weights loaded normally:
   installed before ``get_fused_moe_quant_config`` captures the scale tensors --
   getting that order wrong scales every expert by whichever one occupies its slot,
   which is wrong output from the first token and no exception.
-- streaming the checkpoint straight into the store is not ported, so the full
-  ``[num_experts, ...]`` tensors are materialised during load.
-- ``enforce_eager`` is required. Running the MoE op inside a CUDA graph needs the
-  output-address stabilisation the prototype added to ``MoERunner``, and refusing
-  is better than a silent capture-address bug.
+- streaming the checkpoint straight into the store IS ported and is on by default
+  whenever the disk tier is on (see :mod:`.stream_load`), so the full
+  ``[num_experts, ...]`` tensors are never materialised; ``"stream_load": false``
+  forces the old full-materialisation path.
+- ``enforce_eager`` is no longer required: :mod:`.graph_runtime` substitutes the
+  ``MoERunner`` so the MoE op is a piecewise-graph splitting point that runs eager
+  and copies its output to a capture-stable address. If that substitution does not
+  install (MoERunner moved), :func:`validate` falls back to requiring
+  ``--enforce-eager`` -- refusing is still better than a silent capture-address bug.
+- tensor parallelism is refused: the store identity carries no rank component.
 
 Activation is deliberately *not* ``--moe-expert-cache-size``: that flag drives the
 in-tree implementation. This reads ``--additional-config '{"surgeon": {...}}'``
@@ -81,16 +86,27 @@ def read_config() -> RuntimeConfig:
     out-of-tree configuration, and it reaches every process. The env fallback keeps
     the recipes in the project notes working unchanged.
     """
-    payload: dict[str, Any] = {}
     try:
         from vllm.config import get_current_vllm_config
 
-        config = get_current_vllm_config()
-        extra = getattr(config, "additional_config", None) or {}
-        if isinstance(extra, dict):
-            payload = dict(extra.get("surgeon") or {})
+        config: Any = get_current_vllm_config()
     except Exception:  # pragma: no cover - no config in scope
-        payload = {}
+        config = None
+    return read_config_from(config)
+
+
+def read_config_from(vllm_config: Any) -> RuntimeConfig:
+    """Build the config from an explicit ``VllmConfig`` (or ``None``), env-fallback.
+
+    Separate from :func:`read_config` so a caller holding the config directly can pass
+    it in rather than relying on the ambient one. The graph path needs this: it injects
+    splitting ops from inside ``VllmConfig.__post_init__``, which runs *before*
+    ``get_current_vllm_config()`` is set, so the ambient lookup would miss the tier.
+    """
+    payload: dict[str, Any] = {}
+    extra = getattr(vllm_config, "additional_config", None) or {}
+    if isinstance(extra, dict):
+        payload = dict(extra.get("surgeon") or {})
 
     def env_int(name: str, default: int) -> int:
         raw = os.environ.get(name)
@@ -217,16 +233,37 @@ def validate(config: RuntimeConfig, layer: Any) -> None:
         raise ValueError(
             "the expert cache is incompatible with data or sequence parallelism."
         )
+    if getattr(parallel, "tp_size", 1) > 1:
+        raise ValueError(
+            f"the expert cache does not support tensor parallelism "
+            f"(tp_size={parallel.tp_size}): each rank holds a different shard of "
+            "every expert at identical shapes, but the store identity is "
+            "{model, revision, layer} with no rank component, so ranks would share "
+            "one store file and rank 1 would serve rank 0's shard. Refused rather "
+            "than silently served wrong."
+        )
 
-    from vllm.config import get_current_vllm_config
+    from vllm.config import CUDAGraphMode, get_current_vllm_config
+
+    from .graph_runtime import moe_split_active
 
     vllm_config = get_current_vllm_config()
-    if not vllm_config.model_config.enforce_eager:
+    graphs_on = (
+        not vllm_config.model_config.enforce_eager
+        and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+    )
+    if graphs_on and not moe_split_active(vllm_config):
         raise ValueError(
-            "the out-of-tree expert cache requires --enforce-eager. Running the "
-            "MoE op inside a CUDA graph needs output-address stabilisation that "
-            "this port does not implement, and the failure mode is a silent "
-            "capture-address bug rather than an error."
+            "the out-of-tree expert cache requires --enforce-eager unless the MoE op "
+            "is carved out of the captured region. The out-of-tree MoERunner does "
+            "that by adding vllm::moe_forward to compilation_config.splitting_ops at "
+            "config time, which needs piecewise compilation (compilation mode "
+            "VLLM_COMPILE); it is not in splitting_ops for this run, so the MoE op "
+            "would be captured together with the cache's dynamic host code. That "
+            "fails as wrong output rather than as an error -- a captured graph "
+            "replays against a stale workspace address, which reproduces as the same "
+            "token repeated -- so it is refused. Pass --enforce-eager, or drop the -O "
+            "override that disabled piecewise compilation."
         )
     if getattr(layer, "_moe_expert_cache_size", 0) > 0:
         raise ValueError(
@@ -312,6 +349,98 @@ def build_provider(layer: Any, config: RuntimeConfig) -> Any:
     replace_parameter(layer, "w13_weight", torch.empty(0))
     replace_parameter(layer, "w2_weight", torch.empty(0))
     return provider
+
+
+#: Row count above which a forward is treated as a prefill and left alone. See
+#: :func:`_warn_if_oversubscribed` for why the distinction decides whether the warning
+#: is worth having. Set well above any plausible decode batch rather than just above the
+#: one that was benchmarked: at 32 this silenced exactly the wide-batch serving case
+#: where oversubscription costs the most, which is the opposite of the intent. A prefill
+#: forward carries hundreds to thousands of token rows, so the two populations stay
+#: separated at this value.
+_DECODE_ROWS = 512
+
+#: How many decode forwards a layer is inspected for before the check retires itself.
+#: A diagnostic that never stops looking is a tax on the configuration it is trying to
+#: praise: ``topk_ids.unique()`` synchronises with the device, and on a correctly sized
+#: cache the check would otherwise run on every decode forward of every MoE layer for
+#: the process lifetime -- recomputing, on the fast path, a value the provider does not
+#: even need there. A handful of probes is enough to catch a batch that oversubscribes
+#: while bounding the cost to a constant.
+_WARN_PROBES = 8
+
+
+def _warn_if_oversubscribed(layer: Any, provider: Any, topk_ids: Any) -> None:
+    """Say so, once, when a forward routes to more experts than there are slots.
+
+    A cache smaller than the batch's per-layer *union* is the most expensive
+    misconfiguration this system has, and until now it was completely silent. Measured
+    on OLMoE at batch 8, where the decode union is 35.3 mean / 46 max: 24 slots decode
+    at 55.3 tok/s and 48 slots at 143.0 tok/s -- 2.6x apart, for one integer, with
+    nothing in the logs to distinguish them.
+
+    Where that 2.6x comes from, measured rather than assumed, because the obvious guess
+    is wrong: **~76-89% of it is simply fetching more bytes.** Loads fall from 26.4 to
+    4.7 per layer per step, and a load on the bf16 path is 217 us of host->device DMA
+    (12.58 MB at 57.9 GB/s) with no other term hiding in it. Only ~11-24% is the chunk
+    split itself, and the split's real cost is *not* re-fetching experts over the bus --
+    that was measured at 2.5% of misses. It is the GPU re-reading resident weights out
+    of its own DRAM once per chunk (the sum of the chunk unions is ~50 records per layer
+    against a union of ~37), plus extra kernel launches. Python planning is ~32 us per
+    ``prepare()``, and removing the blocking mapping upload entirely moved throughput by
+    -1.4%. So the actionable advice is about bytes and residency, not about syncs.
+
+    So this is a diagnostic, not a policy: it changes nothing about what runs. It is
+    deliberately a warning rather than a refusal, because a too-small cache is exactly
+    what someone serving on a device that cannot hold the working set has to do -- the
+    split is the feature that makes that possible. What is not acceptable is paying for
+    it without being told.
+
+    Only **decode-shaped** forwards are considered, and that restriction is the whole
+    difference between a useful warning and a useless one. A prefill routes hundreds of
+    tokens at once, so its union approaches the full expert set -- measured 56-62 of 64
+    on OLMoE -- and a check that fired on it would demand ``capacity == num_experts``
+    from every configuration, including the one that measured fastest. It would also be
+    advice about the wrong cost: a prefill is paid once per request, while a decode step
+    repeats for every token generated, which is where the 2.6x was measured. The row
+    count is the heuristic (a decode step contributes one row per sequence); it is
+    deliberately generous, because a decode batch wide enough to exceed it genuinely
+    does want a cache near the full expert set.
+    """
+    if getattr(layer, "_surgeon_capacity_warned", False):
+        return
+    capacity = getattr(provider, "capacity", 0)
+    if not capacity:
+        return
+    try:
+        rows = int(topk_ids.shape[0])
+        if rows > _DECODE_ROWS:
+            return
+        union = int(topk_ids.unique().numel())
+    except Exception:  # pragma: no cover - never break a forward to warn
+        return
+    if union <= capacity:
+        # Retire after a bounded number of clean probes. Without this the check would
+        # keep synchronising with the device on every decode forward, forever, on
+        # precisely the configuration it has nothing to complain about.
+        probes = getattr(layer, "_surgeon_capacity_probes", 0) + 1
+        layer._surgeon_capacity_probes = probes
+        if probes >= _WARN_PROBES:
+            layer._surgeon_capacity_warned = True
+        return
+    layer._surgeon_capacity_warned = True
+    logger.warning(
+        "expert_cache_size=%d is below the expert union of a decode step (%d) on %s: "
+        "most of these experts are re-fetched over the host->device link every step, "
+        "and each step is additionally split into chunks that re-read resident weights "
+        "and relaunch the expert kernel. Raising the cache toward the union cuts the "
+        "bytes moved per token (measured 2.6x on OLMoE at batch 8, same tokens; ~80%% "
+        "of it fewer fetches, the rest the split). Keep it smaller only if the device "
+        "cannot hold that many slots -- which is the case the tier exists for.",
+        capacity,
+        union,
+        getattr(layer, "layer_name", "?"),
+    )
 
 
 def install() -> bool:
@@ -491,6 +620,8 @@ def install() -> bool:
 
             from ..store import run_with_expert_cache
 
+            _warn_if_oversubscribed(layer, provider, topk_ids)
+
             def run(result, rows, include_shared):
                 assert self.moe_kernel is not None
                 return self.moe_kernel.apply(
@@ -521,4 +652,24 @@ def install() -> bool:
         f"registered under the wrong key: {sorted(op_registry_oot)}"
     )
     logger.info("registered the out-of-tree unquantized MoE method as %s", OOT_KEY)
+
+    # The fp8 path is separate: Fp8MoEMethod is not a CustomOp, so it goes through a
+    # shadowing quantization config instead of register_oot. Optional -- an fp8
+    # checkpoint may never be served, and its internals are the churn-prone ones.
+    try:
+        from .fp8_runtime import install_fp8
+
+        install_fp8()
+    except Exception as exc:  # pragma: no cover - fp8 internals moved
+        logger.debug("fp8 runtime not installed: %s", exc)
+
+    # The graph path is separate again: MoERunner IS a PluggableLayer, so it goes
+    # through register_oot like the unquantized method, but keyed under "MoERunner".
+    # Optional -- if it does not install, validate() keeps requiring --enforce-eager.
+    try:
+        from .graph_runtime import install_graph
+
+        install_graph()
+    except Exception as exc:  # pragma: no cover - MoERunner internals moved
+        logger.debug("graph runtime not installed: %s", exc)
     return True
