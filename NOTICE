@@ -1,0 +1,23 @@
+moe-surgeon
+Copyright 2026 the moe-surgeon authors
+
+This product includes software developed by the vLLM project
+(https://github.com/vllm-project/vllm), licensed under the Apache License,
+Version 2.0.
+
+The following files under src/vllm_moe_surgeon/store/ are a verbatim lift from a
+vLLM fork (branch disk-tier-proto), with only their import paths rewritten
+(`vllm.envs` -> `vllm_moe_surgeon.env`, `vllm.logger` ->
+`vllm_moe_surgeon._logging`, and sibling-module imports). They carry the
+`SPDX-FileCopyrightText: Copyright contributors to the vLLM project` header:
+
+  - store/expert_weight_provider.py
+  - store/expert_disk_store.py
+  - store/expert_load_pipeline.py
+  - store/expert_policy.py
+  - store/expert_zero_copy.py
+
+These are kept byte-comparable to their upstream source on purpose (see README
+"Layout" and pyproject.toml, which exempts store/*.py from two lint rules rather
+than reformatting the lift). Modifications to their behaviour are made in the
+fork first and re-lifted, so this attribution stays accurate.
