@@ -9,14 +9,27 @@ description = "An NVMe expert tier for domain-specialised MoE vLLM deployments, 
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 license = "Apache-2.0"
+authors = [{ name = "Yasin YAMAN", email = "yasnyaman@gmail.com" }]
+keywords = ["vllm", "mixture-of-experts", "moe", "inference", "offloading", "nvme"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 # Deliberately minimal. The offline surgery pipeline must stay importable
-# without vLLM installed -- see docs/architecture.md. vLLM is an extra.
+# without vLLM installed -- see the layering rule in README.md. vLLM is an extra.
 dependencies = [
     "torch",
     "safetensors",
     "numpy",
 ]
+
+[project.urls]
+Homepage = "https://github.com/yasinyaman/moe-surgeon"
+Repository = "https://github.com/yasinyaman/moe-surgeon"
+Issues = "https://github.com/yasinyaman/moe-surgeon/issues"
 
 [project.optional-dependencies]
 # The runtime half: telemetry collection and the serve-time disk tier.

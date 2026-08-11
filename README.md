@@ -874,7 +874,7 @@ Every number above is held-out **perplexity**. Perplexity is a proxy, so the
 rank-1 pruned-40 artifact and its amplitude-corrected version were scored on three
 downstream tasks through `lm-eval` (500 items each, GB10), with a paired **exact
 McNemar** test per task — the same instrument the fp8 store was held to
-([notes/kalite-eval.md](../../notes/kalite-eval.md)):
+(paired exact McNemar over `lm-eval` samples):
 
 | task (metric) | baseline | pruned-40 | Δ (McNemar p) | pruned-40 + amp 0.85 |
 |---|---|---|---|---|

@@ -731,7 +731,7 @@ def check_static(seam: Seam, source_root: str) -> SeamProblem | None:
     """Verify a seam against a vLLM *source tree*, without importing it.
 
     ``source_root`` is the directory containing the ``vllm`` package, e.g.
-    ``/Users/korns/vllm/repos/vllm``. Weaker than :func:`check` -- it cannot see
+    a vLLM checkout. Weaker than :func:`check` -- it cannot see
     signatures on inherited members or names produced by decorators -- so a pass
     here is necessary, not sufficient.
     """

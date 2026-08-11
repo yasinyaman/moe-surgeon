@@ -1,0 +1,73 @@
+# The offline half, on every change. No vLLM, no CUDA, no GPU -- which is the
+# point of the layering rule this suite enforces.
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      # CPU wheels on purpose: nothing here needs a GPU, and the default index
+      # would pull ~2.5 GB of CUDA runtime to run tests that never touch it.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest tests/ -q
+
+  seams-pinned:
+    # The pin must always hold. This is the regression guard; the scheduled
+    # workflow is the early-warning one.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (offline half only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
+
+      - name: Read the pinned vLLM version
+        id: pin
+        run: |
+          # The lower bound of the runtime extra is the version this package is
+          # verified against.
+          v=$(grep -oE 'vllm>=[0-9][0-9.]*' pyproject.toml | head -1 | sed 's/vllm>=//')
+          test -n "$v" || { echo "no vllm pin found in pyproject.toml" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "pinned vLLM: $v"
+
+      - name: Check the seams against that source tree
+        run: |
+          git clone --depth 1 --branch "v${{ steps.pin.outputs.version }}" \
+            https://github.com/vllm-project/vllm.git /tmp/vllm
+          surgeon seams --source /tmp/vllm

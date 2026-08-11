@@ -58,7 +58,7 @@ Two readings worth keeping:
 
 > **Attribution and caveats for the two rows above.** The 2026-08-05 predecessor
 > measured the same question with a simulator validated bit-exact against live
-> counters ([notes/adaptif-politika.md](../../notes/adaptif-politika.md)) and found
+> counters (an unpublished working note) and found
 > the opposite on an *end-to-end, two-tier* trace (Qwen3-30B): EWMA worth −0.05% disk
 > reads, cold-start seeding −5.3% in the boot window, decision "default stays lfru",
 > reopen bar ">15–20%". The numbers here are not a refutation of that — they are a
@@ -141,8 +141,7 @@ tier-vs-baseline ratio within this run is.
 ### The capacity sweep, and the finding that dominates everything else here
 
 The arms above all ran at `expert_cache_size=24`. A follow-up investigation into whether
-prefetching could hide the disk ([notes/onbellek-tahmini.md](../../notes/onbellek-tahmini.md))
-measured the actual per-layer
+prefetching could hide the disk measured the actual per-layer
 expert **union** under this benchmark's batch of 8: **35.28 mean, 46 max**. Twenty-four
 slots against a 46-expert working set is 47% oversubscribed, so `plan_chunks` splits every
 layer into 2–3 chunks — each with a blocking `topk_ids.tolist()` D2H, its own `prepare()`
@@ -210,8 +209,7 @@ never accept a control with n=1.**
 So the corrected headline is that a correctly sized tier decodes at **143.0 vs 218.2 tok/s
 (0.66×)**, not the 0.25× the first arms suggested.
 
-A follow-up investigation ([notes/onbellek-tahmini.md](../../notes/onbellek-tahmini.md) and
-[notes/kapasite-ikamesi.md](../../notes/kapasite-ikamesi.md))
+A follow-up investigation
 decomposed that 2.59×: **76–89% of it is simply fetching fewer bytes** (loads fall 26.4 →
 4.7 per layer per step, and a bf16 load is 217 µs of pure host→device DMA), and only 11–24%
 is the chunk split. The split's cost is also not what the code comments claimed — re-fetching
