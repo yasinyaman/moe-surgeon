@@ -164,3 +164,22 @@ def test_collect_reads_the_real_worker_shape():
     assert stats.hits == 14 and stats.misses == 6
     assert stats.ram_hits == 18 and stats.ram_misses == 2
     assert stats.disk_bytes == 10 << 20
+
+
+def test_the_first_fill_is_not_misdiagnosed_as_an_undersized_ram_tier():
+    """Observed live on a correctly sized 64/64 config: first turn showed RAM
+    0 hits / 730 misses -- every expert read from the store once -- and the old
+    warning told the user to raise a setting that was already right. The
+    signature of cold fill is ram_hits == 0 with ram_misses equal to the GPU
+    misses; that gets an informational line, not advice to resize."""
+    cold = format_session(
+        TierStats(hits=2793, misses=730, ram_hits=0, ram_misses=730, layers=16)
+    )
+    assert "first fill" in cold
+    assert "! evictions" not in cold
+
+    # Genuine eviction pressure -- RAM hits mixed with ongoing misses -- still warns.
+    warm = format_session(
+        TierStats(hits=900, misses=100, ram_hits=50, ram_misses=50, layers=16)
+    )
+    assert "! evictions" in warm

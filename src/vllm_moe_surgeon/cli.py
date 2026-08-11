@@ -519,6 +519,21 @@ def _cmd_seams(args: argparse.Namespace) -> int:
     return 1 if required else 0
 
 
+def _user_input_errors() -> type[Exception]:
+    """Exception classes that mean "your input", beyond the builtins.
+
+    SafetensorError derives from Exception directly -- not ValueError -- so a
+    corrupt shard would traceback without this. Resolved lazily because the CLI
+    must import on hosts where optional extras are absent.
+    """
+    try:
+        from safetensors import SafetensorError
+
+        return SafetensorError
+    except ImportError:  # pragma: no cover - safetensors is a core dep
+        return ValueError
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="surgeon", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -762,7 +777,18 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=_cmd_seams)
 
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (OSError, ValueError, _user_input_errors()) as exc:
+        # A mistyped path, a missing config.json, a corrupt shard, a target that
+        # does not fit: these are answers about the user's input, and every one of
+        # them already carries its explanation in the exception message. A
+        # traceback buries the answer under nine frames of plumbing -- found by
+        # running each command against a bad path and reading what a user would
+        # read. Genuine bugs (TypeError, KeyError, assertions) still crash loudly,
+        # because hiding those would be worse than ugly output.
+        print(f"surgeon {args.command}: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

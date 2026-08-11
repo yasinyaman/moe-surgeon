@@ -161,7 +161,18 @@ def format_session(stats: TierStats) -> str:
             "expert_cache_size toward the batch's per-layer union is the lever "
             "measured at 2.59x; `surgeon autoconfig` sizes it."
         )
-    if stats.ram_misses and stats.ram_misses > 0.1 * max(1, ram_total):
+    cold_fill = stats.ram_hits == 0 and stats.ram_misses == stats.misses
+    if cold_fill and stats.ram_misses:
+        # Every RAM miss was also a GPU miss and nothing ever hit the RAM tier:
+        # that is the signature of the first fill -- each expert read from the
+        # store once -- not of an undersized tier. Observed live: a correctly
+        # sized 64/64 config showed 0/730 here on its first turn and the old
+        # warning told its user to fix a setting that was already right.
+        lines.append(
+            "  (all of that is the first fill -- each expert read once. If disk "
+            "reads continue in later turns, then raise ram_cache.)"
+        )
+    elif stats.ram_misses and stats.ram_misses > 0.1 * max(1, ram_total):
         lines.append(
             "  ! evictions are reaching disk. ram_cache below the expert count "
             "was measured at 1.66x slower, and more variable; raise it if the "
@@ -287,7 +298,7 @@ def run(
         chatted = True
         try:
             try:
-                outputs = llm.chat(messages, sampling)
+                outputs = llm.chat(messages, sampling, use_tqdm=False)
             except _no_chat_template():
                 # A base model without a chat template: fall back to the raw
                 # prompt. ONLY that case -- an engine fault (OOM, a dead engine)
@@ -297,7 +308,7 @@ def run(
                     "  (no chat template; sending this prompt raw -- previous "
                     "turns are not included)"
                 )
-                outputs = llm.generate([line], sampling)
+                outputs = llm.generate([line], sampling, use_tqdm=False)
                 chatted = False
         except KeyboardInterrupt:
             # Ctrl-C mid-generation. The engine's state after an interrupted
