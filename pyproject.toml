@@ -35,7 +35,10 @@ Issues = "https://github.com/yasinyaman/moe-surgeon/issues"
 # The runtime half: telemetry collection and the serve-time disk tier.
 # Pinned narrowly on purpose. Widening the pin is a decision, not a default:
 # tests/test_seams.py is what tells you whether a wider pin is safe.
-runtime = ["vllm>=0.26.1,<0.27"]
+# 0.26.1 was never released upstream -- the tags go 0.26.0 -> 0.26.1rc0 -> 0.27.0 --
+# so the floor named a version nobody can install. 0.26.0 is the oldest release the
+# seam check passes against; see DECISIONS.md for what the ceiling is waiting on.
+runtime = ["vllm>=0.26.0,<0.27"]
 server = ["fastapi", "uvicorn", "pydantic>=2", "pyarrow"]
 dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "pyarrow"]
 

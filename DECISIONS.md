@@ -322,6 +322,33 @@ Absolute throughputs here also differ from the older tables in this file (which 
 689/265 tok/s); those were taken at a different measurement point and are kept as-is
 rather than silently overwritten — compare ratios within a run, never across runs.
 
+## The vLLM pin, and what CI now measures for us
+
+`runtime = ["vllm>=0.26.0,<0.27"]`. Two things about that line were checked rather
+than assumed, on 2026-08-11, by cloning the tags and running `surgeon seams --source`:
+
+- **The floor named a version that does not exist.** It said `>=0.26.1`, but upstream's
+  tags run `v0.26.0` -> `v0.26.1rc0` -> `v0.27.0`: 0.26.1 was never released, and the
+  runtime work was done against a dev snapshot of it. Nobody could have installed what
+  the pin asked for. Corrected to `0.26.0`, which the seam check passes against (0
+  required broken; only the optional `_orient_fused_weight`, which upstream had not
+  extracted yet, is absent).
+- **The ceiling is now stricter than the evidence.** Against **v0.27.1**, a full minor
+  version past the ceiling, the check reports **0 required seams broken** — and
+  `_orient_fused_weight` resolves, so a seam the table records as "emerging" has landed.
+  That is the architecture's central claim measured rather than argued.
+
+The ceiling stays at `<0.27` anyway, and the reason is the one this register keeps
+insisting on: the static check parses names and signatures, **not behaviour**. Every
+runtime verification in this document — token identity, the graph controls, the capacity
+sweep — was run against the 0.26.1-dev fork. Widening the ceiling would claim 0.27
+support on a check that cannot see a semantic change, which is the overclaim this
+document exists to prevent. What it needs is one runtime pass on 0.27: boot the tier,
+hash the tokens against untiered, and the ceiling can move.
+
+`.github/workflows/vllm-compat.yml` now asks the question weekly and on demand, and
+opens an issue naming the symbol when the answer changes.
+
 ## Open
 
 - ~~Streaming load.~~ **Done and measured.** The tier's boot floor went 23.40 GiB →

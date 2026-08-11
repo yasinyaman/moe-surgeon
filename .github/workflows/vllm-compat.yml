@@ -1,27 +1,18 @@
 # Does this package still hold against the vLLM that shipped today?
 #
-# vLLM guarantees exactly one thing for out-of-tree code -- that
-# ModelRegistry.register_model keeps working. Everything in compat/seams.py is
-# borrowed, not owed, so the useful question is not "did it break" but "which
-# name moved, and when". This asks that on every vLLM release and on a weekly
-# tick, and it asks it the cheap way: a shallow clone plus the static seam
-# checker, no install, no GPU, no CUDA wheels.
+# vLLM guarantees one thing for out-of-tree code: ModelRegistry.register_model
+# keeps working. Everything in compat/seams.py is borrowed, not owed, so the
+# useful question is not "did it break" but "which name moved, and when".
 #
-# A required seam breaking is news, not an emergency: the pinned version keeps
-# working. So the failure opens (or updates) one issue naming the symbol rather
-# than quietly going red.
+# Asked the cheap way -- a shallow clone and the static seam checker. No install,
+# no CUDA wheels, no GPU, because check_all_static parses the tree instead of
+# importing it.
 name: vllm-compat
 
 on:
   schedule:
-    # Weekly. vLLM releases roughly fortnightly; this catches a release within
-    # days without burning a run a day on an unchanged upstream.
     - cron: "17 6 * * 1"
   workflow_dispatch:
-    inputs:
-      ref:
-        description: "vLLM ref to check (default: latest release tag)"
-        required: false
 
 permissions:
   contents: read
@@ -32,58 +23,65 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
-      - name: Install (offline half only -- the checker needs no vLLM)
+      - name: Install the offline half
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -e .
 
-      - name: Resolve the vLLM ref to check
+      - name: Resolve vLLM's latest release
         id: ref
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ref="${{ github.event.inputs.ref }}"
-          if [ -z "$ref" ]; then
-            ref=$(gh api repos/vllm-project/vllm/releases/latest --jq .tag_name)
-          fi
+          ref=$(gh api repos/vllm-project/vllm/releases/latest --jq .tag_name)
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "checking against vLLM $ref"
 
-      - name: Clone that ref
+      - name: Check the seams against it
+        id: check
+        continue-on-error: true
         run: |
           git clone --depth 1 --branch "${{ steps.ref.outputs.ref }}" \
             https://github.com/vllm-project/vllm.git /tmp/vllm
-
-      - name: Check the seams
-        id: check
-        run: |
-          set +e
           surgeon seams --source /tmp/vllm | tee /tmp/seams.txt
-          echo "status=$?" >> "$GITHUB_OUTPUT"
-          set -e
 
-      - name: Report a broken seam
-        if: steps.check.outputs.status != '0'
+      - name: Open an issue naming the seam that moved
+        if: steps.check.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.ref.outputs.ref }}
         run: |
-          ref="${{ steps.ref.outputs.ref }}"
-          title="seams broken against vLLM $ref"
-          # One issue per upstream ref, reopened rather than duplicated.
-          existing=$(gh issue list --state all --search "$title in:title" \
-            --json number --jq '.[0].number')
-          body=$(printf 'Static seam check against \x60%s\x60 reports a broken **required** seam.\n\nThe pinned version is unaffected -- this is the early warning that a bump would need work.\n\n\x60\x60\x60\n%s\n\x60\x60\x60\n\nRun locally with:\n\n\x60\x60\x60bash\nsurgeon seams --source /path/to/vllm\n\x60\x60\x60\n' "$ref" "$(cat /tmp/seams.txt)")
-          if [ -n "$existing" ]; then
-            gh issue reopen "$existing" 2>/dev/null || true
-            gh issue comment "$existing" --body "$body"
+          # A broken seam is news, not an emergency: the pinned version still
+          # works. One issue per upstream ref, reopened rather than duplicated.
+          title="seams broken against vLLM $REF"
+          {
+            echo "The static seam check reports a broken **required** seam against \`$REF\`."
+            echo
+            echo "The pinned vLLM is unaffected. This is the early warning that bumping it needs work."
+            echo
+            echo '```'
+            cat /tmp/seams.txt 2>/dev/null || echo "(no output; the clone or the check itself failed)"
+            echo '```'
+            echo
+            echo "Reproduce locally:"
+            echo
+            echo '```bash'
+            echo "git clone --depth 1 --branch $REF https://github.com/vllm-project/vllm.git /tmp/vllm"
+            echo "surgeon seams --source /tmp/vllm"
+            echo '```'
+          } > /tmp/issue.md
+          n=$(gh issue list --state all --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue reopen "$n" || true
+            gh issue comment "$n" --body-file /tmp/issue.md
           else
-            gh issue create --title "$title" --body "$body" --label upstream || \
-              gh issue create --title "$title" --body "$body"
+            gh issue create --title "$title" --body-file /tmp/issue.md
           fi
           exit 1
