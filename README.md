@@ -82,6 +82,34 @@ goes through a `Fp8Config` shadowing the `"fp8"` config, and the override copies
 costs three more (optional) internal seams, the price recorded in
 [DECISIONS.md](DECISIONS.md).
 
+## Trying it interactively
+
+```bash
+surgeon run allenai/OLMoE-1B-7B-0924 --checkpoint /path/to/model
+```
+
+A prompt, like `ollama run` — with the part that is actually worth adding: every
+turn says what the tier cost.
+
+```
+>>> explain a b-tree in two sentences
+A B-tree is a self-balancing search tree ...
+  [128 tok, 142.2 tok/s, cache 89% (712/800), disk 6 MiB]
+```
+
+`/stats` summarises the session, and names a misconfiguration when the counters show
+one rather than leaving it as "it feels slow":
+
+```
+  GPU cache : 180 hits / 620 misses (22.5% hit rate)
+  ! under half of expert lookups hit the GPU cache. Raising expert_cache_size toward
+    the batch's per-layer union is the lever measured at 2.59x; `surgeon autoconfig`
+    sizes it.
+```
+
+It boots the configuration `surgeon autoconfig` picked, so there is one implementation
+of the sizing rules rather than two. `--no-tier` serves untiered for a side-by-side.
+
 ## Sizing it automatically
 
 `surgeon autoconfig` reads the checkpoint's geometry from headers, measures free

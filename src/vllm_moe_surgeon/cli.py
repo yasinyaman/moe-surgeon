@@ -199,6 +199,44 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run(args: argparse.Namespace) -> int:
+    from .compat.repl import run
+    from .surgery.autoconfig import autoconfigure
+
+    surgeon = None
+    if not args.no_tier:
+        checkpoint = args.checkpoint or args.model
+        try:
+            config = autoconfigure(
+                checkpoint,
+                store_dir=args.store,
+                max_num_seqs=args.max_num_seqs,
+                kv_reserve_gib=args.kv_reserve,
+                vram_gib=args.vram,
+            )
+        except (ValueError, OSError) as exc:
+            # A bare repo id has no headers to read, and a machine that cannot fit
+            # the tier is a real answer. Either way, say which and offer the way out
+            # rather than failing with a stack trace.
+            print(f"could not size the tier: {exc}", file=sys.stderr)
+            print(
+                "pass --checkpoint <local dir> to size it, or --no-tier to serve "
+                "untiered.",
+                file=sys.stderr,
+            )
+            return 2
+        surgeon = config.surgeon
+        source = "cached" if config.cached else "probed"
+        print(f"tier ({source}): {json.dumps(surgeon)}")
+
+    return run(
+        args.model,
+        surgeon=surgeon,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+    )
+
+
 def _cmd_autoconfig(args: argparse.Namespace) -> int:
     from .surgery.autoconfig import autoconfigure
 
@@ -565,6 +603,22 @@ def main(argv: list[str] | None = None) -> int:
         help="add per-expert SVD spectra (slow: tens of seconds per layer)",
     )
     p.set_defaults(func=_cmd_inspect)
+
+    p = sub.add_parser(
+        "run", help="interactive prompt, with what the tier costs per turn"
+    )
+    p.add_argument("model", help="model id or checkpoint directory to serve")
+    p.add_argument("--checkpoint", help="local directory to size from, if `model` "
+                                       "is a repo id")
+    p.add_argument("--store", default="./store")
+    p.add_argument("--max-num-seqs", type=int, default=8)
+    p.add_argument("--kv-reserve", type=float, default=2.0)
+    p.add_argument("--vram", type=float, help="override the measured free VRAM")
+    p.add_argument("--no-tier", action="store_true", help="serve untiered, for a "
+                                                          "side-by-side comparison")
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--max-tokens", type=int, default=512)
+    p.set_defaults(func=_cmd_run)
 
     p = sub.add_parser(
         "autoconfig",
