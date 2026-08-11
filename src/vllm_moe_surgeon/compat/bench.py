@@ -66,6 +66,9 @@ class BenchResult:
     prefill_seconds: float = 0.0
     decode_tokens: int = 0
     decode_seconds: float = 0.0
+    #: spread of the timed generation over ``repeats`` runs (0 for a single run)
+    decode_seconds_std: float = 0.0
+    repeats: int = 1
     #: accuracy
     perplexity: float = float("nan")
     #: what produced these numbers
@@ -88,7 +91,9 @@ class BenchResult:
         return self.prefill_tokens / total if total else 0.0
 
 
-def _generation_timing(llm: Any, prompts: Sequence[str], max_tokens: int):
+def _generation_timing(
+    llm: Any, prompts: Sequence[str], max_tokens: int, *, repeats: int = 1
+):
     """Decode throughput, measured so prefill cannot contaminate it.
 
     An earlier version timed a full run and subtracted a prefill-only run. That is
@@ -100,7 +105,14 @@ def _generation_timing(llm: Any, prompts: Sequence[str], max_tokens: int):
     generations -- and one warmup run precedes the timed one. Decode rate is then
     output tokens over wall time, with the prefill share reported alongside so the
     contamination is visible rather than assumed away.
+
+    ``repeats`` > 1 times the generation that many times and reports the **median**
+    wall time plus its spread, because a single boot is not a measurement: probes of
+    the same configuration vary run to run, and a ratio quoted to three figures off
+    one run overstates its own precision.
     """
+    import statistics
+
     from vllm import SamplingParams
 
     params = SamplingParams(max_tokens=max_tokens, temperature=0.0, ignore_eos=True)
@@ -109,9 +121,15 @@ def _generation_timing(llm: Any, prompts: Sequence[str], max_tokens: int):
     # run measures steady state rather than first-call costs.
     llm.generate(list(prompts), SamplingParams(max_tokens=8, temperature=0.0))
 
-    start = time.perf_counter()
-    outputs = llm.generate(list(prompts), params)
-    elapsed = time.perf_counter() - start
+    elapseds: list[float] = []
+    outputs = None
+    for _ in range(max(1, repeats)):
+        start = time.perf_counter()
+        outputs = llm.generate(list(prompts), params)
+        elapseds.append(time.perf_counter() - start)
+
+    elapsed = statistics.median(elapseds)
+    std = statistics.pstdev(elapseds) if len(elapseds) > 1 else 0.0
 
     decode_tokens = sum(len(c.token_ids) for o in outputs for c in o.outputs)
     prompt_tokens = sum(len(o.prompt_token_ids) for o in outputs)
@@ -120,6 +138,8 @@ def _generation_timing(llm: Any, prompts: Sequence[str], max_tokens: int):
         "prefill_seconds": 0.0,
         "decode_tokens": decode_tokens,
         "decode_seconds": max(elapsed, 1e-6),
+        "decode_seconds_std": std,
+        "repeats": len(elapseds),
     }
 
 
@@ -132,6 +152,7 @@ def run_arm(
     env: dict[str, str] | None = None,
     llm_kwargs: dict[str, Any] | None = None,
     accuracy_prompts: Sequence[str] | None = None,
+    repeats: int = 1,
 ) -> BenchResult:
     """One configuration, all three axes.
 
@@ -166,7 +187,7 @@ def run_arm(
         except Exception as exc:  # pragma: no cover - platform dependent
             logger.warning("could not reset the VRAM peak: %s", exc)
 
-        timing = _generation_timing(llm, prompts, max_tokens)
+        timing = _generation_timing(llm, prompts, max_tokens, repeats=repeats)
         for key, value in timing.items():
             setattr(result, key, value)
 

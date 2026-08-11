@@ -6,10 +6,16 @@ subset a given target and model want. This is those tables as code, so the choic
 made from the checkpoint's actual geometry and the profile's actual distribution
 instead of from a habit.
 
-The rule it encodes, which is the point of the register: **a method that loses on one
-axis is still chosen when it wins on another.** Deletion costs accuracy and is
-recommended anyway when it buys feasibility the target does not otherwise have --
-and refused when it would only trade accuracy for nothing.
+The rule it encodes, updated once task accuracy was measured: **the tier is the
+primary mechanism; deletion is a last resort.** The tier keeps every expert (cold
+ones stream from NVMe), so it costs no accuracy; deletion permanently removes
+experts and, measured on downstream tasks, costs real accuracy that the perplexity
+gate does not catch and the amplitude fix does not recover (arc_challenge −25%
+relative on OLMoE rank-1 pruned-40). So deletion is recommended **only when the tier
+alone cannot fit the target** — when even the tier's own floor is above the target's
+VRAM, a smaller model is the only way to run at all. Where the tier fits, deletion is
+declined even against a cold tail: shrinking the store is not worth measured task
+accuracy unless a hard resource constraint forces it.
 
 Everything here is decided from ``surgeon budget`` and ``surgeon inspect``-grade
 inputs, so a recommendation costs no GPU and no engine. What it cannot decide it
@@ -37,6 +43,16 @@ COLD_SHARE = 0.5
 #: which is why deletion cost 1.25x perplexity there rather than nothing.
 DEAD_TAIL_RATIO = 0.2
 
+#: Attached to every deletion recommendation. Deletion looked cheap on perplexity and
+#: is not on downstream tasks; say so wherever deletion is proposed.
+_DELETION_COST_WARNING = (
+    "deletion permanently removes experts and costs measured task accuracy the "
+    "perplexity gate does not catch: OLMoE rank-1 pruned-40 lost 25% relative "
+    "arc_challenge accuracy (paired McNemar p=5e-08), and the amplitude fix does not "
+    "recover it. Do this only because the resource constraint forces it, and prefer "
+    "the tier wherever it fits."
+)
+
 
 @dataclass
 class Recommendation:
@@ -63,11 +79,15 @@ class Recommendation:
             )
         else:
             lines.append("  disk tier          not needed")
-        lines.append(
-            f"  delete             {self.delete_experts} experts per layer"
-            if self.delete_experts
-            else "  delete             nothing"
-        )
+        if self.delete_experts == -1:
+            delete_line = "  delete             last resort (size with budget)"
+        elif self.delete_experts:
+            delete_line = (
+                f"  delete             {self.delete_experts} experts per layer"
+            )
+        else:
+            delete_line = "  delete             nothing"
+        lines.append(delete_line)
         merge = "enabled" if self.merge_enabled else "no"
         lines.append(f"  merge              {merge}")
         lines.append(
@@ -113,7 +133,10 @@ def recommend(
     rec = Recommendation()
     floor = floor_plan(geometry)
     floor_gib = floor.gpu_bytes / 1024**3
-    full_gib = geometry.total_bytes / 1024**3
+    # Resident bytes, not checkpoint bytes: vLLM downcasts an fp32 model, so a 12.57
+    # GiB fp32 checkpoint is 6.29 GiB resident and would otherwise be called
+    # tier-mandatory on hardware that fits it fine.
+    full_gib = geometry.resident_scale(geometry.total_bytes) / 1024**3
 
     # --- feasibility decides whether the tier is optional at all -------------
     if vram_gib is None:
@@ -162,37 +185,62 @@ def recommend(
                 "for a larger KV cache at ~1.003x perplexity"
             )
 
-    # --- deletion is judged on what it buys, not on accuracy alone -----------
-    if stats is None:
+    # --- deletion is a LAST RESORT: only when the tier alone cannot fit -------
+    # The tier keeps every expert, so it costs no accuracy; deletion is permanent and
+    # measured to cost real task accuracy the gate does not catch. So it is proposed
+    # only when even the tier's own floor is above the target's VRAM -- a smaller model
+    # is then the only way to run at all -- and declined otherwise, cold tail or not.
+    tier_cannot_fit = vram_gib is not None and vram_gib < floor_gib
+    if stats is None and tier_cannot_fit:
+        rec.delete_experts = -1  # count is a sizing question; defer to `surgeon budget`
+        rec.reasons.append(
+            f"the tier's own floor is {floor_gib:.1f} GiB but the target has only "
+            f"{vram_gib:.1f} GiB, so the tier alone cannot run this model; deletion is "
+            "the last resort that makes it fit. Size it with `surgeon budget --vram`, "
+            "then measure with `surgeon gate`"
+        )
+        rec.warnings.append(_DELETION_COST_WARNING)
+    elif stats is None and vram_gib is not None:
+        rec.reasons.append(
+            "the tier fits the target, so deletion is not needed; no profile is "
+            "required to reach that conclusion"
+        )
+    elif stats is None:
         rec.must_measure.append(
-            "no profile given, so no expert can be called cold; run `surgeon profile`"
+            "no profile given, so coldness cannot be judged; run `surgeon profile` "
+            "(and pass --vram, since deletion is only worth considering when the tier "
+            "cannot fit)"
         )
     else:
         share = stats.layer_share()
         tail = dead_tail_size(share, stats.num_experts)
-        if tail == 0:
+        if tier_cannot_fit:
+            rec.delete_experts = tail or -1
             rec.reasons.append(
-                f"no dead tail: even the coldest expert of the worst layer carries "
-                f"more than {DEAD_TAIL_RATIO:.0%} of a uniform share, so deletion "
-                "would trade accuracy for very little"
+                f"the tier's floor is {floor_gib:.1f} GiB but the target has "
+                f"{vram_gib:.1f} GiB, so the tier alone cannot run this model; "
+                "deletion is the last resort that makes it fit. Delete the cold tail "
+                "first"
+                + (f" ({tail} per layer)" if tail else "")
+                + ", size the rest with `surgeon budget --vram`, and measure the cost"
             )
-        elif rec.use_tier:
-            rec.delete_experts = tail
-            rec.reasons.append(
-                f"{tail} experts per layer are far enough under uniform to delete, "
-                "and with the tier enabled that pays twice: a smaller store and a "
-                "smaller candidate set, measured 1.32x decode over the tier alone"
-            )
-        else:
-            rec.delete_experts = tail
-            rec.reasons.append(
-                f"{tail} experts per layer sit under the dead-tail threshold; "
-                "deleting them shrinks the artifact at no throughput cost"
-            )
-        if rec.delete_experts:
+            rec.warnings.append(_DELETION_COST_WARNING)
             rec.must_measure.append(
                 "what the deletions cost -- `surgeon gate` decides, and `apply` "
                 "refuses an unmeasured plan"
+            )
+        elif tail == 0:
+            rec.reasons.append(
+                "no dead tail and the tier fits, so nothing is deleted -- deletion "
+                "would only trade measured task accuracy for a smaller store"
+            )
+        else:
+            rec.reasons.append(
+                f"there is a {tail}-expert cold tail, but the tier already fits the "
+                f"target (floor {floor_gib:.1f} GiB), so deletion is NOT recommended: "
+                "keeping those experts on the tier costs no accuracy, while deleting "
+                "them is a measured task-accuracy loss worth paying only under a hard "
+                "resource constraint. Delete only the genuinely worthless, under a gate"
             )
 
     # --- merging is available only if the model actually has redundancy ------

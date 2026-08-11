@@ -1475,3 +1475,52 @@ def test_zc_fp8_retention_off_reads_again(zero_copy):
     reads_before = len(store.reads)
     provider.prepare(_topk([0, 1]))
     assert len(store.reads) == reads_before + 2
+
+
+def test_zc_fp8_failed_read_returns_its_staging_row(zero_copy, monkeypatch):
+    """A transient read error under zc-fp8 retention must return the staging row it
+    claimed. Without the fix each failure leaks a row (popped from _zc_free_rows or
+    evicted from _zc_fp8_map before the read, never returned) until the ring empties
+    and the next eviction's next(iter(...)) raises StopIteration."""
+    monkeypatch.setenv("VLLM_MOE_ZC_FP8_SLOTS", "4")
+    provider, store, _, _ = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, quantize_fp8=True, fail_on={7}
+    )
+    provider.prepare(_topk([0, 1, 2, 3]))  # warm: fills retention rows
+    rows_before = len(provider._zc_free_rows) + len(provider._zc_fp8_map)
+    for _ in range(6):  # more failures than the ring has rows
+        with pytest.raises(OSError):
+            provider.prepare(_topk([7, 0, 1, 2]))  # 7 misses -> read raises
+    rows_after = len(provider._zc_free_rows) + len(provider._zc_fp8_map)
+    assert rows_after == rows_before, "a failed read leaked its staging row"
+    # The ring is intact, so a subsequent real read still works.
+    store.fail_on.clear()
+    provider.prepare(_topk([7, 0, 1, 2]))
+
+
+def test_zc_fp8_failed_h2d_drops_the_unmaterialised_pool_row(zero_copy, monkeypatch):
+    """If the dequant (H2D) fails after a successful read, the pool row was never
+    written, so the RAM entry must be dropped on rollback -- else a later prepare()
+    counts a RAM hit and the kernel computes with the previous occupant's weights."""
+    provider, store, _, _ = _make_disk_provider(
+        num_experts=8, capacity=4, ram_capacity=4, quantize_fp8=True
+    )
+    provider.prepare(_topk([0, 1, 2, 3]))  # warm
+
+    real_h2d = provider._issue_h2d
+
+    def flaky(op):
+        if op.expert_id == 4:
+            raise RuntimeError("injected dequant failure")
+        return real_h2d(op)
+
+    monkeypatch.setattr(provider, "_issue_h2d", flaky)
+    with pytest.raises(RuntimeError):
+        provider.prepare(_topk([4, 0, 1, 2]))  # 4 misses: read ok, dequant fails
+    monkeypatch.setattr(provider, "_issue_h2d", real_h2d)
+
+    # Expert 4's pool row was never materialised, so it must re-read, not hit stale.
+    reads_before = len(store.reads)
+    provider.prepare(_topk([4, 0, 1, 2]))
+    assert len(store.reads) > reads_before, "expert 4 served from an unmaterialised row"
+    _assert_tiers_consistent(provider)

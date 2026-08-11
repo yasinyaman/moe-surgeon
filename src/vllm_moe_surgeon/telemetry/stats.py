@@ -338,7 +338,9 @@ def accumulate(
             "top_k == 1 leaves uncaptured dense rows indistinguishable from a "
             "genuine selection of expert 0; pass an explicit moe_layers"
         )
-    stats = ExpertStats.empty(num_experts, moe_layers, with_cooc=with_cooc)
+    stats = ExpertStats.empty(
+        num_experts, moe_layers, with_cooc=with_cooc, top_k=top_k
+    )
     for capture in captures:
         stats.add(capture)
     stats.finalize()

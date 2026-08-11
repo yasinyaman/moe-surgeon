@@ -271,6 +271,45 @@ def test_dropped_experts_get_no_prior():
     assert 2 in priors, "a disk expert can still earn a slot"
 
 
+def test_importance_share_zero_is_not_bumped_to_raw_share():
+    """The falsy trap, fixed per-plan: in a plan that carries importance shares, a
+    rank-1 share of exactly 0.0 stays 0.0 rather than falling back to raw token
+    share and outranking a genuine contributor."""
+    placements = [
+        ExpertPlacement(
+            0, 0, "merge_into_core", tokens=500, share=0.5, importance_share=0.7
+        ),
+        ExpertPlacement(
+            0, 1, "keep_on_disk", tokens=300, share=0.3, importance_share=0.0
+        ),
+    ]
+    plan = Plan(model="m", revision="r", budget={}, placements=placements)
+    priors = hot_experts.from_plan(plan, scale=8.0).for_layer(0)
+    assert priors[0] == pytest.approx(5.6)  # 0.7 * 8
+    assert priors[1] == pytest.approx(0.0)  # rank-1 share 0, not 0.3 * 8
+
+
+def test_remap_keys_priors_in_the_applied_id_space():
+    """Tiering the pruned checkpoint renumbers survivors; a remap rekeys the priors
+    and drops deleted experts."""
+    placements = [
+        ExpertPlacement(
+            0, 1, "merge_into_core", tokens=500, share=0.5, importance_share=0.6
+        ),
+        ExpertPlacement(
+            0, 3, "keep_on_disk", tokens=300, share=0.3, importance_share=0.4
+        ),
+        ExpertPlacement(0, 0, "drop", tokens=10, share=0.01),
+    ]
+    plan = Plan(model="m", revision="r", budget={}, placements=placements)
+    priors = hot_experts.from_plan(
+        plan, scale=8.0, remap={0: {1: 0, 3: 1}}
+    ).for_layer(0)
+    assert set(priors) == {0, 1}  # new contiguous ids
+    assert priors[0] == pytest.approx(4.8)  # old expert 1: 0.6 * 8
+    assert priors[1] == pytest.approx(3.2)  # old expert 3: 0.4 * 8
+
+
 def test_core_is_ordered_hottest_first():
     hints = hot_experts.from_plan(_plan_with_shares())
     assert hints.core[0] == [0, 1]

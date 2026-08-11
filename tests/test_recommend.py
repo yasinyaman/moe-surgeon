@@ -99,19 +99,28 @@ def test_a_flat_distribution_is_not_pruned():
     assert any("no dead tail" in r for r in rec.reasons)
 
 
-def test_a_dead_tail_is_pruned_and_the_composition_is_the_reason():
+def test_a_dead_tail_is_not_pruned_when_the_tier_fits():
+    """New policy: the tier keeps every expert at no accuracy cost, so a cold tail is
+    left on the tier rather than deleted, even though the model does not fit
+    resident. Deletion is a measured task-accuracy loss, not a free win."""
     rec = recommend(
         _geometry(), vram_gib=1.0, stats=_with_dead_tail(), max_similarity=0.1
     )
-    assert rec.delete_experts == 4
     assert rec.use_tier
-    assert any("1.32x" in r for r in rec.reasons)
+    assert rec.delete_experts == 0
+    assert any("NOT recommended" in r for r in rec.reasons)
 
 
-def test_deletion_always_defers_the_quality_call_to_the_gate():
+def test_deletion_is_the_last_resort_only_when_the_tier_cannot_fit():
+    """Below the tier's own floor, a smaller model is the only way to run; deletion is
+    then recommended -- with the task-accuracy warning and a deferral to the gate."""
+    # A tiny target below the tier floor forces deletion.
     rec = recommend(
-        _geometry(), vram_gib=1.0, stats=_with_dead_tail(), max_similarity=0.1
+        _geometry(), vram_gib=0.2, stats=_with_dead_tail(), max_similarity=0.1
     )
+    assert rec.delete_experts != 0
+    assert any("last resort" in r for r in rec.reasons)
+    assert any("task accuracy" in w for w in rec.warnings)
     assert any("surgeon gate" in m for m in rec.must_measure)
 
 
@@ -146,6 +155,13 @@ def test_missing_inputs_are_reported_not_assumed():
     assert not rec.merge_enabled
 
 
+def test_the_tier_fitting_makes_deletion_unneeded_without_a_profile():
+    """When VRAM is known and the tier fits, deletion is off with no profile needed."""
+    rec = recommend(_geometry(), vram_gib=64.0)
+    assert rec.delete_experts == 0
+    assert any("deletion is not needed" in r for r in rec.reasons)
+
+
 def test_the_prior_is_recommended_whenever_the_tier_is_used():
     """It wins on cold start only, and that is enough to keep it."""
     rec = recommend(_geometry(), vram_gib=1.0, stats=_flat(), max_similarity=0.1)
@@ -155,10 +171,17 @@ def test_the_prior_is_recommended_whenever_the_tier_is_used():
 
 
 def test_report_is_readable_and_carries_the_reasons():
-    rec = recommend(
-        _geometry(), vram_gib=1.0, stats=_with_dead_tail(), max_similarity=0.1
-    )
+    # vram=None leaves feasibility (and therefore deletion) undecided, so the report
+    # carries a "not decidable here" section.
+    rec = recommend(_geometry(), stats=_with_dead_tail(), max_similarity=0.1)
     text = rec.report()
     assert "recommendation:" in text
     assert "because:" in text
     assert "not decidable here" in text
+    assert "delete" in text
+
+
+def test_last_resort_deletion_reports_as_such():
+    rec = recommend(_geometry(), vram_gib=0.2, max_similarity=0.1)
+    assert rec.delete_experts == -1
+    assert "last resort" in rec.report()

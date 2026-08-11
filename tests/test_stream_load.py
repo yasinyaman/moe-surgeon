@@ -269,21 +269,39 @@ def test_return_success_is_honoured_both_ways(tmp_path):
     ) is None
 
 
-def test_a_positional_call_is_delegated_rather_than_guessed(tmp_path):
-    """The contract read from vLLM is all-keyword. A positional call is not it.
-
-    Delegating is the safe response: guessing an argument order would write a shard
-    into the wrong half of the wrong expert, and nothing downstream would object.
-    """
+def test_a_positional_expert_shard_is_claimed_not_lost(tmp_path):
+    """deepseek_v2 and granitemoe call weight_loader positionally
+    ``(param, loaded_weight, weight_name, shard_id=, expert_id=)``. The shard must be
+    claimed and written, not delegated to the zero-expert placeholder where
+    ``param.data[expert_id]`` would index an empty tensor and load nothing."""
+    experts = _experts()
     streamer = _loader(tmp_path)
-    got = []
-    loader = streamer.wrap(lambda *a, **kw: got.append(("pos", len(a))))
+    delegated = []
+    loader = streamer.wrap(lambda *a, **kw: delegated.append(True))
 
-    loader(
-        object(), shard_id="w1", expert_id=0, loaded_weight=torch.zeros(INTER, HIDDEN)
-    )
-    assert got == [("pos", 1)]
-    assert streamer.records_written == 0
+    for expert_id, (gate, up, down) in enumerate(experts):
+        for shard, tensor in (("w1", gate), ("w3", up), ("w2", down)):
+            loader(
+                None,
+                tensor,
+                f"experts.{expert_id}.{shard}.weight",
+                shard_id=shard,
+                expert_id=expert_id,
+            )
+    assert delegated == [], "a positional expert shard must not be delegated"
+    assert streamer.records_written == E
+    streamer.finalize()
+
+
+def test_an_uninterpretable_positional_call_refuses(tmp_path):
+    """More positional args than the loader contract: refuse rather than write a
+    shard into the wrong half of the wrong expert silently."""
+    experts = _experts()
+    streamer = _loader(tmp_path)
+    loader = streamer.wrap(lambda *a, **kw: None)
+    gate = experts[0][0]
+    with pytest.raises(ValueError, match="Refusing to guess"):
+        loader(None, gate, "experts.0.w1.weight", "w1", 0, True, "extra-arg")
 
 
 def test_a_negative_local_id_is_skipped(tmp_path):

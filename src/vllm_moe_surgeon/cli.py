@@ -40,9 +40,19 @@ def _cmd_profile(args: argparse.Namespace) -> int:
     print(summarize(stats))
 
     if args.out:
+        from .surgery.apply import environment
         from .telemetry.persist import save
 
-        save(stats, args.out, model=args.model, revision=args.revision)
+        # Capture torch/vLLM/device here, where vLLM is already imported, so the
+        # profile records what produced it -- a number without its environment is
+        # not reproducible.
+        save(
+            stats,
+            args.out,
+            model=args.model,
+            revision=args.revision,
+            extra={"environment": environment()},
+        )
         print(f"\nwrote {args.out}")
     return 0
 
@@ -309,8 +319,18 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     from .server.app import create_app
 
+    token = args.token or os.environ.get("MOE_SURGEON_TOKEN")
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not token:
+        print(
+            f"refusing to bind {args.host} without an auth token: the server runs "
+            "subprocesses from request fields. Pass --token (or set "
+            "MOE_SURGEON_TOKEN), or bind 127.0.0.1.",
+            file=sys.stderr,
+        )
+        return 2
+
     uvicorn.run(
-        create_app(args.state, timeout=args.stage_timeout),
+        create_app(args.state, timeout=args.stage_timeout, token=token),
         host=args.host,
         port=args.port,
     )
@@ -555,6 +575,12 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("serve", help="run the job server")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
+    p.add_argument(
+        "--token",
+        default=None,
+        help="require this token in the X-Surgeon-Token header; needed to bind a "
+        "non-loopback host. Falls back to $MOE_SURGEON_TOKEN.",
+    )
     p.add_argument("--state", default="./surgeon-state", help="where jobs are recorded")
     p.add_argument(
         "--stage-timeout",

@@ -217,6 +217,28 @@ def validate_plan(plan: Plan) -> None:
         if not keep:
             raise ValueError(f"layer {layer} would keep no experts")
 
+    # If the plan deletes from any layer, every layer must end with the same survivor
+    # count: a single HF ``num_experts`` cannot express a per-layer count. The usual
+    # cause is a *silent* layer -- one that produced no routing rows, so it is kept at
+    # full width -- coexisting with pruned layers. Caught here rather than as a
+    # confusing "different expert counts" deep in rewrite_config.
+    counts = {layer: len(keep) for layer, keep in survivors.items()}
+    has_drops = any(p.action == "drop" for p in plan.placements)
+    if has_drops and len(set(counts.values())) > 1:
+        untouched = getattr(plan, "untouched_layers", None) or {}
+        silent = sorted(set(untouched) & set(counts))
+        hint = (
+            f" Layers {silent} produced no routing rows (silent) and were kept at "
+            "full width; profile longer so they get data, or lower the budget so "
+            "nothing is dropped."
+            if silent
+            else " Use a uniform budget that touches every layer the same way."
+        )
+        raise ValueError(
+            f"plan deletes experts but layers end with different survivor counts "
+            f"{counts}; a single HF num_experts cannot express that.{hint}"
+        )
+
 
 def deletes_anything(plan: Plan) -> bool:
     """Whether this plan removes expert capacity at all.
@@ -247,6 +269,26 @@ def merges_anything(plan: Plan) -> bool:
 
 def gate_passed(plan: Plan) -> bool:
     return bool(plan.gate and plan.gate.get("passed"))
+
+
+def drop_set_digest(plan: Plan) -> str:
+    """A stable fingerprint of exactly the experts the gate measures deleting.
+
+    Only true deletions -- ``drop`` placements with no merge target -- since a merge
+    donor is folded, not discarded, and is excluded from the gate. Binds a gate
+    verdict to the plan it was measured on, so editing the drop-set after gating and
+    applying is caught rather than silently authorised.
+    """
+    import hashlib
+
+    dropped: dict[int, list[int]] = {}
+    for placement in plan.placements:
+        if placement.action == "drop" and placement.merge_target is None:
+            dropped.setdefault(placement.layer, []).append(placement.expert)
+    canonical = {str(layer): sorted(v) for layer, v in sorted(dropped.items())}
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True).encode()
+    ).hexdigest()
 
 
 def coverage(stats: ExpertStats) -> float:

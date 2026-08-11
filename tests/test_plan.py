@@ -86,6 +86,14 @@ def test_silent_layer_is_never_pruned():
     assert any(p.action != "merge_into_core" for p in plan.by_layer(0))
 
 
+def test_silent_layer_with_deletion_is_refused():
+    """A silent layer kept at full width cannot coexist with deleted layers under a
+    single HF num_experts. Refused at build with a message naming the silent layer."""
+    stats = _stats({0: [4000, 3000, 2000, 1000, 500, 200, 100, 50], 1: [0] * 8})
+    with pytest.raises(ValueError, match="different survivor counts"):
+        build_plan(stats, Budget(core_experts=2, drop_share_below=0.5))
+
+
 # ------------------------------------------------------------- core selection
 
 

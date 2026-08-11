@@ -159,6 +159,44 @@ class JobStore:
 WEIGHT_FILE_PATTERNS = ("*.safetensors", "*.safetensors.index.json", "config.json")
 
 
+# The only engine kwargs a request may pass through to `LLM(...)`. An allow-list, not
+# a deny-list, because the request comes over HTTP from a caller we do not trust: the
+# splat reaches vLLM's model loader, so `trust_remote_code` here is "run this
+# stranger's Python as the server user", and keys like `download_dir` or `load_format`
+# widen the surface further. Anything outside this set is a 400 naming the key.
+ALLOWED_LLM_KWARGS = frozenset({
+    "gpu_memory_utilization",
+    "max_model_len",
+    "dtype",
+    "enforce_eager",
+    "max_num_seqs",
+    "seed",
+    "kv_cache_dtype",
+    "swap_space",
+})
+
+
+def validate_llm_kwargs(llm_kwargs: Any) -> None:
+    """Refuse any engine kwarg not on :data:`ALLOWED_LLM_KWARGS`, by name.
+
+    Raises :class:`ValueError` (which the HTTP layer turns into a 400). The message
+    names the offending key rather than silently dropping it, so a caller who meant
+    well learns why, and a caller who did not gets nothing.
+    """
+    if llm_kwargs is None:
+        return
+    if not isinstance(llm_kwargs, dict):
+        raise ValueError("llm_kwargs must be an object")
+    bad = sorted(k for k in llm_kwargs if k not in ALLOWED_LLM_KWARGS)
+    if bad:
+        raise ValueError(
+            f"llm_kwargs contains keys that are not allowed over the API: {bad}. "
+            f"Allowed keys are {sorted(ALLOWED_LLM_KWARGS)}. In particular "
+            "`trust_remote_code` is refused: it would execute the checkpoint's own "
+            "Python in the server process."
+        )
+
+
 def resolve_checkpoint(reference: str, needed_by: set[str]) -> str:
     """A local directory of safetensors for ``reference``.
 
@@ -207,6 +245,9 @@ def build_stages(spec: dict[str, Any], workdir: str) -> list[StageResult]:
     model = spec.get("model")
     if not model:
         raise ValueError("spec needs a model")
+    # Reject a dangerous engine kwarg before any stage is built, not after a stage
+    # boots with it.
+    validate_llm_kwargs(spec.get("llm_kwargs"))
     profile = os.path.join(workdir, "profile.npz")
     plan = os.path.join(workdir, "plan.json")
 
@@ -319,6 +360,14 @@ class Runner:
         self.store.save(job)
 
         merged = dict(os.environ)
+        # Offline by default: a stage that boots vLLM's loader would otherwise fetch
+        # any repo id the request named, straight from the network, as the server
+        # user. Downloading is opt-in per job, not the default an unauthenticated
+        # POST gets. This does not by itself stop `trust_remote_code` on an
+        # already-cached repo -- that is what validate_llm_kwargs is for.
+        if not job.spec.get("allow_download"):
+            merged.setdefault("HF_HUB_OFFLINE", "1")
+            merged.setdefault("TRANSFORMERS_OFFLINE", "1")
         merged.update(env or {})
 
         for stage in job.stages:

@@ -48,6 +48,7 @@ from .descriptors import LAYOUTS, CheckpointIndex
 from .plan import (
     Plan,
     deletes_anything,
+    drop_set_digest,
     gate_passed,
     merges_anything,
     validate_plan,
@@ -261,6 +262,82 @@ def _expert_tensor_names(index: CheckpointIndex, layer: int) -> set[str]:
     return {name for name in index.weight_map if name.startswith(prefix)}
 
 
+#: Per-expert router-side tensors we know how to renumber. A DeepSeek-V3-style
+#: `e_score_correction_bias` is a learned per-expert balancing term; a plain
+#: `mlp.gate.bias` (or the stacked router's bias) is one value per expert too. All
+#: are `[E, ...]` and must be reordered by the survivor mapping, exactly like the
+#: router rows -- left alone they keep old-id length against a new-id router.
+KNOWN_ROUTER_AUX_SUFFIXES = (
+    "mlp.gate.e_score_correction_bias",
+    "mlp.gate.bias",
+    "block_sparse_moe.router.layer.bias",
+)
+
+
+def _router_module_prefix(index: CheckpointIndex, layer: int) -> str:
+    if index.layout == "stacked":
+        return f"model.layers.{layer}.block_sparse_moe.router."
+    return f"model.layers.{layer}.mlp.gate."
+
+
+def _router_aux_names(index: CheckpointIndex, layer: int) -> set[str]:
+    """Per-expert router-side tensors for ``layer`` that must be renumbered.
+
+    Any tensor under the router module whose first dimension is the expert count is
+    a per-expert quantity. Known ones are renumbered; an *unknown* one is refused
+    rather than passed through at the wrong length, because a wrong per-expert
+    balancing bias against renumbered experts is a silent correctness bug.
+    """
+    prefix = _router_module_prefix(index, layer)
+    router = index.router_name(layer)
+    n_experts = len(index.expert_ids(layer))
+    aux: set[str] = set()
+    unknown: list[str] = []
+    for name in index.weight_map:
+        if not name.startswith(prefix) or name == router:
+            continue
+        if _read_torch(index, name).shape[0] != n_experts:
+            continue  # a shared router-module tensor, not per-expert
+        if any(name.endswith(sfx) for sfx in KNOWN_ROUTER_AUX_SUFFIXES):
+            aux.add(name)
+        else:
+            unknown.append(name)
+    if unknown:
+        raise ValueError(
+            f"layer {layer} has per-expert router tensor(s) {sorted(unknown)} that "
+            "apply does not know how to renumber. Refusing rather than writing them "
+            "at the old expert count against a renumbered router. Add them to "
+            "KNOWN_ROUTER_AUX_SUFFIXES once their semantics are confirmed."
+        )
+    return aux
+
+
+def _blend_expert_rows(weight: Any, edit: LayerSurgery) -> Any:
+    """Survivors of a ``[E, ...]`` tensor in new-id order, merges weighted-averaged.
+
+    Works for the router (`[E, H]`) and for a per-expert bias (`[E]`) alike, since
+    both index the expert on axis 0. See the module docstring on why a merged
+    cluster's combined selection mass cannot be represented without a gate bias.
+    """
+    import torch
+
+    rows = []
+    for old_id in edit.survivors:
+        donors = edit.merges.get(old_id, [])
+        base = weight[old_id].to(torch.float32)
+        if not donors:
+            rows.append(base)
+            continue
+        total = edit.weights[old_id] + sum(w for _, w in donors)
+        blended = base * (edit.weights[old_id] / total)
+        for donor_id, donor_weight in donors:
+            blended = blended + weight[donor_id].to(torch.float32) * (
+                donor_weight / total
+            )
+        rows.append(blended)
+    return torch.stack(rows)
+
+
 def _write_experts_stacked(
     writer: ShardWriter,
     index: CheckpointIndex,
@@ -303,6 +380,102 @@ def _iter_source_tensors(index: CheckpointIndex) -> Iterator[str]:
     return iter(sorted(index.weight_map))
 
 
+def _source_moe_layers(index: CheckpointIndex) -> set[int]:
+    """Every layer that carries expert weights in the source checkpoint."""
+    import re
+
+    pattern = (
+        r"model\.layers\.(\d+)\.block_sparse_moe\."
+        if index.layout == "stacked"
+        else r"model\.layers\.(\d+)\.mlp\.experts\."
+    )
+    layers = set()
+    for name in index.weight_map:
+        m = re.match(pattern, name)
+        if m:
+            layers.add(int(m.group(1)))
+    return layers
+
+
+def source_fingerprint(source: str) -> dict[str, Any]:
+    """A cheap content fingerprint of the source checkpoint, for the manifest.
+
+    Not a full content hash of gigabytes of weights -- that would dominate a 7-second
+    apply. Hashes ``config.json`` and the (name, size) of every shard, which is enough
+    to notice the artifact was built from a *different* checkpoint than a later reader
+    assumes. Recorded so a published number is traceable to the bytes it came from.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    try:
+        with open(os.path.join(source, "config.json"), "rb") as f:
+            h.update(f.read())
+    except OSError:
+        pass
+    shards = sorted(
+        p for p in os.listdir(source) if p.endswith(".safetensors")
+    )
+    manifest = []
+    for name in shards:
+        size = os.path.getsize(os.path.join(source, name))
+        h.update(f"{name}:{size}".encode())
+        manifest.append({"shard": name, "bytes": size})
+    return {"sha256": h.hexdigest()[:32], "shards": manifest}
+
+
+def environment() -> dict[str, Any]:
+    """Best-effort record of what produced an artifact: python, torch, vLLM, device.
+
+    Versions come from package metadata (no heavy import); the device name needs
+    torch, imported lazily and tolerantly, since the offline writer must not depend
+    on it. A number nobody can place in an environment is a number nobody can
+    reproduce.
+    """
+    import platform
+    import sys
+    from importlib import metadata
+
+    env: dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+    }
+    for pkg in ("torch", "vllm"):
+        try:
+            env[pkg] = metadata.version(pkg)
+        except metadata.PackageNotFoundError:
+            pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            env["cuda"] = torch.version.cuda
+            env["device"] = torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return env
+
+
+def refuse_in_place(source: str, out: str) -> None:
+    """Refuse to write into the directory being read.
+
+    ``apply`` and ``tier`` emit HF-conventional shard names and overwrite
+    ``config.json`` / the shard index, while reading the source shards lazily and
+    interleaved. Pointing ``--out`` at ``--source`` -- the obvious in-place
+    invocation for an operator short on disk -- corrupts the checkpoint mid-read
+    with no error. Refuse it before the first byte is written, source or out nested
+    in the other included.
+    """
+    s = os.path.realpath(source)
+    o = os.path.realpath(out)
+    if s == o or o.startswith(s + os.sep) or s.startswith(o + os.sep):
+        raise RuntimeError(
+            f"refusing in-place surgery: --out ({out!r}) is the same as or nested "
+            f"with --source ({source!r}). The writer overwrites the checkpoint it is "
+            "reading. Write to a fresh directory."
+        )
+
+
 def apply_plan(
     plan: Plan,
     source: str,
@@ -326,13 +499,35 @@ def apply_plan(
     """
     import torch
 
-    if require_gate and deletes_anything(plan) and not gate_passed(plan):
-        verdict = (plan.gate or {}).get("reason", "never measured")
-        raise RuntimeError(
-            "this plan deletes experts but has not passed the quality gate "
-            f"({verdict}). Run `surgeon gate` to measure what the deletions cost, "
-            "or pass require_gate=False to accept an unmeasured plan."
-        )
+    refuse_in_place(source, out_dir)
+
+    gate_skipped = False
+    if deletes_anything(plan) and not gate_passed(plan):
+        if require_gate:
+            verdict = (plan.gate or {}).get("reason", "never measured")
+            raise RuntimeError(
+                "this plan deletes experts but has not passed the quality gate "
+                f"({verdict}). Run `surgeon gate` to measure what the deletions "
+                "cost, or pass require_gate=False to accept an unmeasured plan."
+            )
+        gate_skipped = True
+    elif deletes_anything(plan) and gate_passed(plan):
+        # The gate passed, but for *this* drop-set? A plan is hand-editable, and a
+        # verdict is a plain dict; gating a small drop-set then editing in more
+        # deletions must not apply under the stale pass.
+        recorded = (plan.gate or {}).get("drop_digest")
+        current = drop_set_digest(plan)
+        if recorded is None:
+            logger.warning(
+                "the gate verdict predates drop-set binding (no digest), so it "
+                "cannot be checked against the plan's current deletions"
+            )
+        elif recorded != current:
+            raise RuntimeError(
+                "the gate verdict was measured for a different drop-set than this "
+                f"plan now carries (digest {recorded[:12]}... != {current[:12]}...). "
+                "Re-run `surgeon gate`, or pass require_gate=False to override."
+            )
 
     if merges_anything(plan):
         # A passing gate is not evidence about merges. The gate zeroes experts,
@@ -364,13 +559,38 @@ def apply_plan(
         config = json.load(f)
     new_config = rewrite_config(config, surgery)
 
+    # An applied plan must cover every MoE layer the source has, or none: writing a
+    # config with the pruned num_experts while an uncovered layer's expert tensors
+    # pass through at full width is a checkpoint that misloads. This is the exact
+    # inconsistency a hand-edit produces by deleting a silent layer's placements.
+    new_count = _expert_count(new_config)
+    uncovered = _source_moe_layers(index) - set(surgery)
+    if uncovered and new_count is not None:
+        mismatched = {
+            layer: len(index.expert_ids(layer))
+            for layer in sorted(uncovered)
+            if len(index.expert_ids(layer)) != new_count
+        }
+        if mismatched:
+            raise ValueError(
+                f"plan does not cover MoE layer(s) {sorted(mismatched)} (experts "
+                f"{mismatched}), but writes a config with num_experts={new_count}. "
+                "Their tensors would pass through at full width against a pruned "
+                "config -- an inconsistent checkpoint. Cover every MoE layer, or "
+                "none."
+            )
+
     writer = ShardWriter(out_dir, shard_bytes)
     # The output keeps the source's layout. Emitting per-expert tensors for a model
     # whose loader expects stacked ones produces a checkpoint that fails to load;
     # emitting them under stacked names produces one that loads wrong.
+    # Per-expert router-side tensors (e.g. DeepSeek's e_score_correction_bias) are
+    # renumbered alongside the router; an unknown one is refused here, before writing.
+    router_aux = {layer: _router_aux_names(index, layer) for layer in surgery}
     rewritten = {index.router_name(layer) for layer in surgery}
     for layer in surgery:
         rewritten |= _expert_tensor_names(index, layer)
+        rewritten |= router_aux[layer]
 
     n_merged = 0
     for name in _iter_source_tensors(index):
@@ -439,6 +659,11 @@ def apply_plan(
             index.router_name(layer),
             _rewrite_router(index, layer, edit, dtype),
         )
+        # Per-expert router-side tensors (e_score_correction_bias, router bias) follow
+        # the same survivor reordering, in their own source dtype.
+        for aux_name in sorted(router_aux[layer]):
+            aux = _read_torch(index, aux_name)
+            writer.add(aux_name, _blend_expert_rows(aux, edit).to(aux.dtype))
 
     weight_map = writer.finalize()
 
@@ -453,10 +678,19 @@ def apply_plan(
         "base_model": plan.model,
         "base_revision": plan.revision,
         "source_path": os.path.abspath(source),
+        "source_fingerprint": source_fingerprint(source),
+        "environment": environment(),
         "plan_budget": plan.budget,
         "plan_provenance": plan.provenance,
         "plan_warnings": plan.warnings,
         "gate": plan.gate,
+        "gate_skipped": gate_skipped,
+        "gate_note": (
+            "deletions applied WITHOUT a passing quality gate (require_gate=False); "
+            "this artifact's quality was not measured"
+            if gate_skipped
+            else None
+        ),
         "experts_before": _expert_count(config),
         "experts_after": _expert_count(new_config),
         "top_k_before": _top_k(config),
@@ -472,8 +706,9 @@ def apply_plan(
         "router_rewrite": (
             "usage-weighted mean of member rows; the gate has no bias term, so "
             "the combined selection mass of a merged cluster is NOT represented "
-            "-- a least-squares refit on calibration hidden states is the "
-            "principled fix and was not applied"
+            "-- the principled fix is the log-sum-exp least-squares refit in "
+            "surgery/refit.py, which needs calibration hidden states and was not "
+            "applied here"
             if n_merged
             else "rows of surviving experts, reordered to the new ids"
         ),
@@ -535,25 +770,8 @@ def _rewrite_router(
     index: CheckpointIndex, layer: int, edit: LayerSurgery, dtype
 ):
     """Router rows for the survivors, in their new order."""
-    import torch
-
     weight = _read_torch(index, index.router_name(layer))  # [E, H]
-    rows = []
-    for old_id in edit.survivors:
-        donors = edit.merges.get(old_id, [])
-        if not donors:
-            rows.append(weight[old_id].to(torch.float32))
-            continue
-        # Weighted mean over the cluster. See the module docstring: without a
-        # gate bias this cannot express the cluster's summed selection mass.
-        total = edit.weights[old_id] + sum(w for _, w in donors)
-        blended = weight[old_id].to(torch.float32) * (edit.weights[old_id] / total)
-        for donor_id, donor_weight in donors:
-            blended = blended + weight[donor_id].to(torch.float32) * (
-                donor_weight / total
-            )
-        rows.append(blended)
-    return torch.stack(rows).to(dtype)
+    return _blend_expert_rows(weight, edit).to(dtype)
 
 
 def _expert_count(config: dict[str, Any]) -> int | None:

@@ -381,3 +381,65 @@ def test_a_directory_is_passed_through_unresolved(tmp_path):
     from vllm_moe_surgeon.server.jobs import resolve_checkpoint
 
     assert resolve_checkpoint(str(tmp_path), {"tier"}) == str(tmp_path)
+
+
+# ------------------------------------------------------------------ security
+
+
+def test_trust_remote_code_in_llm_kwargs_is_refused():
+    """A splat into vLLM's loader; trust_remote_code would run the repo's Python."""
+    with pytest.raises(ValueError, match="trust_remote_code"):
+        build_stages(_spec(llm_kwargs={"trust_remote_code": True}), "/w")
+
+
+def test_only_allowlisted_llm_kwargs_pass():
+    # A safe engine kwarg is fine.
+    build_stages(_spec(llm_kwargs={"gpu_memory_utilization": 0.3}), "/w")
+    # An unknown key is refused by name, allow-list not deny-list.
+    with pytest.raises(ValueError, match="download_dir"):
+        build_stages(_spec(llm_kwargs={"download_dir": "/etc"}), "/w")
+
+
+def _echo_offline(name="profile"):
+    """A stage that prints HF_HUB_OFFLINE so the runner's env reaches the tail."""
+    return StageResult(
+        name=name,
+        argv=[
+            sys.executable,
+            "-c",
+            "import os; print('OFFLINE=' + os.environ.get('HF_HUB_OFFLINE', 'unset'))",
+        ],
+    )
+
+
+def test_runner_boots_stages_offline_unless_download_opted_in(tmp_path, monkeypatch):
+    # Neutralise any offline flag inherited from the test host's own environment.
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    store = JobStore(str(tmp_path / "jobs"))
+
+    job = store.create(_spec(), str(tmp_path / "w"), [_echo_offline()])
+    done = Runner(store).run(job)
+    assert "OFFLINE=1" in done.stages[0].tail
+
+    job2 = store.create(
+        _spec(allow_download=True), str(tmp_path / "w2"), [_echo_offline()]
+    )
+    done2 = Runner(store).run(job2)
+    assert "OFFLINE=unset" in done2.stages[0].tail
+
+
+def test_a_token_gates_every_route_but_health(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from vllm_moe_surgeon.server.app import create_app
+
+    with TestClient(create_app(str(tmp_path), token="s3cret")) as client:
+        assert client.get("/health").status_code == 200  # health is open
+        assert client.get("/jobs").status_code == 401  # no token
+        assert client.get(
+            "/jobs", headers={"X-Surgeon-Token": "wrong"}
+        ).status_code == 401
+        assert client.get(
+            "/jobs", headers={"X-Surgeon-Token": "s3cret"}
+        ).status_code == 200

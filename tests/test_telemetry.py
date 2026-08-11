@@ -106,6 +106,15 @@ def test_counts_are_token_weighted():
     assert stats.top_k_hint == pytest.approx(2.0)
 
 
+def test_accumulate_allocates_the_position_histogram():
+    """top_k must reach ExpertStats.empty, or rank-1 ranking silently degrades to
+    plain token count for every profile built through this public helper."""
+    capture = _capture({0: [[1, 2], [1, 3]]}, num_layers=1, seq_len=2)
+    stats = accumulate([capture], num_experts=E, moe_layers=[0], top_k=TOP_K)
+    assert stats.positions is not None
+    assert stats.positions.shape == (1, E, TOP_K)
+
+
 def test_dense_layer_zero_rows_do_not_become_expert_zero():
     """The trap this module exists for.
 

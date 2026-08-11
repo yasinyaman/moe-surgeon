@@ -48,6 +48,9 @@ class JobSpec(BaseModel):
     force: bool = False
     stages: list[str] | None = None
     llm_kwargs: dict[str, Any] | None = None
+    #: Opt in to fetching an uncached model from the network. Off by default, so an
+    #: unauthenticated request cannot make the server download an arbitrary repo id.
+    allow_download: bool = False
 
     # `model` and `model_id` are ordinary fields here, not pydantic internals.
     model_config = {"protected_namespaces": ()}
@@ -110,15 +113,40 @@ class JobQueue:
         return self.runner.cancel(job_id)
 
 
-def create_app(root: str | None = None, *, timeout: float | None = None):
-    """Build the FastAPI app. Import is local so the offline half needs no web deps."""
-    from fastapi import FastAPI, HTTPException
+def create_app(
+    root: str | None = None,
+    *,
+    timeout: float | None = None,
+    token: str | None = None,
+):
+    """Build the FastAPI app. Import is local so the offline half needs no web deps.
+
+    ``token``: when set, every request except ``/health`` must carry it in the
+    ``X-Surgeon-Token`` header or gets a 401. The server submits subprocesses from
+    request-supplied fields, so an open ``0.0.0.0`` bind with no token is a remote
+    handle on the operator's machine. There is no default token: unset means the
+    server trusts whoever can reach it, which is only safe on a loopback bind.
+    """
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.responses import JSONResponse
 
     state_root = root or DEFAULT_ROOT
     store = JobStore(os.path.join(state_root, "jobs"))
     jobs = JobQueue(store, state_root, timeout=timeout)
 
     app = FastAPI(title="moe-surgeon", version="0.1.0")
+
+    if token:
+        @app.middleware("http")
+        async def _require_token(request: Request, call_next):
+            if request.url.path != "/health":
+                supplied = request.headers.get("x-surgeon-token")
+                if supplied != token:
+                    return JSONResponse(
+                        {"detail": "missing or invalid X-Surgeon-Token"},
+                        status_code=401,
+                    )
+            return await call_next(request)
 
     def summarize(job) -> JobSummary:
         return JobSummary(

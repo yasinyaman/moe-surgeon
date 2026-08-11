@@ -41,6 +41,19 @@ logger = init_logger(__name__)
 #: they are the record's ``w13`` field, in that order -- and ``w2`` is down.
 EXPERT_SHARDS = ("w1", "w2", "w3")
 
+#: vLLM's ``weight_loader`` positional parameter order, so a positional call
+#: (deepseek_v2, granitemoe) can be bound to names. Matches
+#: ``RoutedExperts.weight_loader(param, loaded_weight, weight_name, shard_id,
+#: expert_id, return_success)``.
+LOADER_POSITIONAL = (
+    "param",
+    "loaded_weight",
+    "weight_name",
+    "shard_id",
+    "expert_id",
+    "return_success",
+)
+
 
 class StreamLoader:
     """Turns arriving expert shards into store records, one layer's worth.
@@ -152,21 +165,39 @@ class StreamLoader:
         """
 
         def stream_weight_loader(*args: Any, **kwargs: Any) -> Any:
-            shard_id = kwargs.get("shard_id")
-            expert_id = kwargs.get("expert_id")
-            weight_name = kwargs.get("weight_name") or ""
-            loaded_weight = kwargs.get("loaded_weight")
-            return_success = bool(kwargs.get("return_success", False))
+            # vLLM's weight_loader contract, positional order. Some models call it by
+            # keyword (the unified RoutedExperts path), others positionally with
+            # shard_id/expert_id as kwargs (deepseek_v2, granitemoe). Bind both so a
+            # positional expert shard is claimed rather than delegated to the
+            # zero-expert placeholder, where param.data[expert_id] would index an
+            # empty tensor and load nothing.
+            bound = dict(zip(LOADER_POSITIONAL, args, strict=False))
+            bound.update(kwargs)
+            shard_id = bound.get("shard_id")
+            expert_id = bound.get("expert_id")
+            weight_name = bound.get("weight_name") or ""
+            loaded_weight = bound.get("loaded_weight")
+            return_success = bool(bound.get("return_success", False))
 
             mine = (
                 shard_id in EXPERT_SHARDS
                 and expert_id is not None
                 and loaded_weight is not None
                 and "bias" not in weight_name
-                and not args  # a positional call is not the contract we read
             )
             if not mine:
                 return inner(*args, **kwargs)
+
+            # We own this shard. If more positional args arrived than the contract we
+            # know, our name<-position mapping is not trustworthy, and writing a shard
+            # into the wrong half of the wrong expert is silent. Refuse over guess.
+            if len(args) > len(LOADER_POSITIONAL):
+                raise ValueError(
+                    f"stream_load received {len(args)} positional weight_loader args "
+                    f"for an expert shard on {self.layer_name}, beyond the "
+                    f"{len(LOADER_POSITIONAL)}-argument contract it can interpret. "
+                    "Refusing to guess the argument order."
+                )
 
             self.accept(shard_id, loaded_weight, int(expert_id))
             # The caller distinguishes "loaded" from "skipped" only when it asked to.

@@ -116,7 +116,23 @@ def build_layer_store(
         quant="fp8e4m3-row" if fp8 else None,
     )
     if store.is_complete:
-        logger.info("layer %d: reusing existing store", layer)
+        # Reuse is keyed by identity {model, revision, layer} + shapes/dtypes, NOT by
+        # content: a full content hash is deliberately not part of the fingerprint,
+        # because the streamed boot builds the store without reading the source
+        # weights and must stay byte-interchangeable with this offline build. So a
+        # rebuilt checkpoint under the same model id and revision would be reused
+        # silently -- warn, naming the identity, and note that revision is often unset
+        # (str(None)). Give a changed checkpoint a fresh --store dir or a distinct
+        # --revision.
+        logger.warning(
+            "layer %d: reusing existing store for identity "
+            "{model=%s, revision=%s, layer=%s}; reuse is by identity + shapes, not "
+            "content, so ensure this store was built from the same checkpoint",
+            layer,
+            model_id,
+            revision,
+            layer_name,
+        )
         return store
 
     def read(expert: int, projection: str):
@@ -187,6 +203,9 @@ def build_store(
     fp8: bool = True,
 ) -> dict[str, Any]:
     """Build the store for every named layer. Returns a summary."""
+    from .apply import refuse_in_place
+
+    refuse_in_place(checkpoint, directory)
     index = CheckpointIndex.open(checkpoint)
     total_bytes = 0
     built = []

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-moe-surgeon"
 version = "0.1.0.dev0"
-description = "Permanent MoE expert pruning and merging for domain-specialised vLLM deployments"
+description = "An NVMe expert tier for domain-specialised MoE vLLM deployments, with offline expert pruning and merging where a model supports it"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
 license = "Apache-2.0"

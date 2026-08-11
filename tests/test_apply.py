@@ -38,7 +38,9 @@ def _distinct_expert(layer: int, expert: int):
     return gate, up, down
 
 
-def _make_checkpoint(root, *, dtype=torch.float32, num_experts=NUM_EXPERTS):
+def _make_checkpoint(
+    root, *, dtype=torch.float32, num_experts=NUM_EXPERTS, extra_tensors=None
+):
     tensors: dict[str, torch.Tensor] = {
         "model.embed_tokens.weight": torch.arange(8 * H, dtype=torch.float32).reshape(
             8, H
@@ -61,6 +63,9 @@ def _make_checkpoint(root, *, dtype=torch.float32, num_experts=NUM_EXPERTS):
         tensors[f"model.layers.{layer}.self_attn.q_proj.weight"] = torch.full(
             (H, H), 7.0
         )
+
+    if extra_tensors:
+        tensors.update(extra_tensors)
 
     root.mkdir(parents=True, exist_ok=True)
     save_file(
@@ -160,10 +165,28 @@ def test_rewrite_config_leaves_top_k_alone_when_it_still_fits():
 
 
 def test_rewrite_config_refuses_uneven_layers():
-    """One config field cannot express a per-layer expert count."""
-    surgery = derive_surgery(_plan({0: {0, 1}, 1: {0, 1, 2}}))
+    """One config field cannot express a per-layer expert count.
+
+    Built directly rather than through derive_surgery, which now refuses an uneven
+    drop plan earlier in validate_plan (see the silent-layer test below)."""
+    from vllm_moe_surgeon.surgery.apply import LayerSurgery
+
+    surgery = {
+        0: LayerSurgery(layer=0, remap={0: 0, 1: 1}, merges={}, weights={0: 1, 1: 1}),
+        1: LayerSurgery(
+            layer=1, remap={0: 0, 1: 1, 2: 2}, merges={}, weights={0: 1, 1: 1, 2: 1}
+        ),
+    }
     with pytest.raises(ValueError, match="different expert counts"):
         rewrite_config({"num_experts": NUM_EXPERTS}, surgery)
+
+
+def test_validate_plan_refuses_uneven_drops_early():
+    """An uneven drop plan is caught in validate_plan with a clear message."""
+    from vllm_moe_surgeon.surgery.plan import validate_plan
+
+    with pytest.raises(ValueError, match="different survivor counts"):
+        validate_plan(_plan({0: {0, 1}, 1: {0, 1, 2}}))
 
 
 def test_rewrite_config_handles_the_alias_key():
@@ -206,6 +229,128 @@ def test_drop_only_produces_a_loadable_renumbered_checkpoint(tmp_path):
         assert gate[0, 0] == pytest.approx(expected), (
             f"new expert {new_id} should be old expert {old_id}"
         )
+
+
+def test_e_score_correction_bias_is_renumbered_with_the_router(tmp_path):
+    """A DeepSeek-style per-expert bias must follow the survivor mapping, or it is
+    left at old-id length against a renumbered [K] router."""
+    source = tmp_path / "src"
+    out = tmp_path / "out"
+    # Bias value == old expert id, so the reordering is checkable.
+    extra = {
+        f"model.layers.{layer}.mlp.gate.e_score_correction_bias": torch.arange(
+            NUM_EXPERTS, dtype=torch.float32
+        )
+        for layer in range(NUM_LAYERS)
+    }
+    _make_checkpoint(source, extra_tensors=extra)
+
+    keep = {1, 3, 5}
+    apply_plan(_plan({0: keep, 1: keep}), str(source), str(out))
+
+    index = CheckpointIndex.open(str(out))
+    bias = index.read("model.layers.0.mlp.gate.e_score_correction_bias")
+    assert bias.shape == (3,)
+    # New ids 0,1,2 hold old experts 1,3,5, whose bias values were 1,3,5.
+    assert list(bias) == [1.0, 3.0, 5.0]
+
+
+def test_unknown_per_expert_router_tensor_is_refused(tmp_path):
+    """An unrecognised [E, ...] router-side tensor must not pass through silently."""
+    source = tmp_path / "src"
+    out = tmp_path / "out"
+    extra = {
+        f"model.layers.{layer}.mlp.gate.mystery_per_expert": torch.arange(
+            NUM_EXPERTS, dtype=torch.float32
+        )
+        for layer in range(NUM_LAYERS)
+    }
+    _make_checkpoint(source, extra_tensors=extra)
+    with pytest.raises(ValueError, match="does not know how to renumber"):
+        apply_plan(_plan({0: {1, 3, 5}, 1: {1, 3, 5}}), str(source), str(out))
+
+
+def test_gate_verdict_is_bound_to_the_drop_set(tmp_path):
+    """Gate a small drop-set, edit in more deletions, apply -> refused."""
+    from vllm_moe_surgeon.surgery.plan import drop_set_digest
+
+    source = tmp_path / "src"
+    _make_checkpoint(source)
+
+    keep_two = _plan({0: {0, 1}, 1: {0, 1}})
+    keep_two.gate = {
+        "passed": True,
+        "ratio": 1.0,
+        "drop_digest": drop_set_digest(keep_two),
+    }
+    # A verdict measured for this exact drop-set applies.
+    apply_plan(keep_two, str(source), str(tmp_path / "out_ok"))
+
+    # A verdict carrying the old digest against a wider drop-set is refused.
+    keep_one = _plan({0: {0}, 1: {0}})
+    keep_one.gate = {
+        "passed": True,
+        "ratio": 1.0,
+        "drop_digest": drop_set_digest(keep_two),  # stale
+    }
+    with pytest.raises(RuntimeError, match="different drop-set"):
+        apply_plan(keep_one, str(source), str(tmp_path / "out_bad"))
+
+
+def test_manifest_records_provenance_for_reproducibility(tmp_path):
+    source = tmp_path / "src"
+    _make_checkpoint(source)
+    manifest = apply_plan(
+        _plan({0: {0, 1}, 1: {0, 1}}), str(source), str(tmp_path / "out")
+    )
+    fp = manifest["source_fingerprint"]
+    assert fp["sha256"] and fp["shards"], "the source must be fingerprinted"
+    # A different checkpoint yields a different fingerprint.
+    other = tmp_path / "src2"
+    _make_checkpoint(other, num_experts=NUM_EXPERTS)
+    (other / "config.json").write_text('{"num_experts": 8, "changed": true}')
+    from vllm_moe_surgeon.surgery.apply import source_fingerprint
+
+    assert source_fingerprint(str(other))["sha256"] != fp["sha256"]
+    env = manifest["environment"]
+    assert "python" in env and "platform" in env
+
+
+def test_skip_gate_stamps_the_manifest_unmeasured(tmp_path):
+    source = tmp_path / "src"
+    _make_checkpoint(source)
+    plan = _plan({0: {0, 1}, 1: {0, 1}})
+    plan.gate = None  # never measured
+    manifest = apply_plan(
+        plan, str(source), str(tmp_path / "out"), require_gate=False
+    )
+    assert manifest["gate_skipped"] is True
+    assert "WITHOUT a passing quality gate" in manifest["gate_note"]
+
+
+def test_apply_refuses_a_plan_that_misses_a_moe_layer(tmp_path):
+    """The hand-edit trap: a plan covering only some MoE layers, applied with drops,
+    writes a pruned config while the uncovered layer stays at full width."""
+    source = tmp_path / "src"
+    out = tmp_path / "out"
+    _make_checkpoint(source)  # NUM_LAYERS MoE layers
+    # Only layer 0 is covered, and it deletes experts.
+    with pytest.raises(ValueError, match="does not cover MoE layer"):
+        apply_plan(_plan({0: {1, 3, 5}}), str(source), str(out))
+
+
+def test_apply_refuses_to_write_into_the_source(tmp_path):
+    """In-place surgery overwrites the checkpoint mid-read; refuse before writing."""
+    source = tmp_path / "src"
+    _make_checkpoint(source)
+    before = sorted(p.name for p in source.iterdir())
+
+    with pytest.raises(RuntimeError, match="in-place surgery"):
+        apply_plan(_plan({0: {0, 1}, 1: {0, 1}}), str(source), str(source))
+    # A nested out is refused too, and nothing was written either way.
+    with pytest.raises(RuntimeError, match="in-place surgery"):
+        apply_plan(_plan({0: {0, 1}, 1: {0, 1}}), str(source), str(source / "out"))
+    assert sorted(p.name for p in source.iterdir()) == before
 
 
 def test_router_rows_follow_the_expert_renumbering(tmp_path):

@@ -152,8 +152,38 @@ def main() -> int:
             for target in appeared:
                 print(f"  {target}")
         print("\n? = optional seam")
+        _print_semantic_caveat()
 
     return 1 if broke else 0
+
+
+#: Behavioural couplings a name-and-signature diff cannot see. A seam can hold on
+#: both refs while the *meaning* behind it changed; these are where that has
+#: bitten, or plausibly could, so a green run is not a promise the upgrade is safe.
+SEMANTIC_RISK = (
+    ("CustomOp.register_oot",
+     "keyed by the class name via CustomOp.__new__; a change to that lookup "
+     "no-ops the substitution silently, with matching tokens"),
+    ("UnquantizedFusedMoEMethod.process_weights_after_loading",
+     "vLLM wraps it in device_loading_context, which hoists cpu-typed params to "
+     "the device; a change to that hoist changes the tier's memory behaviour "
+     "without touching the name"),
+    ("MemorySnapshot.measure",
+     "substitutes psutil availability for cudaMemGetInfo on integrated GPUs; the "
+     "feasibility numbers depend on that behaviour, not a symbol"),
+)
+
+
+def _print_semantic_caveat() -> None:
+    print(
+        "\nNOTE: this tool checks symbol PRESENCE and SIGNATURE, not behaviour. A "
+        "seam can\n"
+        "hold on both refs while its meaning drifts. Known behavioural couplings "
+        "no diff\n"
+        "here can see (review these by hand on a bump):"
+    )
+    for name, risk in SEMANTIC_RISK:
+        print(f"  - {name}: {risk}")
 
 
 if __name__ == "__main__":

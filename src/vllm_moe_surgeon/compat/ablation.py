@@ -226,8 +226,12 @@ def run_study(
     )
 
     for name, spec in arms:
-        stats = llm.collective_rpc(zero_experts, args=(spec,))[0]
+        # zero_experts is inside the try so a failure partway through the zero pass
+        # (an out-of-range id, an OOM cloning a row, a KeyboardInterrupt) still runs
+        # restore in the finally. Otherwise the worker-global backup keeps rows nobody
+        # replays, and the next arm inherits stale damage.
         try:
+            stats = llm.collective_rpc(zero_experts, args=(spec,))[0]
             nll, tokens = measure_nll(llm, prompts)
             study.arms.append(
                 AblationResult(name, nll, tokens, stats["experts_zeroed"])
@@ -344,6 +348,14 @@ def gate_plan(
         else ""
     )
 
+    # Bind the verdict to the exact drop-set and corpus it measured, so a plan
+    # edited after gating cannot be applied under a stale pass. Imported lazily to
+    # keep this module free of a hard surgery dependency at import time.
+    from ..surgery.plan import drop_set_digest
+
+    digest = drop_set_digest(plan)
+    corpus_id = _corpus_fingerprint(prompts)
+
     if not dropped:
         return {
             "passed": True,
@@ -353,6 +365,8 @@ def gate_plan(
             "ratio": 1.0,
             "max_ratio": max_ratio,
             "merges_not_gated": merged,
+            "drop_digest": digest,
+            "corpus": corpus_id,
         }
 
     study = run_study(
@@ -392,7 +406,20 @@ def gate_plan(
         "experts_zeroed": arm.experts_zeroed,
         "method": "zeroed weights, router held fixed (pessimistic vs deletion)",
         "merges_not_gated": merged,
+        "drop_digest": digest,
+        "corpus": corpus_id,
     }
     if note:
         verdict["note"] = note
     return verdict
+
+
+def _corpus_fingerprint(prompts: Sequence[str]) -> dict[str, Any]:
+    """Enough to notice the held-out corpus changed under a reused verdict."""
+    import hashlib
+
+    joined = "\x00".join(prompts).encode()
+    return {
+        "n_prompts": len(prompts),
+        "sha256": hashlib.sha256(joined).hexdigest()[:16],
+    }

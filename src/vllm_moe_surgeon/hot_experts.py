@@ -129,7 +129,12 @@ def load(path: str) -> HotExperts:
     )
 
 
-def from_plan(plan: Any, *, scale: float = DEFAULT_SCALE) -> HotExperts:
+def from_plan(
+    plan: Any,
+    *,
+    scale: float = DEFAULT_SCALE,
+    remap: dict[int, dict[int, int]] | None = None,
+) -> HotExperts:
     """Derive residency hints from a plan.
 
     The prior is the expert's per-layer **importance** share times ``scale`` --
@@ -140,8 +145,17 @@ def from_plan(plan: Any, *, scale: float = DEFAULT_SCALE) -> HotExperts:
     Share rather than rank, because taking 20% of a layer's importance should count
     for more than placing third in an almost-flat distribution.
 
-    Falls back to the raw token share when a plan predates the importance field,
-    so an old plan still produces a usable (if worse-ranked) prior.
+    Falls back to the raw token share only when a plan predates the importance field
+    entirely (every share zero), decided **per plan** rather than per placement: in a
+    modern plan a legitimate rank-1 share of exactly 0.0 -- an expert selected often
+    but never at the first slot, precisely the kind the rank-1 ranking exists to
+    demote -- must stay 0.0, not fall back to the raw token share and outrank a
+    genuine contributor.
+
+    Ids are the plan's, i.e. the **pre-surgery** checkpoint's. Tiering the *applied*
+    (pruned) checkpoint renumbers survivors to 0..K-1, so pass ``remap`` (layer ->
+    {old id: new id}, from the surgeon manifest) to key the priors in that new id
+    space; deleted experts are then dropped from the hint.
 
     Experts the plan deletes get no entry -- they will not exist to be resident.
     Experts placed on disk get a share-proportional prior too, just a small one,
@@ -150,14 +164,24 @@ def from_plan(plan: Any, *, scale: float = DEFAULT_SCALE) -> HotExperts:
     priors: dict[int, dict[int, float]] = {}
     core: dict[int, list[int]] = {}
 
+    has_importance = any(
+        p.importance_share for p in plan.placements if p.action != "drop"
+    )
+
     for placement in plan.placements:
         if placement.action == "drop":
             continue
+        expert_id = placement.expert
+        if remap is not None:
+            layer_remap = remap.get(placement.layer, {})
+            if placement.expert not in layer_remap:
+                continue  # renumbered away (deleted); not resident in the artifact
+            expert_id = layer_remap[placement.expert]
         layer_priors = priors.setdefault(placement.layer, {})
-        weight = getattr(placement, "importance_share", 0.0) or placement.share
-        layer_priors[placement.expert] = float(weight) * scale
+        weight = placement.importance_share if has_importance else placement.share
+        layer_priors[expert_id] = float(weight) * scale
         if placement.action == "merge_into_core":
-            core.setdefault(placement.layer, []).append(placement.expert)
+            core.setdefault(placement.layer, []).append(expert_id)
 
     for layer, ids in core.items():
         ids.sort(key=lambda e: -priors[layer][e])
