@@ -108,18 +108,59 @@ def test_commands_are_recognised_and_typos_are_not_prompts():
     assert handle_command("hello") is None
 
 
-def test_collecting_stats_never_takes_the_session_down():
-    """The counters are a nicety; the conversation is not. An engine whose internals
-    moved must cost the stats line, not the turn."""
+def test_unreadable_counters_are_unknown_not_untiered():
+    """The counters are a nicety; the conversation is not. But "could not read" and
+    "no layer holds a provider" are different statements -- one is a broken probe,
+    the other an untiered run -- and returning the same value for both made the
+    boot line lie about an active tier."""
 
     class _Hostile:
         def collective_rpc(self, _fn):
             raise RuntimeError("model_runner moved")
 
-    assert collect(_Hostile()) == TierStats()
+    assert collect(_Hostile()) is None
 
     class _Untiered:
         def collective_rpc(self, _fn):
             return [[]]
 
-    assert collect(_Untiered()).layers == 0
+    stats = collect(_Untiered())
+    assert stats is not None and stats.layers == 0
+
+
+def test_collect_reads_the_real_worker_shape():
+    """The production closure walks worker.model_runner.model.modules() and reads
+    five counter attributes off _surgeon_provider. Every other test replaces
+    collective_rpc wholesale, so this is the one that fails if that closure body
+    drifts from the provider's actual attribute names."""
+
+    class _Provider:
+        hits, misses, ram_hits, ram_misses, n_disk_bytes = 7, 3, 9, 1, 5 << 20
+
+    class _MoEModule:
+        _surgeon_provider = _Provider()
+
+    class _Plain:
+        pass
+
+    class _Model:
+        def modules(self):
+            return [_Plain(), _MoEModule(), _Plain(), _MoEModule()]
+
+    class _Runner:
+        model = _Model()
+
+    class _Worker:
+        model_runner = _Runner()
+
+    class _LLM:
+        def collective_rpc(self, fn):
+            # Deliver the closure to a worker-shaped object, as the engine would.
+            return [fn(_Worker())]
+
+    stats = collect(_LLM())
+    assert stats is not None
+    assert stats.layers == 2
+    assert stats.hits == 14 and stats.misses == 6
+    assert stats.ram_hits == 18 and stats.ram_misses == 2
+    assert stats.disk_bytes == 10 << 20

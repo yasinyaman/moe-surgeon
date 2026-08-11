@@ -22,6 +22,11 @@ sizing rules, and the two would drift.
 
 from __future__ import annotations
 
+try:  # arrow keys and history for input(); not present on every platform
+    import readline  # noqa: F401
+except ImportError:
+    pass
+
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,8 +78,14 @@ class TierStats:
         return self.hits / self.lookups if self.lookups else None
 
 
-def collect(llm: Any) -> TierStats:
-    """Sum the provider counters across every MoE layer. Never raises."""
+def collect(llm: Any) -> TierStats | None:
+    """Sum the provider counters across every MoE layer. Never raises.
+
+    ``None`` means the counters could not be read at all -- an engine whose
+    internals moved, or a boot the RPC cannot reach. That is a different
+    statement from "no layer holds a provider" (an untiered run), and the two
+    must not print the same line.
+    """
 
     def _read(worker):
         out = []
@@ -95,8 +106,8 @@ def collect(llm: Any) -> TierStats:
     try:
         rows = llm.collective_rpc(_read)[0]
     except Exception as exc:  # pragma: no cover - engine internals moved
-        logger.debug("could not read the tier counters: %s", exc)
-        return TierStats()
+        logger.warning("could not read the tier counters: %s", exc)
+        return None
     if not rows:
         return TierStats()
     return TierStats(
@@ -177,6 +188,24 @@ def handle_command(line: str) -> str | None:
     return known.get(name, "unknown")
 
 
+def _no_chat_template() -> type[BaseException]:
+    """The exception ``llm.chat`` raises when the model has no chat template.
+
+    Imported per vLLM version: where the dedicated class exists it is caught by
+    name, and where it does not, vLLM raises a ``ValueError`` for this case --
+    which is still far narrower than the bare ``Exception`` this replaced, under
+    which a CUDA OOM was "no chat template" and got silently re-run.
+    """
+    try:
+        from vllm.entrypoints.chat_utils import (
+            ChatTemplateResolutionError,
+        )
+
+        return ChatTemplateResolutionError
+    except ImportError:
+        return ValueError
+
+
 def run(
     model: str,
     *,
@@ -186,6 +215,15 @@ def run(
     llm_kwargs: dict[str, Any] | None = None,
 ) -> int:
     """Boot the engine and read prompts until told to stop."""
+    import os
+
+    # The counters are read with a collective_rpc *callable*, which cannot cross
+    # the default multiprocess engine's serialization boundary -- on a stock boot
+    # every read would fail and the REPL's whole point would be silently dead.
+    # In-process is the configuration every measurement in this project used.
+    # setdefault, so an explicit user override still wins.
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
     from vllm import LLM, SamplingParams
 
     kwargs = dict(llm_kwargs or {})
@@ -195,7 +233,11 @@ def run(
     print(f"loading {model} ...")
     llm = LLM(model=model, **kwargs)
     baseline = collect(llm)
-    if baseline.layers:
+    if baseline is None:
+        print("tier status unknown -- could not read the provider counters. "
+              "/help for commands.")
+        baseline = TierStats()
+    elif baseline.layers:
         print(f"tier active on {baseline.layers} MoE layers. /help for commands.")
     else:
         print("tier NOT active -- no layer holds a provider. /help for commands.")
@@ -220,7 +262,11 @@ def run(
             print(HELP, end="")
             continue
         if action == "stats":
-            print(format_session(collect(llm) - session_start))
+            now = collect(llm)
+            if now is None:
+                print("  tier counters unreadable this session")
+            else:
+                print(format_session(now - session_start))
             continue
         if action == "config":
             print(f"  {surgeon or 'no tier: serving untiered'}")
@@ -238,22 +284,49 @@ def run(
         import time
 
         started = time.perf_counter()
+        chatted = True
         try:
-            outputs = llm.chat(messages, sampling)
-        except Exception:
-            # No chat template, or chat unavailable: fall back to the raw prompt so
-            # a base model still works, and say so rather than failing the turn.
-            print("  (no chat template; sending the prompt raw)")
-            outputs = llm.generate([line], sampling)
+            try:
+                outputs = llm.chat(messages, sampling)
+            except _no_chat_template():
+                # A base model without a chat template: fall back to the raw
+                # prompt. ONLY that case -- an engine fault (OOM, a dead engine)
+                # must propagate with its real message, not be misdiagnosed as a
+                # template problem and silently re-run.
+                print(
+                    "  (no chat template; sending this prompt raw -- previous "
+                    "turns are not included)"
+                )
+                outputs = llm.generate([line], sampling)
+                chatted = False
+        except KeyboardInterrupt:
+            # Ctrl-C mid-generation. The engine's state after an interrupted
+            # forward is not something to keep typing into; end the session with
+            # the summary rather than pretend the turn can resume.
+            print("\n  interrupted; ending the session")
+            messages.pop()
+            break
         elapsed = time.perf_counter() - started
 
         completion = outputs[0].outputs[0]
         text = completion.text.strip()
         print(text)
-        messages.append({"role": "assistant", "content": text})
-        print(
-            format_turn(collect(llm) - before, len(completion.token_ids), elapsed)
-        )
+        if chatted:
+            messages.append({"role": "assistant", "content": text})
+        else:
+            # The raw path transmitted only this line: recording a fictional
+            # exchange would make the NEXT chat() turn claim context the model
+            # never saw.
+            messages.pop()
+        after = collect(llm)
+        if after is not None and before is not None:
+            print(
+                format_turn(after - before, len(completion.token_ids), elapsed)
+            )
+        else:
+            print(format_turn(TierStats(), len(completion.token_ids), elapsed))
 
-    print(format_session(collect(llm) - session_start))
+    final = collect(llm)
+    if final is not None:
+        print(format_session(final - session_start))
     return 0

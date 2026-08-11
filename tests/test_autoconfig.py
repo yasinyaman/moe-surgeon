@@ -188,10 +188,77 @@ def test_the_emitted_config_is_what_the_runtime_reads(checkpoint):
 
 def test_an_unmeasurable_resource_is_named_not_defaulted_to_zero(monkeypatch):
     """A probe that silently reports zero would size the tier for a machine with no
-    memory. The caller has to be able to tell "measured small" from "unknown"."""
+    memory. The caller has to be able to tell "measured small" from "unknown".
+
+    Forced rather than assumed: the first version asserted "no CUDA here", which is
+    true on the laptop and false on the GPU box, so the test failed on exactly the
+    machine most worth running it on."""
+    import torch
+
     from vllm_moe_surgeon.surgery import autoconfig
 
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     env = autoconfig.probe("/nonexistent-path-for-probe")
-    # No CUDA in the offline test environment, so VRAM is the unknown one.
     assert env.vram_gib == 0.0
     assert any("vram" in u for u in env.unknown)
+
+
+def test_an_existing_store_is_not_counted_against_free_disk(tmp_path, checkpoint):
+    """The second-boot trap. The store's own bytes reduce statvfs free space, so a
+    probe that reads free space naively concludes after every build that the store
+    no longer fits -- and either refuses or silently flips to fp8, which rebuilds
+    the store slower and no longer bit-exact. probe() must credit the store's bytes
+    back, so "can the store live here" gets the same answer on every boot."""
+    from vllm_moe_surgeon.surgery.autoconfig import probe
+
+    store = tmp_path / "store"
+    store.mkdir()
+    empty = probe(str(store)).disk_free_gib
+
+    (store / "layer0.experts").write_bytes(b"\0" * (64 << 20))
+    populated = probe(str(store)).disk_free_gib
+
+    # Within a rounding error, the 64 MiB inside the store came back as "free".
+    assert abs(populated - empty) < 0.01
+
+
+def test_the_recipe_carries_the_batch_bound_it_was_sized_for(checkpoint):
+    """Capacity covers the union a batch of max_num_seqs can reach. A boot that
+    does not enforce that bound can route to more experts than there are slots
+    right after the tool printed "no step should have to re-fetch" -- so the bound
+    is part of the recipe, not an annotation."""
+    config = autoconfigure(checkpoint, store_dir="/s", vram_gib=8.0, max_num_seqs=4)
+    argv = config.serve_args("m")
+    assert "--max-num-seqs" in argv
+    assert argv[argv.index("--max-num-seqs") + 1] == "4"
+
+
+def test_fp8_is_never_reached_for_on_a_one_byte_checkpoint():
+    """On an already-1-byte checkpoint the fp8 record is *larger* -- it adds row
+    scales to the same payload -- so flipping to it under pressure approves a store
+    that fits even less than the one just measured not to."""
+    g = _olmoe_geometry()
+    g.checkpoint_dtype_bytes = 1
+    g.serving_dtype_bytes = 1
+    assert g.record_bytes(fp8=True) >= g.record_bytes(fp8=False)
+
+    store_gib = (
+        g.num_moe_layers * g.num_experts * g.record_bytes(fp8=False) / 1024**3
+    )
+    # Disk pressure that the old "assume fp8 halves it" logic would have accepted.
+    with pytest.raises(ValueError, match="does not fit|is free at"):
+        decide(
+            g,
+            _env(vram=40.0, ram=512.0, disk=store_gib * 0.6),
+            store_dir="/s",
+        )
+
+    # RAM pressure: the fallback must size with the record that is actually
+    # smaller, and must not claim "even in fp8" when fp8 was never applicable.
+    tight = decide(
+        g,
+        _env(vram=40.0, ram=store_gib, disk=500.0),
+        store_dir="/s",
+    )
+    assert "fp8_store" not in tight.surgeon
+    assert not any("even in fp8" in w for w in tight.warnings)

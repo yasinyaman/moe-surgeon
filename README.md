@@ -94,7 +94,7 @@ turn says what the tier cost.
 ```
 >>> explain a b-tree in two sentences
 A B-tree is a self-balancing search tree ...
-  [128 tok, 142.2 tok/s, cache 89% (712/800), disk 6 MiB]
+  [128 tok, 142.2 tok/s, cache 93% (15302/16384)]
 ```
 
 `/stats` summarises the session, and names a misconfiguration when the counters show
@@ -125,10 +125,10 @@ probed (13c48f4333d97fc8): NVIDIA GB10, 41.2 GiB free VRAM, 122 GiB host RAM, 18
 
   - a batch of 8 at top_k=8 can route to at most 64 experts per layer, so that is the capacity to aim for
   - memory fits 64 slots, at or above the bound, so capacity is 64 and no step should have to re-fetch
-  - host RAM holds all 64 experts (12.6 GiB), so nothing spills to disk in steady state
+  - host RAM holds all 64 experts (12.0 GiB), so nothing spills to disk in steady state
 
 serve with:
-  vllm serve /path/to/model --additional-config '{"surgeon": {"expert_cache_size": 64, "store_dir": "./store", "ram_cache": 64}}'
+  vllm serve /path/to/model --max-num-seqs 8 --additional-config '{"surgeon": {"expert_cache_size": 64, "store_dir": "./store", "ram_cache": 64}}'
 ```
 
 `--start` runs that command instead of printing it, and `--json` emits just the

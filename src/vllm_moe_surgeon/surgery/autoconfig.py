@@ -61,7 +61,7 @@ _BUCKET_GIB = 0.5
 
 #: Bumped when the decision logic changes, so a cached answer from older logic is
 #: not served for a machine that would now be configured differently.
-_LOGIC_VERSION = 1
+_LOGIC_VERSION = 2
 
 
 def _bucket(gib: float) -> float:
@@ -117,7 +117,21 @@ def probe(store_dir: str) -> Environment:
                 break
             target = parent
         usage = os.statvfs(target or ".")
-        env.disk_free_gib = usage.f_bavail * usage.f_frsize / 1024**3
+        free = usage.f_bavail * usage.f_frsize
+        # Credit the bytes already inside the store back to "free": the question
+        # decide() asks is "can the store live here", and the answer must not change
+        # once the store exists. Without this, the second boot measured a disk
+        # exactly one store smaller, concluded the store did not fit, and silently
+        # flipped to fp8 -- which rebuilds the store it was worried about, slower
+        # and no longer bit-exact.
+        if os.path.isdir(store_dir):
+            for root, _dirs, files in os.walk(store_dir):
+                for name in files:
+                    try:
+                        free += os.path.getsize(os.path.join(root, name))
+                    except OSError:
+                        pass
+        env.disk_free_gib = free / 1024**3
     except Exception as exc:  # pragma: no cover - non-POSIX
         env.unknown.append(f"disk ({type(exc).__name__})")
 
@@ -136,6 +150,11 @@ class AutoConfig:
     warnings: list[str] = field(default_factory=list)
     fingerprint: str = ""
     cached: bool = False
+    #: The serving batch the capacity was sized for. Part of the recipe, not an
+    #: annotation: capacity covers the union a batch of this size can reach, so a
+    #: boot that does not enforce the same bound can route to more experts than
+    #: there are slots while the tool has just said no step should re-fetch.
+    max_num_seqs: int = 8
 
     def serve_args(self, model: str) -> list[str]:
         """The `vllm serve` argv this configuration corresponds to."""
@@ -143,6 +162,8 @@ class AutoConfig:
             "vllm",
             "serve",
             model,
+            "--max-num-seqs",
+            str(self.max_num_seqs),
             "--additional-config",
             json.dumps({"surgeon": self.surgeon}),
         ]
@@ -286,7 +307,10 @@ def decide(
             f"({ram_bytes_bf16 / 1024**3:.1f} GiB), so nothing spills to disk in "
             "steady state"
         )
-    elif layers * want_ram * record_fp8 <= ram_budget_gib * 1024**3:
+    elif (
+        record_fp8 < record_bf16
+        and layers * want_ram * record_fp8 <= ram_budget_gib * 1024**3
+    ):
         ram_cache = want_ram
         fp8 = True
         why.append(
@@ -295,24 +319,38 @@ def decide(
             "worth making when the alternative is reading disk on every eviction"
         )
     else:
+        # fp8 shrinks a record only when the checkpoint is wider than one byte --
+        # on an already-1-byte checkpoint the fp8 record is *larger* (it adds row
+        # scales to the same payload), so reaching for it under pressure would
+        # approve a store that fits even less than the one just measured not to.
+        fp8 = record_fp8 < record_bf16
+        record_small = record_fp8 if fp8 else record_bf16
         ram_cache = max(
             capacity,
-            int(ram_budget_gib * 1024**3 / max(1, layers * record_fp8)),
+            int(ram_budget_gib * 1024**3 / max(1, layers * record_small)),
         )
-        fp8 = True
         warnings.append(
-            f"host RAM holds only {ram_cache} of {geometry.num_experts} experts even "
-            "in fp8, so evictions will read disk; decode will be slower and more "
-            "variable than the numbers in DECISIONS.md"
+            f"host RAM holds only {ram_cache} of {geometry.num_experts} experts"
+            f"{' even in fp8' if fp8 else ''}, so evictions will read disk; decode "
+            "will be slower and more variable than the numbers in DECISIONS.md"
         )
 
     store_bytes = layers * geometry.num_experts * (record_fp8 if fp8 else record_bf16)
     if env.disk_free_gib and store_bytes > env.disk_free_gib * 1024**3:
-        if not fp8 and store_bytes / 2 <= env.disk_free_gib * 1024**3:
+        store_fp8 = layers * geometry.num_experts * record_fp8
+        # Gate on the real fp8 store size, not an assumed halving: on a 1-byte
+        # checkpoint the fp8 record is larger, and "assume half" would approve a
+        # store the build then runs out of disk writing.
+        if (
+            not fp8
+            and record_fp8 < record_bf16
+            and store_fp8 <= env.disk_free_gib * 1024**3
+        ):
             fp8 = True
             why.append(
-                f"the bf16 store needs {store_bytes / 1024**3:.1f} GiB and "
-                f"{env.disk_free_gib:.1f} GiB is free, so fp8_store is on to halve it"
+                f"the full-width store needs {store_bytes / 1024**3:.1f} GiB and "
+                f"{env.disk_free_gib:.1f} GiB is free, so fp8_store is on: its store "
+                f"is {store_fp8 / 1024**3:.1f} GiB"
             )
         else:
             raise ValueError(
@@ -336,7 +374,11 @@ def decide(
         )
 
     return AutoConfig(
-        surgeon=surgeon, environment=env, why=why, warnings=warnings
+        surgeon=surgeon,
+        environment=env,
+        why=why,
+        warnings=warnings,
+        max_num_seqs=max_num_seqs,
     )
 
 

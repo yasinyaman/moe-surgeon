@@ -200,6 +200,8 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    from safetensors import SafetensorError
+
     from .compat.repl import run
     from .surgery.autoconfig import autoconfigure
 
@@ -214,10 +216,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 kv_reserve_gib=args.kv_reserve,
                 vram_gib=args.vram,
             )
-        except (ValueError, OSError) as exc:
-            # A bare repo id has no headers to read, and a machine that cannot fit
-            # the tier is a real answer. Either way, say which and offer the way out
-            # rather than failing with a stack trace.
+        except (ValueError, OSError, SafetensorError) as exc:
+            # A bare repo id has no headers to read, a corrupt shard raises from
+            # safetensors, and a machine that cannot fit the tier is a real answer.
+            # Say which and offer the way out rather than failing with a stack
+            # trace.
             print(f"could not size the tier: {exc}", file=sys.stderr)
             print(
                 "pass --checkpoint <local dir> to size it, or --no-tier to serve "
@@ -234,10 +237,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
         surgeon=surgeon,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        # The capacity above was sized for this batch bound; boot with the same
+        # bound or the engine can route to more experts than there are slots
+        # right after the tool said no step should have to re-fetch.
+        llm_kwargs={"max_num_seqs": args.max_num_seqs} if surgeon else None,
     )
 
 
 def _cmd_autoconfig(args: argparse.Namespace) -> int:
+    from safetensors import SafetensorError
+
     from .surgery.autoconfig import autoconfigure
 
     try:
@@ -249,9 +258,10 @@ def _cmd_autoconfig(args: argparse.Namespace) -> int:
             vram_gib=args.vram,
             refresh=args.refresh,
         )
-    except ValueError as exc:
-        # "this will not fit" is an answer, not a crash. The message already names
-        # the numbers and what to change, so a traceback only buries it.
+    except (ValueError, OSError, SafetensorError) as exc:
+        # "this will not fit" is an answer, not a crash -- and so are a mistyped
+        # checkpoint path and a corrupt shard. The message names the problem, so a
+        # traceback only buries it.
         print(f"cannot configure the tier here: {exc}", file=sys.stderr)
         return 2
 
