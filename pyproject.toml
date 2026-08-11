@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 # Deliberately minimal. The offline surgery pipeline must stay importable
-# without vLLM installed -- see the layering rule in README.md. vLLM is an extra.
+# without vLLM installed -- see docs/architecture.md. vLLM is an extra.
 dependencies = [
     "torch",
     "safetensors",
