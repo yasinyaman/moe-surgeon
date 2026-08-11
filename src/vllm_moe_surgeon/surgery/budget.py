@@ -304,17 +304,44 @@ class TierPlan:
     #: Resident share of the routed experts.
     resident_fraction: float
 
-    def env(self, store_dir: str = "<store>") -> list[str]:
-        """The environment this plan corresponds to."""
-        lines = [
-            f"VLLM_MOE_DISK_STORE_DIR={store_dir}",
-            f"VLLM_MOE_RAM_CACHE={self.ram_capacity}",
-        ]
+    def serve_config(self, store_dir: str = "./store") -> dict:
+        """The ``additional_config['surgeon']`` this plan corresponds to."""
+        cfg: dict = {
+            "expert_cache_size": self.capacity,
+            "store_dir": store_dir,
+            "ram_cache": self.ram_capacity,
+        }
         if self.fp8_store:
-            lines.append("VLLM_MOE_DISK_STORE_FP8=1")
-        lines.append(f"--moe-expert-cache-size {self.capacity}")
+            cfg["fp8_store"] = True
         if self.needs_expert_split:
-            lines.append("--moe-expert-cache-split expert   # capacity < top_k")
+            cfg["split"] = "expert"
+        return cfg
+
+    def env(self, store_dir: str = "./store") -> list[str]:
+        """How to serve this plan, as lines to paste.
+
+        This package is the **out-of-tree** tier, activated through
+        ``--additional-config``, so that is what this prints. It used to print the
+        in-tree fork's environment variables and ``--moe-expert-cache-size`` instead --
+        flags that do not exist in stock vLLM, so anyone who pip-installed this and
+        followed the advice got an argument error. The in-tree recipe is kept below the
+        fold for whoever is running the fork, clearly labelled as the other thing.
+        """
+        import json
+
+        cfg = json.dumps({"surgeon": self.serve_config(store_dir)})
+        lines = [f"--additional-config '{cfg}'"]
+        if self.needs_expert_split:
+            lines.append('# split="expert" because capacity < top_k')
+        lines.append("")
+        lines.append("# the in-tree fork instead uses:")
+        lines.append(f"#   VLLM_MOE_DISK_STORE_DIR={store_dir}")
+        lines.append(f"#   VLLM_MOE_RAM_CACHE={self.ram_capacity}")
+        if self.fp8_store:
+            lines.append("#   VLLM_MOE_DISK_STORE_FP8=1")
+        lines.append(f"#   --moe-expert-cache-size {self.capacity}")
+        if self.needs_expert_split:
+            lines.append("#   --moe-expert-cache-split expert")
         return lines
 
 

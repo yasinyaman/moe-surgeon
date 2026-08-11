@@ -435,3 +435,53 @@ def test_report_calls_fp8_store_a_space_mechanism_only_when_it_is_on(tmp_path):
     off = report(g, vram_gib=1.0, kv_cache_gib=0.0, fp8_store=False)
     assert "SPACE mechanism" in on
     assert "SPACE mechanism" not in off
+
+
+def test_the_printed_recipe_activates_this_package_not_the_fork():
+    """The recipe has to work for whoever installed *this*.
+
+    `env()` used to print the in-tree fork's environment variables and
+    `--moe-expert-cache-size` — flags stock vLLM does not have, so a reader who
+    pip-installed this package and pasted them got an argument error. This package is
+    activated through `additional_config`, so that is what leads; the fork's recipe
+    stays, commented, for whoever is running the fork.
+    """
+    from vllm_moe_surgeon.surgery.budget import TierPlan
+
+    plan = TierPlan(
+        capacity=7, ram_capacity=14, fp8_store=True, gpu_bytes=0, host_ram_bytes=0,
+        disk_bytes=0, needs_expert_split=True, resident_fraction=0.11,
+    )
+    lines = plan.env("./store")
+    assert lines[0].startswith("--additional-config")
+    assert "surgeon" in lines[0]
+    # The fork's flags must not be presented as something to run.
+    for line in lines:
+        if "moe-expert-cache-size" in line or "VLLM_MOE_DISK_STORE_DIR" in line:
+            assert line.lstrip().startswith("#"), f"fork recipe not commented: {line}"
+
+
+def test_the_serve_config_round_trips_to_what_the_runtime_reads():
+    """The dict the report prints must be the dict `read_config` accepts, or the
+    advice is a suggestion rather than a recipe."""
+    import json
+
+    from vllm_moe_surgeon.compat.runtime import read_config_from
+    from vllm_moe_surgeon.surgery.budget import TierPlan
+
+    plan = TierPlan(
+        capacity=24, ram_capacity=64, fp8_store=True, gpu_bytes=0, host_ram_bytes=0,
+        disk_bytes=0, needs_expert_split=False, resident_fraction=0.375,
+    )
+
+    class _Cfg:
+        additional_config = {"surgeon": plan.serve_config("/tmp/store")}
+
+    config = read_config_from(_Cfg())
+    assert config.expert_cache_size == 24
+    assert config.ram_cache == 64
+    assert config.store_dir == "/tmp/store"
+    assert config.fp8_store is True
+    assert config.enabled and config.use_disk
+    # And it survives the JSON round trip the command line puts it through.
+    assert json.loads(json.dumps(plan.serve_config()))["expert_cache_size"] == 24
