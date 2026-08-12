@@ -349,6 +349,51 @@ hash the tokens against untiered, and the ceiling can move.
 `.github/workflows/vllm-compat.yml` now asks the question weekly and on demand, and
 opens an issue naming the symbol when the answer changes.
 
+## Narrow-domain pruning, measured on real logs (2026-08-12)
+
+The recurring question — "surely a deployment that only ever analyses logs can
+delete experts?" — was answered on real data (LogHub-style corpora: Linux + SSH +
+Apache as the domain, task-shaped triage prompts, held-out lines from the same
+files, Windows + HealthApp as the out-of-domain probe). Full pipeline: profile →
+plan → gate → apply → calibrate, all on GB10.
+
+| configuration | held-out log ppl | vs baseline |
+|---|---|---|
+| baseline, 64 experts | 27.89 | 1.000× |
+| tier, nothing deleted | 27.89 | 1.000× |
+| keep-56 applied (the near-dead tail deleted) | 30.64 | 1.099× |
+| keep-40, zeroed gate bound | 33.26 | 1.192× |
+| keep-40 applied, **no amplitude** | 41.00 | **1.470×** |
+| **keep-40 applied + amplitude 0.850** | **32.53** | **1.166×** |
+
+Three findings worth keeping:
+
+- **A narrow domain does concentrate routing — but less than intuition says.** For
+  the first time a near-dead tail exists (median 7 experts/layer under 10% of
+  uniform; the coldest at ~0.00×), the hot quartile carries 69% (gsm8k: 52%), and
+  deleting 24/64 costs 1.17× against gsm8k's 1.25× at the same depth. Cheaper,
+  not free — and the hot sets still overlap gsm8k's at 56% (random: 37.5%), so
+  even logs share the model's core experts.
+- **The zeroed gate is NOT always a pessimistic bound.** On gsm8k, applied
+  deletion beat zeroing (15.26 vs 16.90); on logs it was far *worse* (41.00 vs
+  33.26) until the amplitude fix, which recovered it to 32.53 — below the bound
+  again. Mechanism: deletion shrinks the softmax to the survivors and inflates
+  their gates by 1/(1−P_D); the log domain concentrates more deleted mass into
+  fewer layers, so the inflation bites harder than zeroing's discarded mass.
+  Verified in a clean process before being believed, and the single 0.850
+  multiply recovered 80% of the gap. **For narrow-domain pruning, `calibrate` is
+  mandatory, not optional** — and a gate verdict on a plan that will be applied
+  without amplitude understates the damage on domains like this one.
+- **Within the log universe there is no distribution cliff**: the same keep-40
+  plan gated 1.16× on out-of-domain logs against 1.19× in-domain — unlike the
+  gsm8k → hellaswag case (1.404× vs 1.234×). Log families share structure;
+  task families do not.
+
+The tier-first default earned its keep along the way: `plan` without
+`--disk-experts 0` placed the cold tail on disk instead of deleting it, and the
+gate answered "the plan deletes nothing". Deletion had to be asked for
+explicitly, which is the design.
+
 ## Stress campaign, 2026-08-12 (both machines, limits deliberately pushed)
 
 Nine scenarios on GB10 and four on the laptop, chosen to hit combinations nothing
