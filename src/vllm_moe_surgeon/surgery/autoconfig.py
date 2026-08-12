@@ -61,7 +61,7 @@ _BUCKET_GIB = 0.5
 
 #: Bumped when the decision logic changes, so a cached answer from older logic is
 #: not served for a machine that would now be configured differently.
-_LOGIC_VERSION = 2
+_LOGIC_VERSION = 3
 
 
 def _bucket(gib: float) -> float:
@@ -232,17 +232,41 @@ def save_cached(config: AutoConfig) -> None:
         logger.debug("could not cache the autoconfig: %s", exc)
 
 
+def resolve_kv_reserve(env: Environment, kv_reserve_gib: float | None) -> float:
+    """The KV reserve, scaled to the card unless the caller chose one.
+
+    A flat default is a decision about every machine at once, and 2.0 GiB was the
+    wrong decision for exactly the machines this package exists for: on a 3.5 GiB
+    laptop GPU it reserved over half the card for KV and strangled the expert
+    cache to one slot -- capacity 1 against a proven hand-tuned 4, below top_k,
+    forcing the non-bit-exact expert split for no reason. Measured live on that
+    laptop. Fifteen percent of free VRAM, clamped to [0.5, 2.0], keeps the old
+    behaviour on large cards and stops starving small ones.
+    """
+    if kv_reserve_gib is not None:
+        return kv_reserve_gib
+    if env.vram_gib <= 0:
+        return 2.0
+    return round(min(2.0, max(0.5, 0.15 * env.vram_gib)), 2)
+
+
 def decide(
     geometry: CheckpointGeometry,
     env: Environment,
     *,
     store_dir: str,
     max_num_seqs: int = 8,
-    kv_reserve_gib: float = 2.0,
+    kv_reserve_gib: float | None = None,
 ) -> AutoConfig:
     """Turn a machine and a checkpoint into a configuration, with reasons."""
     why: list[str] = []
     warnings: list[str] = []
+    resolved_kv = resolve_kv_reserve(env, kv_reserve_gib)
+    if kv_reserve_gib is None and env.vram_gib > 0:
+        why.append(
+            f"KV reserve scaled to the card: {resolved_kv} GiB "
+            f"(15% of {env.vram_gib:.1f} GiB free, clamped to [0.5, 2.0])"
+        )
 
     # The union the serving batch can reach, which is what capacity should cover.
     union_bound = min(geometry.num_experts, max_num_seqs * geometry.top_k)
@@ -263,11 +287,11 @@ def decide(
             geometry,
             int(env.vram_gib * 1024**3),
             fp8_store=False,
-            kv_cache_bytes=int(kv_reserve_gib * 1024**3),
+            kv_cache_bytes=int(resolved_kv * 1024**3),
         )
         if plan is None:
             raise ValueError(
-                f"{env.vram_gib:.1f} GiB free (minus {kv_reserve_gib} GiB reserved for "
+                f"{env.vram_gib:.1f} GiB free (minus {resolved_kv} GiB reserved for "
                 "KV) does not fit this model at any capacity >= 1. Free the device, "
                 "lower --kv-reserve, or serve a smaller checkpoint."
             )
@@ -387,7 +411,7 @@ def autoconfigure(
     *,
     store_dir: str = "./store",
     max_num_seqs: int = 8,
-    kv_reserve_gib: float = 2.0,
+    kv_reserve_gib: float | None = None,
     vram_gib: float | None = None,
     refresh: bool = False,
 ) -> AutoConfig:
@@ -408,7 +432,9 @@ def autoconfigure(
         checkpoint=checkpoint,
         store_dir=store_dir,
         max_num_seqs=max_num_seqs,
-        kv_reserve_gib=kv_reserve_gib,
+        # The resolved value, so "scaled default" and an explicit identical
+        # override share an identity, and a re-measured card re-decides.
+        kv_reserve_gib=resolve_kv_reserve(env, kv_reserve_gib),
     )
 
     if not refresh:

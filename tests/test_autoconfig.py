@@ -61,7 +61,11 @@ def _olmoe_geometry():
         routed_expert_bytes=expert_bytes * experts * layers,
         shared_expert_bytes=0,
         router_bytes=2 * hidden * experts * layers,
-        other_bytes=2 << 30,
+        # The real model's non-expert bytes, back-derived from the live laptop
+        # probe (cap 1 at 3.5 GiB free with a 2.0 GiB KV reserve implies fixed
+        # ~0.77 GiB). The first draft said 2 GiB, which made this fixture a
+        # different, heavier model than the one every number in it came from.
+        other_bytes=int(0.77 * (1 << 30)),
         checkpoint_dtype_bytes=2,
         serving_dtype_bytes=2,
     )
@@ -262,3 +266,28 @@ def test_fp8_is_never_reached_for_on_a_one_byte_checkpoint():
     )
     assert "fp8_store" not in tight.surgeon
     assert not any("even in fp8" in w for w in tight.warnings)
+
+
+def test_kv_reserve_scales_to_the_card_instead_of_starving_it():
+    """Measured live on the 3.5 GiB laptop this package targets: the flat 2.0 GiB
+    KV reserve consumed over half the card, strangled capacity to 1 -- against a
+    proven hand-tuned 4 -- and thereby forced the non-bit-exact expert split for
+    no reason. Scaled (15% of free VRAM, clamped to [0.5, 2.0]) the same card
+    affords a capacity at or above top_k, and the split is not needed at all."""
+    from vllm_moe_surgeon.surgery.autoconfig import resolve_kv_reserve
+
+    g = _olmoe_geometry()
+    laptop = _env(vram=3.5, ram=15.0, disk=780.0)
+
+    assert resolve_kv_reserve(laptop, None) == 0.53
+    assert resolve_kv_reserve(laptop, 2.0) == 2.0, "an explicit choice wins"
+    assert resolve_kv_reserve(_env(vram=40.0), None) == 2.0, "large cards keep 2.0"
+    assert resolve_kv_reserve(Environment(), None) == 2.0, "unmeasured stays safe"
+
+    scaled = decide(g, laptop, store_dir="/s")
+    assert scaled.surgeon["expert_cache_size"] >= g.top_k
+    assert "split" not in scaled.surgeon
+
+    flat = decide(g, laptop, store_dir="/s", kv_reserve_gib=2.0)
+    assert flat.surgeon["expert_cache_size"] < g.top_k
+    assert flat.surgeon.get("split") == "expert"

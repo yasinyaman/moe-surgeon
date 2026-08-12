@@ -349,6 +349,62 @@ hash the tokens against untiered, and the ceiling can move.
 `.github/workflows/vllm-compat.yml` now asks the question weekly and on demand, and
 opens an issue naming the symbol when the answer changes.
 
+## Stress campaign, 2026-08-12 (both machines, limits deliberately pushed)
+
+Nine scenarios on GB10 and four on the laptop, chosen to hit combinations nothing
+had ever run together and regimes nothing had measured. Token streams are compared
+by sha256 over every prompt's ids, one arm per process, greedy.
+
+**Combinations proven safe, first time run:**
+
+- **Zero-copy under piecewise CUDA graphs** is token-identical to the fill path
+  (same hash, 1024 tokens across 8 prompts) and decodes ~5% faster (131.0 vs
+  124.9 tok/s). The pairing had never been exercised; it is now a supported claim.
+- **fp8 checkpoints under graphs**: the eager pair is token-identical (tier vs
+  untiered, same hash over 192 tokens), so the tier remains transparent; the
+  graph arms diverge from eager and from each other, which is the same
+  graph-vs-eager float-reduction class measured on OLMoE (the tier's MoE op runs
+  eager between graph pieces, so its reduction environment differs from a fully
+  captured baseline). Attributed by running all four controls, not assumed.
+
+**Limits measured, first numbers:**
+
+- **The capacity lever grows with batch.** At batch 64 (per-layer union = the full
+  64), cap 48 → 64 is **291.3 → 943.9 tok/s (3.24×)** — larger than the 2.59×
+  at batch 8 — with identical token hashes, so capacity still changes only speed.
+  The oversubscription warning fired exactly once per layer at cap 48, which is
+  the scenario the old batch-32 threshold silenced.
+- **The expert split's cost is now empirical, not asserted**: deterministic
+  (hash-stable across repeats) but token-divergent from the unsplit reference,
+  at 40.9 vs 125.5 tok/s for cap 4 vs 48 on GB10.
+- **Sustained generation is stable**: 3 × 1024 tokens/prompt × 8 prompts, hash
+  identical across repeats, spread under 1%, resident set flat — no leak signal.
+- **On a severely bound device the capacity lever flattens**: the laptop serves
+  at 5.5 tok/s with 1 slot and 5.8 with 4 — the bottleneck there is the fp8
+  read+dequant path, not residency. Batching also inverts on tiny capacity:
+  4 prompts ran *slower* than 1 (5.8 vs 7.7 tok/s) because the union quadruples
+  against 4 slots and every layer splits into chunks.
+
+**Defects the campaign found, fixed in this commit:**
+
+- `autoconfig`'s flat 2.0 GiB KV reserve consumed over half of a 3.5 GiB card and
+  strangled capacity to 1 — below top_k, forcing the non-bit-exact expert split
+  against a proven hand-tuned 4. The reserve now scales (15% of free VRAM,
+  clamped to [0.5, 2.0]); re-probed live, the same card now decides capacity 9
+  with no split. An explicit --kv-reserve still wins.
+- `surgeon run` piped to another process delivered **zero output**: stdout is
+  block-buffered on a pipe and vLLM's exit teardown can end the interpreter
+  before the buffer flushes — the session ran to completion, every print lost.
+  The prompt now line-buffers its stdout.
+- A deliberate `split="expert"` configuration — the run-at-all mode whose whole
+  point is that the device cannot hold more slots — was scolded with sixteen
+  layers of WARNING advising it to raise the setting it had explicitly declined.
+  An explicit expert split now suppresses the oversubscription warning.
+- `autoconfigure`'s own decision (capacity 1, ram_cache 64 = 6 GiB pinned on a
+  15 GiB host) was boot-tested on the fragile laptop under a timeout guard: it
+  served correctly and the box stayed up, so the half-the-host pinned-pool rule
+  holds at the boundary it was written for.
+
 ## Open
 
 - ~~Streaming load.~~ **Done and measured.** The tier's boot floor went 23.40 GiB →

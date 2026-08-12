@@ -654,7 +654,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--store", default="./store")
     p.add_argument("--max-num-seqs", type=int, default=8,
                    help="serving batch; it sets how many experts a layer can reach")
-    p.add_argument("--kv-reserve", type=float, default=2.0, help="KV cache GiB")
+    p.add_argument("--kv-reserve", type=float, default=None,
+                   help="KV cache GiB (default: 15%% of free VRAM, clamped to "
+                        "[0.5, 2.0] -- a flat 2.0 starved small cards)")
     p.add_argument("--vram", type=float, help="override the measured free VRAM")
     p.add_argument("--refresh", action="store_true", help="ignore the cached answer")
     p.add_argument("--json", action="store_true", help="print only the surgeon config")

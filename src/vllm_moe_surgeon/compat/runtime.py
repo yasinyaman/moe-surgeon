@@ -412,6 +412,14 @@ def _warn_if_oversubscribed(layer: Any, provider: Any, topk_ids: Any) -> None:
     capacity = getattr(provider, "capacity", 0)
     if not capacity:
         return
+    if read_config().split == "expert":
+        # An explicit expert split IS the acknowledgement that the device cannot
+        # hold the working set -- the exact case the message's last sentence
+        # excuses. Warning anyway printed sixteen layers of advice to raise a
+        # setting the configuration had already, deliberately, declined to
+        # raise. Observed live on the small-device config this split exists for.
+        layer._surgeon_capacity_warned = True
+        return
     try:
         rows = int(topk_ids.shape[0])
         if rows > _DECODE_ROWS:

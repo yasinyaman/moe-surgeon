@@ -227,6 +227,17 @@ def run(
 ) -> int:
     """Boot the engine and read prompts until told to stop."""
     import os
+    import sys
+
+    # When stdout is a pipe it is block-buffered, and vLLM's exit teardown can
+    # take the interpreter down before the buffer flushes -- observed live: a
+    # piped session ran to completion and delivered zero output, every print
+    # lost. Line-buffering makes each line durable the moment it is written,
+    # which is also the right behaviour for a prompt someone is watching.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:  # pragma: no cover - non-reconfigurable stream
+        pass
 
     # The counters are read with a collective_rpc *callable*, which cannot cross
     # the default multiprocess engine's serialization boundary -- on a stock boot
