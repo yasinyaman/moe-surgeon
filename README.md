@@ -11,9 +11,12 @@ justify it, by dropping the genuinely unused ones and merging redundant ones int
 a smaller checkpoint.
 
 **On the models measured here (OLMoE, Qwen3-30B) the disk tier is the primary
-mechanism, not pruning** — they have no dead tail and no mergeable pairs, so
-deletion costs quality (measured below) and exists to *support* the tier: a
-smaller candidate set and store. Redundancy is a per-model property, so the
+mechanism, not pruning** — on broad workloads they have no dead tail and no
+mergeable pairs, so deletion costs quality (measured below) and exists to
+*support* the tier: a smaller candidate set and store. On a genuinely narrow
+domain the calculus shifts — [measured below](#when-pruning-does-pay-a-narrow-domain-measured)
+on real system logs — but the order never changes: tier first, prune only when
+the measurements say so. Redundancy is a per-model property, so the
 pruning and merging machinery is kept and tested; it is simply not the win on
 these two families. See [DECISIONS.md](DECISIONS.md).
 
@@ -109,6 +112,50 @@ to your machine and caches the answer:
 The slots are paid for out of KV cache, not free device memory — capacity buys
 throughput and spends context. The full evidence, including the boot-floor
 instrument and the capacity sweep, is in [docs/sizing.md](docs/sizing.md).
+
+## When pruning does pay: a narrow domain, measured
+
+Pruning costs quality on broad workloads (arc_challenge −25% relative on a
+general benchmark — the reason `apply` refuses to delete without a measured gate
+verdict). The recurring question is whether a deployment that only ever sees one
+kind of input — a log-analysis system, say — escapes that. Measured end to end
+on real system logs (Linux+SSH+Apache triage prompts, held-out lines for the
+gate, other log families as the distribution probe):
+
+**The narrow domain concentrates routing.** For the first time a near-dead tail
+exists (median 7 of 64 experts per layer under 10% of uniform; a broad domain
+had none), and `surgeon profile` now prints exactly this diagnosis.
+
+**The cost, and the trap** (held-out log perplexity, baseline 27.89):
+
+| pruned to | applied | ratio |
+|---|---|---|
+| 56 of 64 (the dead tail) | 30.64 | 1.10× |
+| 40 of 64, **without amplitude** | 41.00 | **1.47× — the trap** |
+| 40 of 64, **with amplitude 0.85** | 32.53 | **1.17×** |
+
+Deletion inflates the surviving gates by 1/(1−P_D); on a narrow domain that
+inflation bites harder than the gate's zeroing emulation, so the amplitude
+correction is **mandatory** here. The plan predicts it analytically from its own
+deleted routing mass — the predicted 0.861 measured within 0.2% of the
+engine-calibrated 0.850 — and `apply` warns if it is skipped.
+
+**The gain, tier against tier at full coverage:**
+
+| configuration | GPU slot bytes | decode |
+|---|---|---|
+| **pruned-40 + tier, 40/40 resident** | **7.5 GiB** | **256.2 tok/s** |
+| unpruned + tier, 64/64 resident | 12.0 GiB | 205.1 tok/s |
+| unpruned, untiered | 12.0 GiB | 218.2 tok/s |
+
+Pruning buys **compute**, not just memory — a 40-expert kernel is smaller than a
+64-expert one, so the pruned model beats even the untiered baseline — and the
+4.5 GiB of released slots go straight into the KV cache at a fixed memory
+budget. So on a narrow domain the pruned+tier composition wins throughput,
+memory and footprint at once, for a measured 1.17× in-domain perplexity cost.
+The general-task damage does not go away — this is for deployments that never
+leave their domain. Full experiment in
+[DECISIONS.md](DECISIONS.md#narrow-domain-pruning-measured-on-real-logs-2026-08-12).
 
 ## Documentation
 
