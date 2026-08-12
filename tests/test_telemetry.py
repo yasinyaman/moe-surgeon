@@ -348,3 +348,40 @@ def test_concentration_report_reads_a_dead_tail_and_the_lack_of_one():
     text = concentration_report(flat)
     assert "no dead tail" in text
     assert "prefer the tier" in text
+
+
+def test_concentration_report_excludes_silent_layers_and_names_them():
+    """A layer that routed nothing used to read as an entire layer of near-dead
+    experts (share 0 < any threshold) -- missing measurement reported as a
+    license to prune, directly under the profile's own do-not-prune warning."""
+    import numpy as np
+
+    from vllm_moe_surgeon.telemetry.stats import concentration_report
+
+    counts = np.full((3, 8), 100.0)
+    counts[2] = 0  # silent: never routed
+    text = concentration_report(counts)
+    assert "1 silent layer" in text
+    assert "missing data, not a dead tail" in text
+    assert "0.00x" not in text, "the silent layer must not set the coldest reading"
+    assert "no dead tail" in text  # the routed layers are flat
+
+    all_silent = np.zeros((2, 8))
+    assert "nothing to read" in concentration_report(all_silent)
+
+
+def test_concentration_report_baseline_follows_the_actual_quartile():
+    """floor(experts/4) hottest experts are compared against their own uniform
+    share, not a hard-coded 25% -- at 6 experts the slice is one expert whose
+    uniform share is 16.7%, and printing 25% read a flat profile as
+    anti-concentrated."""
+    import numpy as np
+
+    from vllm_moe_surgeon.telemetry.stats import concentration_report
+
+    flat6 = np.full((2, 6), 100.0)
+    text = concentration_report(flat6)
+    assert "(uniform: 16.7%)" in text
+
+    flat8 = np.full((2, 8), 100.0)
+    assert "(uniform: 25.0%)" in concentration_report(flat8)

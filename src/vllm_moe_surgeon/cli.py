@@ -539,6 +539,16 @@ def _user_input_errors() -> type[Exception]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # When stdout is a pipe or a captured log file it is block-buffered, and
+    # vLLM's exit teardown can take the interpreter down before the buffer
+    # flushes -- observed live: a piped `surgeon run` session ran to completion
+    # and delivered zero output, every print lost. Every subcommand that boots
+    # an engine prints its deliverable through this stdout, and the job server
+    # captures stages the same way, so the durability fix belongs here, once.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:  # pragma: no cover - non-reconfigurable stream
+        pass
     parser = argparse.ArgumentParser(prog="surgeon", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -641,7 +651,9 @@ def main(argv: list[str] | None = None) -> int:
                                        "is a repo id")
     p.add_argument("--store", default="./store")
     p.add_argument("--max-num-seqs", type=int, default=8)
-    p.add_argument("--kv-reserve", type=float, default=2.0)
+    p.add_argument("--kv-reserve", type=float, default=None,
+                   help="KV cache GiB (default: 15%% of free VRAM, clamped to "
+                        "[0.5, 2.0] -- a flat 2.0 starved small cards)")
     p.add_argument("--vram", type=float, help="override the measured free VRAM")
     p.add_argument("--no-tier", action="store_true", help="serve untiered, for a "
                                                           "side-by-side comparison")

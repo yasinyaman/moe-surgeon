@@ -389,8 +389,14 @@ Three findings worth keeping:
   prediction was applied and measured against the calibrated 0.850: **32.59 vs
   32.53 held-out ppl (0.2% apart)**. So the analytical amplitude the plan now
   prints is a valid first pass with zero GPU cost; `calibrate` remains the
-  measured refinement. `apply` warns, with these numbers, when a plan deleting
-  more than 5% of routing mass is applied with no amplitude at all.
+  measured refinement. `apply` warns, with these numbers, when any layer loses
+  more than 5% of routing mass and no amplitude is given.
+  *(Review correction, same day: the mean is now taken over **all** layers the
+  plan covers, not just the deleting ones — the amplitude is folded into every
+  layer's survivors, so the deleting-layer mean would over-damp untouched layers
+  on a concentrated plan. This experiment deleted on every layer, so 0.861
+  stands. When the max deleted share sits far above the mean, one global scalar
+  fits poorly — that is `calibrate`'s case.)*
 - **Within the log universe there is no distribution cliff**: the same keep-40
   plan gated 1.16× on out-of-domain logs against 1.19× in-domain — unlike the
   gsm8k → hellaswag case (1.404× vs 1.234×). Log families share structure;
@@ -460,21 +466,76 @@ by sha256 over every prompt's ids, one arm per process, greedy.
 
 - `autoconfig`'s flat 2.0 GiB KV reserve consumed over half of a 3.5 GiB card and
   strangled capacity to 1 — below top_k, forcing the non-bit-exact expert split
-  against a proven hand-tuned 4. The reserve now scales (15% of free VRAM,
-  clamped to [0.5, 2.0]); re-probed live, the same card now decides capacity 9
-  with no split. An explicit --kv-reserve still wins.
+  against a proven hand-tuned 4. The reserve now scales (15% of the *bucketed*
+  free-VRAM reading, clamped to [0.5, 2.0]); re-probed live, the same card now
+  decides capacity 9 with no split. An explicit --kv-reserve still wins.
+  *(Review correction, same day: the fix had only reached `surgeon autoconfig` —
+  `surgeon run`, the command that boots the engine, still passed a flat 2.0; and
+  resolving from the raw reading leaked probe jitter into the cache fingerprint.
+  Both fixed; see the review entry below.)*
 - `surgeon run` piped to another process delivered **zero output**: stdout is
   block-buffered on a pipe and vLLM's exit teardown can end the interpreter
   before the buffer flushes — the session ran to completion, every print lost.
-  The prompt now line-buffers its stdout.
+  Line-buffering now lives at the top of `cli.main`, so every subcommand that
+  boots an engine — and every job-server stage log, captured to a block-buffered
+  file — gets the same durability, not just the prompt.
 - A deliberate `split="expert"` configuration — the run-at-all mode whose whole
   point is that the device cannot hold more slots — was scolded with sixteen
   layers of WARNING advising it to raise the setting it had explicitly declined.
   An explicit expert split now suppresses the oversubscription warning.
+  *(Review correction, same day: the check read the ambient vLLM config, which
+  does not exist at forward time — so the suppression never fired for
+  `additional_config`-configured runs, the documented channel, and only worked
+  for the env-var recipe it happened to be tested with. It now reads the split
+  off the provider's build-time snapshot.)*
 - `autoconfigure`'s own decision (capacity 1, ram_cache 64 = 6 GiB pinned on a
   15 GiB host) was boot-tested on the fragile laptop under a timeout guard: it
   served correctly and the box stayed up, so the half-the-host pinned-pool rule
   holds at the boundary it was written for.
+
+## Hostile review of the day's commits (2026-08-12)
+
+Eight-angle adversarial review of everything after the previous review commit;
+sixteen candidates, ten confirmed, all fixed. The pattern that matters more than
+any single finding: **three of the day's headline fixes had been verified live
+through exactly one configuration recipe and did not generalise past it.**
+
+- The expert-split warning suppression read `read_config()` at forward time,
+  where there is no ambient vLLM config — the env fallback answered `"token"`,
+  so the suppression never fired for `additional_config`-configured runs (the
+  documented channel; the live test used the env-var recipe). Now reads the
+  provider's build-time snapshot, which also removes a raised-and-caught
+  exception per not-yet-retired layer forward.
+- The scaled KV reserve landed only on `surgeon autoconfig`; `surgeon run` still
+  passed a flat 2.0 as an "explicit" override. Both subcommands now default to
+  None and the resolver owns the default.
+- The resolved reserve fed the cache fingerprint from the **raw** VRAM reading
+  while the fingerprint buckets that same reading to 0.5 GiB against probe
+  jitter — so on exactly the small cards the scaling targets, the cache missed
+  on nearly every boot. The reserve now resolves from the bucketed figure.
+- `suggested_amplitude` averaged deleted share over deleting layers only, but
+  the scalar folds into every layer's survivors — a plan deleting 30% on 2 of
+  24 layers would advise damping the other 22 by 0.7. Mean is now over all
+  covered layers; the apply warning triggers on the per-layer max.
+- `concentration_report` counted silent (never-routed) layers as entire layers
+  of near-dead experts — missing measurement read as a license to prune,
+  directly under the profile's own do-not-prune warning. Silent layers are now
+  excluded and named. The hot-quartile baseline also printed a hard-coded 25%
+  for expert counts not divisible by 4; it now prints the actual slice share.
+- The piped-output fix line-buffered only `repl.run`; profile/gate/ablate/
+  calibrate and the job server's block-buffered stage logs had the identical
+  loss mode. Moved to the top of `cli.main`.
+- The pure-deletion predicate (`drop` with no merge target) existed in five
+  copies across three files — the donor-exclusion mistake the gate once made,
+  waiting to be re-made. Now one `pure_deletions()` helper; `deletion_mass`
+  returns one shape always; the amplitude advice renders in one place; a
+  hand-edited `share: null` is refused by `validate_plan` instead of crashing
+  the advisory warning.
+
+Verified from scratch after the fixes: fresh-venv installs on the Mac (474
+passed / 116 skipped) and GB10 (551/39 — torch is a core dep, so the CUDA tests
+run even in a bare venv there), plus the GB10 fork venv with vLLM installed:
+**588 passed / 2 skipped** (the two: optional `_orient_fused_weight` seam).
 
 ## Open
 

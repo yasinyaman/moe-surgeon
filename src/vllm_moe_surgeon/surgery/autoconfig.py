@@ -247,7 +247,11 @@ def resolve_kv_reserve(env: Environment, kv_reserve_gib: float | None) -> float:
         return kv_reserve_gib
     if env.vram_gib <= 0:
         return 2.0
-    return round(min(2.0, max(0.5, 0.15 * env.vram_gib)), 2)
+    # From the *bucketed* reading, for the same reason the fingerprint buckets
+    # its resources: the VRAM probe wobbles by tens of MiB between boots, and a
+    # reserve that followed the wobble would change the fingerprint and defeat
+    # the cache on exactly the small cards the scaling exists for.
+    return round(min(2.0, max(0.5, 0.15 * _bucket(env.vram_gib))), 2)
 
 
 def decide(
@@ -265,7 +269,8 @@ def decide(
     if kv_reserve_gib is None and env.vram_gib > 0:
         why.append(
             f"KV reserve scaled to the card: {resolved_kv} GiB "
-            f"(15% of {env.vram_gib:.1f} GiB free, clamped to [0.5, 2.0])"
+            f"(15% of {_bucket(env.vram_gib):.1f} GiB free after bucketing, "
+            "clamped to [0.5, 2.0])"
         )
 
     # The union the serving batch can reach, which is what capacity should cover.

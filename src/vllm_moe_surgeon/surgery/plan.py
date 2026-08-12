@@ -187,6 +187,14 @@ def validate_plan(plan: Plan) -> None:
         seen.add(key)
         if placement.action not in ("merge_into_core", "keep_on_disk", "drop"):
             raise ValueError(f"unknown action {placement.action!r} at {key}")
+        # Plans are hand-edited; a nulled-out share would otherwise surface as a
+        # raw TypeError from the amplitude arithmetic instead of a refusal.
+        if not isinstance(placement.share, int | float):
+            raise ValueError(
+                f"layer {placement.layer} expert {placement.expert}: share must "
+                f"be a number, got {placement.share!r} -- the deleted routing "
+                "mass and the suggested amplitude are computed from it"
+            )
         kept = survivors.setdefault(placement.layer, set())
         if placement.action != "drop":
             kept.add(placement.expert)
@@ -271,6 +279,22 @@ def gate_passed(plan: Plan) -> bool:
     return bool(plan.gate and plan.gate.get("passed"))
 
 
+def pure_deletions(plan: Plan) -> dict[int, list[ExpertPlacement]]:
+    """The plan's true deletions -- ``drop`` with no merge target -- per layer.
+
+    The one predicate that decides what is deleted, factored out because a merge
+    donor also carries ``action == "drop"`` but is folded into a survivor, not
+    discarded. Counting donors as deletions is a mistake the gate has already
+    made once; the predicate lives here so it cannot drift between the digest,
+    the gate, the apply step, and the mass report.
+    """
+    deleted: dict[int, list[ExpertPlacement]] = {}
+    for placement in plan.placements:
+        if placement.action == "drop" and placement.merge_target is None:
+            deleted.setdefault(placement.layer, []).append(placement)
+    return deleted
+
+
 def drop_set_digest(plan: Plan) -> str:
     """A stable fingerprint of exactly the experts the gate measures deleting.
 
@@ -281,11 +305,10 @@ def drop_set_digest(plan: Plan) -> str:
     """
     import hashlib
 
-    dropped: dict[int, list[int]] = {}
-    for placement in plan.placements:
-        if placement.action == "drop" and placement.merge_target is None:
-            dropped.setdefault(placement.layer, []).append(placement.expert)
-    canonical = {str(layer): sorted(v) for layer, v in sorted(dropped.items())}
+    canonical = {
+        str(layer): sorted(p.expert for p in placements)
+        for layer, placements in sorted(pure_deletions(plan).items())
+    }
     return hashlib.sha256(
         json.dumps(canonical, sort_keys=True).encode()
     ).hexdigest()
@@ -621,23 +644,50 @@ def deletion_mass(plan: Plan) -> dict:
     plans' mean P_D was ~0.15, i.e. (1-P_D) = 0.85. So the plan can *predict*
     the amplitude it will need, and an apply that skips it can be told what that
     omission costs (measured: 1.47x instead of 1.17x on a narrow log domain).
+
+    The mean is over **every layer the plan covers**, deleting or not, because
+    the amplitude is folded into every layer's survivors (see
+    :func:`~vllm_moe_surgeon.surgery.apply.fold_amplitude`): averaging over
+    deleting layers only would suggest damping layers that deleted nothing.
+    When ``deleted_share_max`` sits far above the mean, one global scalar fits
+    poorly -- that is what `surgeon calibrate` is for.
+
+    Always returns the full shape; ``deletes`` says whether the numbers mean
+    anything, so no caller has to guess which keys exist.
     """
-    per_layer: dict[int, float] = {}
-    for placement in plan.placements:
-        if placement.action == "drop" and placement.merge_target is None:
-            per_layer[placement.layer] = (
-                per_layer.get(placement.layer, 0.0) + float(placement.share)
-            )
-    if not per_layer:
-        return {"deletes": False}
-    shares = list(per_layer.values())
-    mean = sum(shares) / len(shares)
+    per_layer = {
+        layer: sum(float(p.share) for p in placements)
+        for layer, placements in pure_deletions(plan).items()
+    }
+    layers = {p.layer for p in plan.placements}
+    if not per_layer or not layers:
+        return {
+            "deletes": False,
+            "deleted_share_mean": 0.0,
+            "deleted_share_max": 0.0,
+            "suggested_amplitude": 1.0,
+        }
+    mean = sum(per_layer.values()) / len(layers)
     return {
         "deletes": True,
         "deleted_share_mean": round(mean, 4),
-        "deleted_share_max": round(max(shares), 4),
+        "deleted_share_max": round(max(per_layer.values()), 4),
         "suggested_amplitude": round(1.0 - mean, 3),
     }
+
+
+def amplitude_advice(mass: dict) -> str:
+    """The one sentence `plan` and `apply` both print about a deleting plan.
+
+    A single renderer, so the two commands cannot drift into recommending
+    different amplitudes -- or different numbers -- for the same plan.
+    """
+    return (
+        "survivors' gates inflate ~1/(1-P_D); apply with --amplitude "
+        f"~{mass['suggested_amplitude']} or run `surgeon calibrate` (skipping "
+        "the correction measured 1.47x perplexity where the corrected apply "
+        "measured 1.17x on a narrow domain)"
+    )
 
 
 def summarize_plan(plan: Plan) -> str:
@@ -654,17 +704,14 @@ def summarize_plan(plan: Plan) -> str:
         f"ranked by:  {plan.provenance.get('ranked_by', 'unknown')}",
     ]
     merged = [p for p in plan.placements if p.merge_target is not None]
-    deleted = [
-        p for p in plan.placements if p.action == "drop" and p.merge_target is None
-    ]
+    deleted = [p for ps in pure_deletions(plan).values() for p in ps]
     lines.append(f"of the dropped: {len(merged)} merged away, {len(deleted)} deleted")
     mass = deletion_mass(plan)
     if mass["deletes"]:
         lines.append(
             f"deleted routing mass: mean {100 * mass['deleted_share_mean']:.1f}%/layer "
-            f"(max {100 * mass['deleted_share_max']:.1f}%) -- survivors' gates inflate "
-            f"~1/(1-P_D); apply with --amplitude ~{mass['suggested_amplitude']} or run "
-            "`surgeon calibrate`"
+            f"over all layers (max {100 * mass['deleted_share_max']:.1f}%) -- "
+            f"{amplitude_advice(mass)}"
         )
     elif counts["keep_on_disk"]:
         lines.append(

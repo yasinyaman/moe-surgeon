@@ -225,19 +225,13 @@ def run(
     max_tokens: int = 512,
     llm_kwargs: dict[str, Any] | None = None,
 ) -> int:
-    """Boot the engine and read prompts until told to stop."""
-    import os
-    import sys
+    """Boot the engine and read prompts until told to stop.
 
-    # When stdout is a pipe it is block-buffered, and vLLM's exit teardown can
-    # take the interpreter down before the buffer flushes -- observed live: a
-    # piped session ran to completion and delivered zero output, every print
-    # lost. Line-buffering makes each line durable the moment it is written,
-    # which is also the right behaviour for a prompt someone is watching.
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-    except Exception:  # pragma: no cover - non-reconfigurable stream
-        pass
+    Piped-output durability (line-buffered stdout, so vLLM's exit teardown
+    cannot eat the session's prints) is handled once in ``cli.main`` -- it
+    applies to every subcommand that boots an engine, not just this one.
+    """
+    import os
 
     # The counters are read with a collective_rpc *callable*, which cannot cross
     # the default multiprocess engine's serialization boundary -- on a stock boot

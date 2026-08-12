@@ -138,7 +138,10 @@ Deletion inflates the surviving gates by 1/(1−P_D); on a narrow domain that
 inflation bites harder than the gate's zeroing emulation, so the amplitude
 correction is **mandatory** here. The plan predicts it analytically from its own
 deleted routing mass — the predicted 0.861 measured within 0.2% of the
-engine-calibrated 0.850 — and `apply` warns if it is skipped.
+engine-calibrated 0.850 — and `apply` warns if it is skipped. The prediction is
+1 − (mean deleted share over **all** layers), because the scalar folds into
+every layer's survivors; when deletion concentrates in a few layers the global
+scalar fits poorly and `surgeon calibrate` is the honest answer.
 
 **The gain, tier against tier at full coverage:**
 

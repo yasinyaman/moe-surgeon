@@ -332,3 +332,23 @@ def test_a_prefill_shaped_forward_is_not_warned_about():
     # The same oversubscription at decode shape does warn.
     _warn_if_oversubscribed(layer, provider, _ids([[0, 1, 2, 3, 4, 5, 6, 7]]))
     assert layer._surgeon_capacity_warned is True
+
+
+def test_an_explicit_expert_split_suppresses_the_capacity_warning(caplog):
+    """The split IS the acknowledgement that the device cannot hold the working
+    set. The check reads the provider's build-time snapshot -- at forward time
+    there is no ambient vLLM config, so a read_config() here would fall back to
+    the env, miss additional_config (the documented channel), and warn anyway."""
+    from vllm_moe_surgeon.compat.runtime import _warn_if_oversubscribed
+
+    class _SplitProvider:
+        def __init__(self):
+            self.capacity = 4
+            self.split = "expert"
+
+    layer = _Layer()
+    with caplog.at_level("WARNING"):
+        # topk_ids=None: the suppression must decide before touching the ids.
+        _warn_if_oversubscribed(layer, _SplitProvider(), None)
+    assert not caplog.records
+    assert layer._surgeon_capacity_warned is True

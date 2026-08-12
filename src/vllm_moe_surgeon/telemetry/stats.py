@@ -371,16 +371,27 @@ def concentration_report(tokens) -> str:
     cold tail actually holds. On a log-triage domain these read 7 near-dead
     experts/layer and a 4.4% tail; on gsm8k, none and 3.2% -- the difference
     between "trim the tail for ~1.1x" and "there is nothing free to delete".
-    """
-    import numpy as np
 
+    Silent layers -- rows that routed nothing -- are excluded and named, not
+    averaged in: a layer with no data would read as an entire layer of near-dead
+    experts, which is missing measurement, not a license to prune.
+    """
     counts = np.asarray(tokens, dtype=np.float64)
     layers, experts = counts.shape
+    routed = counts.sum(axis=1) > 0
+    silent = int(layers - routed.sum())
+    counts = counts[routed]
+    if not counts.shape[0]:
+        return (
+            "concentration (decides prunability):\n"
+            "  every layer is silent -- no routing was captured, nothing to read"
+        )
     uniform = 1.0 / experts
-    share = counts / np.maximum(counts.sum(axis=1, keepdims=True), 1)
+    share = counts / counts.sum(axis=1, keepdims=True)
     touched = (counts > 0).sum(axis=1)
     coldest = share.min(axis=1) / uniform
-    hot_q = np.sort(share, axis=1)[:, -max(1, experts // 4):].sum(axis=1)
+    hot_n = max(1, experts // 4)
+    hot_q = np.sort(share, axis=1)[:, -hot_n:].sum(axis=1)
     tail10 = (share < 0.10 * uniform).sum(axis=1)
     tail33 = (share < 0.33 * uniform).sum(axis=1)
     tail33_load = np.where(share < 0.33 * uniform, share, 0).sum(axis=1)
@@ -391,12 +402,17 @@ def concentration_report(tokens) -> str:
         f"  coldest vs uniform      : median {np.median(coldest):.2f}x  "
         f"(min {coldest.min():.2f}x)",
         f"  hot quartile carries    : median {100 * np.median(hot_q):.1f}%  "
-        "(uniform: 25%)",
+        f"(uniform: {100 * hot_n / experts:.1f}%)",
         f"  experts <10% of uniform : median {int(np.median(tail10))}/layer  "
         f"(max {int(tail10.max())}) -- the near-dead tail",
         f"  load in the <33% tail   : median {100 * np.median(tail33_load):.2f}%"
         f"/layer across median {int(np.median(tail33))} experts",
     ]
+    if silent:
+        lines.append(
+            f"  excluded: {silent} silent layer(s) that routed nothing -- "
+            "missing data, not a dead tail; profile longer to measure them"
+        )
     if np.median(tail10) < 1:
         lines.append(
             "  reading: no dead tail -- deletion will cost routing load it uses; "

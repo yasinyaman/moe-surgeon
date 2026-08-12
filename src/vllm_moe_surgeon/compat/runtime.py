@@ -412,12 +412,16 @@ def _warn_if_oversubscribed(layer: Any, provider: Any, topk_ids: Any) -> None:
     capacity = getattr(provider, "capacity", 0)
     if not capacity:
         return
-    if read_config().split == "expert":
+    if getattr(provider, "split", None) == "expert":
         # An explicit expert split IS the acknowledgement that the device cannot
         # hold the working set -- the exact case the message's last sentence
         # excuses. Warning anyway printed sixteen layers of advice to raise a
         # setting the configuration had already, deliberately, declined to
         # raise. Observed live on the small-device config this split exists for.
+        # The provider carries the split it was built with; read_config() here
+        # would miss it, because at forward time there is no ambient vLLM config
+        # (get_current_vllm_config raises) and the env fallback cannot see
+        # additional_config -- the documented channel.
         layer._surgeon_capacity_warned = True
         return
     try:

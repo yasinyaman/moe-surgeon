@@ -47,10 +47,13 @@ from .._logging import init_logger
 from .descriptors import LAYOUTS, CheckpointIndex
 from .plan import (
     Plan,
+    amplitude_advice,
     deletes_anything,
+    deletion_mass,
     drop_set_digest,
     gate_passed,
     merges_anything,
+    pure_deletions,
     validate_plan,
 )
 
@@ -87,6 +90,7 @@ def derive_surgery(plan: Plan) -> dict[int, LayerSurgery]:
     """Turn placements into a per-layer edit, and check it is applicable."""
     validate_plan(plan)
     layers = sorted({p.layer for p in plan.placements})
+    deletions = pure_deletions(plan)
     out: dict[int, LayerSurgery] = {}
 
     for layer in layers:
@@ -95,13 +99,9 @@ def derive_surgery(plan: Plan) -> dict[int, LayerSurgery]:
         remap = {old: new for new, old in enumerate(survivors)}
 
         merges: dict[int, list[tuple[int, float]]] = {}
-        deleted: list[int] = []
+        deleted = [p.expert for p in deletions.get(layer, [])]
         for placement in rows:
-            if placement.action != "drop":
-                continue
-            if placement.merge_target is None:
-                deleted.append(placement.expert)
-            else:
+            if placement.action == "drop" and placement.merge_target is not None:
                 merges.setdefault(placement.merge_target, []).append(
                     (placement.expert, float(max(placement.tokens, 1)))
                 )
@@ -498,22 +498,21 @@ def apply_plan(
     only place it can go, and `surgeon calibrate` for how to find the value.
     """
 
-    from .plan import deletion_mass
-
-    mass = deletion_mass(plan)
-    if amplitude is None and mass.get("deletes") and mass["deleted_share_mean"] > 0.05:
-        logger.warning(
-            "this plan deletes %.1f%% of routing mass per layer (mean) and no "
-            "--amplitude was given: the survivors' gates inflate ~1/(1-P_D), and "
-            "skipping the correction measured 1.47x perplexity where the corrected "
-            "apply measured 1.17x on a narrow domain. Suggested --amplitude ~%.3f, "
-            "or run `surgeon calibrate` on the applied checkpoint.",
-            100 * mass["deleted_share_mean"],
-            mass["suggested_amplitude"],
-        )
     import torch
 
     refuse_in_place(source, out_dir)
+
+    # On max, not the mean: the mean is over all layers, so a plan that deletes
+    # heavily on a few layers must still be warned about.
+    mass = deletion_mass(plan)
+    if amplitude is None and mass["deletes"] and mass["deleted_share_max"] > 0.05:
+        logger.warning(
+            "this plan deletes %.1f%% of routing mass per layer (mean over all "
+            "layers; max %.1f%%) and no --amplitude was given: %s",
+            100 * mass["deleted_share_mean"],
+            100 * mass["deleted_share_max"],
+            amplitude_advice(mass),
+        )
 
     gate_skipped = False
     if deletes_anything(plan) and not gate_passed(plan):

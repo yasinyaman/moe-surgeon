@@ -331,15 +331,21 @@ def gate_plan(
     non-redundant experts is not something zeroing can reach, so the verdict says so
     by name instead of implying coverage it does not have.
     """
-    dropped: dict[int, list[int]] = {}
-    merged = 0
-    for placement in plan.placements:
-        if placement.action != "drop":
-            continue
-        if getattr(placement, "merge_target", None) is not None:
-            merged += 1
-            continue
-        dropped.setdefault(placement.layer, []).append(placement.expert)
+    # Imported lazily to keep this module free of a hard surgery dependency at
+    # import time. pure_deletions is the one predicate deciding what is deleted;
+    # this function once re-implemented it and swept donors in, which is exactly
+    # the mistake the shared helper exists to prevent.
+    from ..surgery.plan import drop_set_digest, pure_deletions
+
+    dropped = {
+        layer: [p.expert for p in placements]
+        for layer, placements in pure_deletions(plan).items()
+    }
+    merged = sum(
+        1
+        for p in plan.placements
+        if p.action == "drop" and getattr(p, "merge_target", None) is not None
+    )
 
     ungated = (
         f" {merged} merge donors are folded into survivors, not deleted, and are "
@@ -349,9 +355,7 @@ def gate_plan(
     )
 
     # Bind the verdict to the exact drop-set and corpus it measured, so a plan
-    # edited after gating cannot be applied under a stale pass. Imported lazily to
-    # keep this module free of a hard surgery dependency at import time.
-    from ..surgery.plan import drop_set_digest
+    # edited after gating cannot be applied under a stale pass.
 
     digest = drop_set_digest(plan)
     corpus_id = _corpus_fingerprint(prompts)

@@ -291,3 +291,19 @@ def test_kv_reserve_scales_to_the_card_instead_of_starving_it():
     flat = decide(g, laptop, store_dir="/s", kv_reserve_gib=2.0)
     assert flat.surgeon["expert_cache_size"] < g.top_k
     assert flat.surgeon.get("split") == "expert"
+
+
+def test_the_scaled_reserve_does_not_leak_probe_jitter_into_the_fingerprint():
+    """The fingerprint buckets VRAM to 0.5 GiB because the probe wobbles by tens
+    of MiB between boots; a reserve resolved from the raw reading re-imported
+    that wobble at 0.01 GiB granularity and defeated the cache on exactly the
+    small cards the scaling targets. The reserve must follow the bucket."""
+    from vllm_moe_surgeon.surgery.autoconfig import resolve_kv_reserve
+
+    a = resolve_kv_reserve(_env(vram=7.63), None)
+    b = resolve_kv_reserve(_env(vram=7.69), None)
+    assert a == b, "same 0.5 GiB bucket must resolve the same reserve"
+
+    # Across a real bucket boundary the reserve may move -- that is a real change.
+    c = resolve_kv_reserve(_env(vram=8.01), None)
+    assert c >= a

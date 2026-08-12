@@ -628,4 +628,60 @@ def test_a_merge_donor_does_not_count_as_deleted_mass():
                             merge_target=0, similarity=0.9, reason="merged"),
         ],
     )
-    assert deletion_mass(plan) == {"deletes": False}
+    # The full shape even when nothing is deleted, so no caller has to guess
+    # which keys exist on which kind of plan.
+    assert deletion_mass(plan) == {
+        "deletes": False,
+        "deleted_share_mean": 0.0,
+        "deleted_share_max": 0.0,
+        "suggested_amplitude": 1.0,
+    }
+
+
+def test_the_amplitude_averages_over_all_layers_not_just_deleting_ones():
+    """The suggested --amplitude is folded into every layer's survivors, so a
+    plan deleting 30% on one layer of three must not advise damping all three
+    by 0.7 -- that would trade gate correction on one layer for gratuitous
+    signal loss on the other two."""
+    from vllm_moe_surgeon.surgery.plan import ExpertPlacement, Plan, deletion_mass
+
+    def _core(layer):
+        return ExpertPlacement(layer=layer, expert=0, action="merge_into_core",
+                               tokens=900, share=0.9, importance_share=0.9,
+                               reason="test")
+
+    plan = Plan(
+        model="m", revision=None, budget={"core_experts": 1},
+        placements=[
+            _core(0),
+            ExpertPlacement(layer=0, expert=1, action="drop", tokens=300,
+                            share=0.30, importance_share=0.30, reason="test"),
+            _core(1), _core(2),
+        ],
+    )
+    mass = deletion_mass(plan)
+    assert mass["deleted_share_mean"] == 0.10  # 0.30 across 3 covered layers
+    assert mass["deleted_share_max"] == 0.30   # the concentration is still named
+    assert mass["suggested_amplitude"] == 0.90
+
+
+def test_a_hand_edited_null_share_is_refused_not_a_stack_trace():
+    """Plans are documented hand-editable; a nulled share used to construct and
+    validate cleanly, then die with a raw TypeError inside the amplitude
+    arithmetic -- before any of the purpose-built refusal messages ran."""
+    import pytest
+
+    from vllm_moe_surgeon.surgery.plan import ExpertPlacement, Plan, validate_plan
+
+    plan = Plan(
+        model="m", revision=None, budget={"core_experts": 1},
+        placements=[
+            ExpertPlacement(layer=0, expert=0, action="merge_into_core",
+                            tokens=900, share=0.9, importance_share=0.9,
+                            reason="test"),
+            ExpertPlacement(layer=0, expert=1, action="drop", tokens=100,
+                            share=None, importance_share=0.1, reason="edited"),
+        ],
+    )
+    with pytest.raises(ValueError, match="share must be a number"):
+        validate_plan(plan)
