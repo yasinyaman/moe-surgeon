@@ -7,12 +7,13 @@ name = "vllm-moe-surgeon"
 version = "0.1.0.dev0"
 description = "An NVMe expert tier for domain-specialised MoE vLLM deployments, with offline expert pruning and merging where a model supports it"
 readme = "README.md"
-requires-python = ">=3.10,<3.15"
+requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
 authors = [{ name = "Yasin YAMAN", email = "yasnyaman@gmail.com" }]
 keywords = ["vllm", "mixture-of-experts", "moe", "inference", "offloading", "nvme"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Typing :: Typed",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -39,8 +40,11 @@ Issues = "https://github.com/yasinyaman/moe-surgeon/issues"
 # so the floor named a version nobody can install. 0.26.0 is the oldest release the
 # seam check passes against; see DECISIONS.md for what the ceiling is waiting on.
 runtime = ["vllm>=0.26.0,<0.27"]
-server = ["fastapi", "uvicorn", "pydantic>=2", "pyarrow"]
-dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "pyarrow"]
+server = ["fastapi", "uvicorn", "pydantic>=2", "huggingface_hub"]
+# fastapi+httpx so the TestClient tests run in CI (bare fastapi does not pull
+# httpx); scipy so the greedy alignment fallback is checked against the real
+# Hungarian solver instead of against itself.
+dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "fastapi", "httpx", "scipy"]
 
 [project.scripts]
 surgeon = "vllm_moe_surgeon.cli:main"
@@ -53,6 +57,9 @@ moe_surgeon = "vllm_moe_surgeon.plugin:register"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+vllm_moe_surgeon = ["py.typed"]
 
 [tool.ruff]
 line-length = 88

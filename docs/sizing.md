@@ -40,7 +40,7 @@ not bit-exact, and a target that cannot fit at all is an error naming the shortf
 
 ## Sizing it by hand: the only knob that matters, and what it costs
 
-Everything else in this README is a mechanism. This is the number to get right, and it
+Everything else in these documents is a mechanism. This is the number to get right, and it
 was measured after the mechanisms were built — which is how it came to be a surprise.
 
 | `expert_cache_size` (of 64) | decode | GPU expert bytes | peak VRAM |

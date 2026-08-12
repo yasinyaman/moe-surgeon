@@ -78,7 +78,18 @@ different global subspaces. Activation-based similarity would settle it, and thi
 result promotes that from optional to necessary if merging is to be pursued.
 
 
-#### And when merging is forced anyway, it is worse than deleting
+#### Generalisation: Qwen3-30B-A3B
+
+128 experts, 5 of 48 layers sampled, **81,280 pairs**: median similarity 0.034,
+max 0.401, exactly **one** pair at or above 0.4. Doubling the expert count and
+tripling the depth did not produce mergeable experts — if anything Qwen's experts
+are *more* orthogonal than OLMoE's.
+
+A third family screens the same way: DeepSeek-V2-Lite, max 0.331 across 6,048
+pairs (2026-08-10). Three families at 0.33–0.40 max, none near the 0.85 merge
+threshold.
+
+### And when merging is forced anyway, it is worse than deleting
 
 The similarity finding says no pair *qualifies*. It does not say what merging would
 cost if the threshold were lowered until pairs did — so that was measured, because
@@ -168,8 +179,10 @@ in-domain ratios as a floor on the cost, not the cost.
 All perplexity figures below are single measurements without a confidence interval,
 and the eval slice size varies by section (gsm8k[400:500] here, 20 prompts for the
 merge arm, `--limit 50` for amplitude), so each carries its own baseline — labelled
-where they are juxtaposed. There is no downstream **task**-accuracy measurement
-anywhere in this document; "accuracy" throughout means held-out perplexity, a proxy.
+where they are juxtaposed. Up to this point "accuracy" means held-out perplexity,
+a proxy — the downstream **task**-accuracy measurement, which changes the reading,
+is in [Measured on downstream tasks](#measured-on-downstream-tasks--and-this-changes-the-reading)
+below.
 
 The ablation study puts that number in context (`surgeon ablate`):
 

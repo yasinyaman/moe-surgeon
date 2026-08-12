@@ -103,7 +103,7 @@ to your machine and caches the answer:
 | setting | rule | measured |
 |---|---|---|
 | `expert_cache_size` | cover the serving batch's per-layer expert union, not free VRAM | 24 → 48 slots: **2.59×** decode |
-| `ram_cache` | ≥ the expert count, or every eviction reads disk | 48 → 64: **1.66×**, and steadier |
+| `ram_cache` | ≥ the expert count, or every eviction reads disk | 48 → 64: **1.66×** |
 | `fp8_store` | space mechanism only — on when the store/RAM does not otherwise fit | 1.11× slower, not bit-exact |
 
 The slots are paid for out of KV cache, not free device memory — capacity buys
@@ -114,8 +114,8 @@ instrument and the capacity sweep, is in [docs/sizing.md](docs/sizing.md).
 
 | doc | what it covers |
 |---|---|
-| [docs/serving.md](docs/serving.md) | the out-of-tree runtime, fp8, CUDA graphs, the interactive prompt, cold start |
-| [docs/sizing.md](docs/sizing.md) | the measured sizing rules, autoconfig, boot floors, the capacity sweep |
+| [docs/serving.md](docs/serving.md) | the out-of-tree runtime, fp8, the interactive prompt, cold start |
+| [docs/sizing.md](docs/sizing.md) | the measured sizing rules, autoconfig, boot floors, streaming load, CUDA graphs, the capacity sweep |
 | [docs/surgery.md](docs/surgery.md) | profiling, planning, pruning/merging, the amplitude fix, the quality gate |
 | [docs/architecture.md](docs/architecture.md) | the layering rule, the seam table, what a vLLM upgrade costs |
 | [docs/server.md](docs/server.md) | the HTTP job pipeline |

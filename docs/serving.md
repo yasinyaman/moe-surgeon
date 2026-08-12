@@ -169,12 +169,5 @@ Not pursued, with reasons: **correlation-driven disk layout** — the record str
 is already 6.0 MiB and this project's own NVMe probe found a single thread reaches
 93% of the 6.9 GB/s ceiling at expert-sized reads (granularity only has to clear
 ~1 MB), so co-locating correlated experts has almost no bandwidth left to recover.
-**Cross-expert block dedup** — untested, but the similarity results argue against
+**Cross-expert block dedup** — untested, but the similarity results ([surgery.md](surgery.md#measured-olmoe-has-no-mergeable-experts)) argue against
 finding duplicate blocks in distinct trained bf16 experts.
-
-### Generalisation: Qwen3-30B-A3B
-
-128 experts, 5 of 48 layers sampled, **81,280 pairs**: median similarity 0.034,
-max 0.401, exactly **one** pair at or above 0.4. Doubling the expert count and
-tripling the depth did not produce mergeable experts — if anything Qwen's experts
-are *more* orthogonal than OLMoE's.

@@ -49,14 +49,21 @@ Two readings worth keeping:
 
 | method | feasibility | speed | accuracy | verdict |
 |---|---|---|---|---|
-| **disk tier** | **strong win**: `surgeon budget` puts the bit-exact weight floor at 2.39 GiB (capacity=top_k=8, arithmetic, **plus ~1.1 GiB measured non-weight overhead**; `vram-floor` measured 11.35 GiB streamed / 23.40 GiB not, at capacity 24 — see the boot-floor tables); halves load time | **loses**: 0.38× decode | neutral: 1.003× | **keep** — the only method that changes what is possible at all |
+| **disk tier** | **strong win**: `surgeon budget` puts the bit-exact weight floor at 2.39 GiB (capacity=top_k=8, arithmetic, **plus ~1.1 GiB measured non-weight overhead**; `vram-floor` measured 11.35 GiB streamed / 23.40 GiB not, at capacity 24 — see the boot-floor tables); halves load time | **loses**: 0.66× decode correctly sized (143.0 vs 218.2 tok/s, the release benchmark; the older 24/64 arm measured 0.38×) | neutral: 1.003× | **keep** — the only method that changes what is possible at all |
 | **pruning (rank-1 ranked)** | win, but only when forced: 34% smaller artifact; the only way to run below the tier's floor | neutral alone (1.01×); win in composition (1.32× over tier alone) | **loses: 1.249× perplexity AND measured task accuracy** — arc_challenge −25% relative (McNemar p=5e‑08), not recovered by amplitude | **last resort** — recommended only when the tier alone cannot fit the target; the tier keeps every expert at no accuracy cost |
 | **rank-1 importance** vs token count | n/a | n/a | **strong win**: 1.57× → 1.25× | **keep, as default** |
 | **permutation-aligned merging** | n/a | n/a | no mergeable pair in **three** screened families: OLMoE (max 0.37 of 64512), Qwen3-30B (0.401 of 81280), DeepSeek-V2-Lite (0.331 of 6048, 2026-08-10) | **keep the machinery** — tested exactly, and redundancy is a per-model property; but three families at 0.33–0.40 max, none near 0.85, make a natural candidate implausible on this class of model |
 | **residency prior** (`hot_experts.json`) | **win, narrow**: +10.0 pts hit rate over the first 50 accesses (measured with prewarm placement; the shipped runtime applies only the prior bias — see caveat), decaying to 0 by 2000 | negligible in steady state | n/a | **keep** — free (a byproduct of the plan) and confined to cold start; do not oversell |
 | **EWMA cache policy** vs LFRU | win: +2.3…+4.0 pts on the cold-start window (single-tier replay) | win: +1.2 pts sustained hit rate | n/a | **keep as an opt-in** (`VLLM_MOE_CACHE_POLICY=ewma`); default stays `lfru` |
+| **fp8 store** | **loses on VRAM**: none saved, the provider dequantizes into model-dtype slots | win: halves disk, host RAM and transfer bytes | small loss: quantization error, no argmax moved in testing | **keep** — the axis it wins on is not the one people expect |
+| **static gate geometry** (row norm, cosine) | n/a | n/a | **loses**: ρ ≈ 0.00 against measured load and co-occurrence | **drop as a selection signal** — but see below |
+| **static byte accounting** (`surgeon budget`) | **strong win**: answers "least VRAM" in 1.5 s with no GPU | n/a | n/a | **keep** — the same static analysis, pointed at sizing instead of selection |
+| **`e_score_correction_bias`** | n/a | n/a | untested: absent from every accessible small MoE | **keep detection** — principled (a *learned* balancing term), just unavailable here |
+| **cross-domain profile** as a cold-start prior | win: ρ +0.43, top-24 overlap 54% vs 37.5% random | n/a | n/a | **keep** — dominates static analysis, and profiling costs minutes |
+| **block dedup across experts** | n/a | n/a | n/a | **drop** — untested, and near-orthogonality makes duplicate blocks implausible in trained bf16 experts |
+| **correlation-driven disk layout** | n/a | no headroom: 6.0 MiB records already reach 93% of the NVMe ceiling on one thread | n/a | **drop** — the lever is already banked by the record-stride design |
 
-> **Attribution and caveats for the two rows above.** The 2026-08-05 predecessor
+> **Attribution and caveats for the residency-prior and EWMA rows.** The 2026-08-05 predecessor
 > measured the same question with a simulator validated bit-exact against live
 > counters (an unpublished working note) and found
 > the opposite on an *end-to-end, two-tier* trace (Qwen3-30B): EWMA worth −0.05% disk
@@ -68,13 +75,6 @@ Two readings worth keeping:
 > table is also **not regenerable from the repo today** (no `replay` CLI subcommand);
 > and `+10 pts at N=50` is ~5 cache hits, binomial SE ≈ 6.6 pts, so treat it as
 > indicative, not precise.
-| **fp8 store** | **loses on VRAM**: none saved, the provider dequantizes into model-dtype slots | win: halves disk, host RAM and transfer bytes | small loss: quantization error, no argmax moved in testing | **keep** — the axis it wins on is not the one people expect |
-| **static gate geometry** (row norm, cosine) | n/a | n/a | **loses**: ρ ≈ 0.00 against measured load and co-occurrence | **drop as a selection signal** — but see below |
-| **static byte accounting** (`surgeon budget`) | **strong win**: answers "least VRAM" in 1.5 s with no GPU | n/a | n/a | **keep** — the same static analysis, pointed at sizing instead of selection |
-| **`e_score_correction_bias`** | n/a | n/a | untested: absent from every accessible small MoE | **keep detection** — principled (a *learned* balancing term), just unavailable here |
-| **cross-domain profile** as a cold-start prior | win: ρ +0.43, top-24 overlap 54% vs 37.5% random | n/a | n/a | **keep** — dominates static analysis, and profiling costs minutes |
-| **block dedup across experts** | n/a | n/a | n/a | **drop** — untested, and near-orthogonality makes duplicate blocks implausible in trained bf16 experts |
-| **correlation-driven disk layout** | n/a | no headroom: 6.0 MiB records already reach 93% of the NVMe ceiling on one thread | n/a | **drop** — the lever is already banked by the record-stride design |
 
 The two static-signal rows are the clearest case for judging per axis. Gate
 geometry is worthless for *choosing* experts and genuinely useful for *sizing* them
@@ -94,7 +94,7 @@ otherwise, cold tail or not.
 
 | if the target… | then |
 |---|---|
-| fits the model resident, latency-sensitive | skip the tier (its 0.38× decode is not worth paying) |
+| fits the model resident, latency-sensitive | skip the tier (even correctly sized it decodes at 0.66× untiered) |
 | below resident, at or above the tier's floor (`surgeon budget --vram`) | **tier only** — it runs the model at no accuracy cost; do not delete |
 | below the tier's own floor | deletion becomes the last resort: shrink the model enough to fit, sized by `surgeon budget --vram`, gated by `surgeon gate`, task cost accepted |
 | restarts often | seed the residency prior and set `VLLM_MOE_CACHE_POLICY=ewma` |
@@ -107,7 +107,7 @@ otherwise, cold tail or not.
 | has mergeable pairs (similarity ≥ merge threshold) AND deletion is forced | merge instead of deleting — no capacity lost; OLMoE/Qwen have none |
 | carries `e_score_correction_bias` | a static popularity prior is available with no profiling |
 | has shared/always-on experts | they are fixed VRAM cost, never cached — `surgeon budget` accounts for them separately |
-| ships pre-stacked expert tensors (IBM Granite) | reading is supported (inspect, budget, tier); `apply` refuses to write that layout back |
+| ships pre-stacked expert tensors (IBM Granite) | both directions are supported: read (inspect, budget, tier) and write-back (`apply`) |
 
 `surgeon inspect` and `surgeon budget` between them report every property in the
 second table without a GPU, and **`surgeon recommend` applies both tables**:
