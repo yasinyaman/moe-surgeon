@@ -71,3 +71,12 @@ jobs:
           git clone --depth 1 --branch "v${{ steps.pin.outputs.version }}" \
             https://github.com/vllm-project/vllm.git /tmp/vllm
           surgeon seams --source /tmp/vllm
+
+      - name: Run the per-seam static tests against the same tree
+        # The tests job skips all 33 of these for lack of a vLLM checkout -- a
+        # 431-vs-463 gap that took a three-machine bisection to explain. The
+        # clone is already here; running the tests against it closes the gap
+        # where it is cheapest and keeps the per-seam failure messages.
+        run: |
+          pip install pytest
+          MOE_SURGEON_VLLM_SRC=/tmp/vllm python -m pytest tests/test_seams.py -q

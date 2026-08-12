@@ -42,6 +42,13 @@ diffable against `repos/vllm` on `disk-tier-proto` on purpose, which is why
 
 ## Tests
 
+The static seam tests parse a vLLM *source tree* rather than importing it, so they
+run with no torch and no GPU — but they need a checkout to parse. They look for one
+next to this repository (`../vllm`) and otherwise at `MOE_SURGEON_VLLM_SRC`; without
+either they skip, which is why a bare CI checkout runs 32 fewer tests than a
+workspace clone. CI closes that gap in the `seams-pinned` job, which already clones
+the pinned vLLM and runs these tests against it.
+
 ```bash
 python3 -m pytest tests/ -q
 ```
