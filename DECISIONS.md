@@ -384,6 +384,13 @@ Three findings worth keeping:
   multiply recovered 80% of the gap. **For narrow-domain pruning, `calibrate` is
   mandatory, not optional** — and a gate verdict on a plan that will be applied
   without amplitude understates the damage on domains like this one.
+  **Follow-up, head-to-head:** the plan can *predict* this amplitude from its own
+  deleted routing mass — (1 − P_D) with mean P_D = 13.9% gives 0.861 — and the
+  prediction was applied and measured against the calibrated 0.850: **32.59 vs
+  32.53 held-out ppl (0.2% apart)**. So the analytical amplitude the plan now
+  prints is a valid first pass with zero GPU cost; `calibrate` remains the
+  measured refinement. `apply` warns, with these numbers, when a plan deleting
+  more than 5% of routing mass is applied with no amplitude at all.
 - **Within the log universe there is no distribution cliff**: the same keep-40
   plan gated 1.16× on out-of-domain logs against 1.19× in-domain — unlike the
   gsm8k → hellaswag case (1.404× vs 1.234×). Log families share structure;
