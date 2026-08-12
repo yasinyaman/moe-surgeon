@@ -396,6 +396,25 @@ Three findings worth keeping:
   gsm8k → hellaswag case (1.404× vs 1.234×). Log families share structure;
   task families do not.
 
+**And the gain side, measured rather than assumed** (the table above is the cost
+side). The applied keep-40+amplitude checkpoint was served from the tier at full
+coverage and compared against the unpruned model at its own full coverage:
+
+| arm | GPU slot bytes | decode |
+|---|---|---|
+| **pruned-40 + tier, 40/40 resident** | **7.5 GiB** | **256.2 tok/s** |
+| unpruned + tier, 64/64 resident | 12.0 GiB | 205.1 tok/s |
+| unpruned, untiered | 12.0 GiB | 218.2 tok/s |
+
+Three measured gains for the 1.17× ppl cost: **decode +25%** over the unpruned
+tier ceiling — the pruned model even beats the *untiered* baseline, because a
+40-expert GEMM is smaller than a 64-expert one, so pruning buys compute, not
+just memory; **~4.6 GiB freed and visible in the allocation** (the pruned run's
+pool grew by almost exactly the slot bytes released — the slots↔KV trade,
+confirmed a third time from the pruning direction); and a **37.5% smaller
+store**. So in a genuinely narrow domain the composition earns its keep on all
+three axes at once, which the gsm8k domain never managed.
+
 The tier-first default earned its keep along the way: `plan` without
 `--disk-experts 0` placed the cold tail on disk instead of deleting it, and the
 gate answered "the plan deletes nothing". Deletion had to be asked for
