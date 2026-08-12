@@ -497,6 +497,20 @@ def apply_plan(
     gate inflation deletion introduces. See :func:`fold_amplitude` for why that is the
     only place it can go, and `surgeon calibrate` for how to find the value.
     """
+
+    from .plan import deletion_mass
+
+    mass = deletion_mass(plan)
+    if amplitude is None and mass.get("deletes") and mass["deleted_share_mean"] > 0.05:
+        logger.warning(
+            "this plan deletes %.1f%% of routing mass per layer (mean) and no "
+            "--amplitude was given: the survivors' gates inflate ~1/(1-P_D), and "
+            "skipping the correction measured 1.47x perplexity where the corrected "
+            "apply measured 1.17x on a narrow domain. Suggested --amplitude ~%.3f, "
+            "or run `surgeon calibrate` on the applied checkpoint.",
+            100 * mass["deleted_share_mean"],
+            mass["suggested_amplitude"],
+        )
     import torch
 
     refuse_in_place(source, out_dir)

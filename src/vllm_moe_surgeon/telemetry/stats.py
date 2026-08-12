@@ -359,3 +359,52 @@ def from_hf_config(
         with_cooc=with_cooc,
         top_k=get_top_k(config),
     )
+
+
+def concentration_report(tokens) -> str:
+    """The numbers that decide prunability, from a profile's token counts.
+
+    Written because answering "can this deployment delete experts?" required a
+    scratch numpy script every time, and the decision hinges on exactly four
+    quantities: whether a dead tail exists, how far the coldest expert sits below
+    uniform, how much the hot quartile carries, and how much routing load the
+    cold tail actually holds. On a log-triage domain these read 7 near-dead
+    experts/layer and a 4.4% tail; on gsm8k, none and 3.2% -- the difference
+    between "trim the tail for ~1.1x" and "there is nothing free to delete".
+    """
+    import numpy as np
+
+    counts = np.asarray(tokens, dtype=np.float64)
+    layers, experts = counts.shape
+    uniform = 1.0 / experts
+    share = counts / np.maximum(counts.sum(axis=1, keepdims=True), 1)
+    touched = (counts > 0).sum(axis=1)
+    coldest = share.min(axis=1) / uniform
+    hot_q = np.sort(share, axis=1)[:, -max(1, experts // 4):].sum(axis=1)
+    tail10 = (share < 0.10 * uniform).sum(axis=1)
+    tail33 = (share < 0.33 * uniform).sum(axis=1)
+    tail33_load = np.where(share < 0.33 * uniform, share, 0).sum(axis=1)
+    lines = [
+        "concentration (decides prunability):",
+        f"  touched experts/layer   : min {int(touched.min())}  "
+        f"median {int(np.median(touched))}  max {int(touched.max())} of {experts}",
+        f"  coldest vs uniform      : median {np.median(coldest):.2f}x  "
+        f"(min {coldest.min():.2f}x)",
+        f"  hot quartile carries    : median {100 * np.median(hot_q):.1f}%  "
+        "(uniform: 25%)",
+        f"  experts <10% of uniform : median {int(np.median(tail10))}/layer  "
+        f"(max {int(tail10.max())}) -- the near-dead tail",
+        f"  load in the <33% tail   : median {100 * np.median(tail33_load):.2f}%"
+        f"/layer across median {int(np.median(tail33))} experts",
+    ]
+    if np.median(tail10) < 1:
+        lines.append(
+            "  reading: no dead tail -- deletion will cost routing load it uses; "
+            "prefer the tier"
+        )
+    else:
+        lines.append(
+            "  reading: a near-dead tail exists -- deleting it is measured cheap, "
+            "but gate it, and apply with calibrate (see DECISIONS on amplitude)"
+        )
+    return "\n".join(lines)

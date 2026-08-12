@@ -325,3 +325,26 @@ def test_num_local_experts_alias_is_not_read_as_dense():
 
 def test_config_with_no_expert_count_is_dense_not_an_error():
     assert resolve_moe_layers({"num_hidden_layers": 3}) == []
+
+
+def test_concentration_report_reads_a_dead_tail_and_the_lack_of_one():
+    """The four numbers that decide prunability, printed at profile time instead
+    of requiring a scratch numpy script (which is how the log-domain experiment
+    actually had to compute them)."""
+    import numpy as np
+
+    from vllm_moe_surgeon.telemetry.stats import concentration_report
+
+    # A concentrated domain: half the experts near-dead.
+    concentrated = np.zeros((2, 8))
+    concentrated[:, :4] = [400, 300, 200, 100]
+    concentrated[:, 4:] = 1
+    text = concentration_report(concentrated)
+    assert "near-dead tail exists" in text
+    assert "calibrate" in text
+
+    # A flat profile: nothing free to delete.
+    flat = np.full((2, 8), 100)
+    text = concentration_report(flat)
+    assert "no dead tail" in text
+    assert "prefer the tier" in text

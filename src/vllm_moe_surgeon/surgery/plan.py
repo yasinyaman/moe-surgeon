@@ -611,6 +611,35 @@ def _cooccurrence_fraction(
     return float(stats.cooc[slot, donor, target]) / donor_tokens
 
 
+def deletion_mass(plan: Plan) -> dict:
+    """Per-layer routing mass the plan's pure deletions remove, and what follows.
+
+    Deletion shrinks the softmax to the survivors, inflating their gates by
+    1/(1-P_D) where P_D is the deleted mass. The correction is a single multiply
+    of ~(1-P_D) on the survivors' down_proj -- and the prediction matches
+    measurement: `calibrate` found 0.850 on two unrelated domains where the
+    plans' mean P_D was ~0.15, i.e. (1-P_D) = 0.85. So the plan can *predict*
+    the amplitude it will need, and an apply that skips it can be told what that
+    omission costs (measured: 1.47x instead of 1.17x on a narrow log domain).
+    """
+    per_layer: dict[int, float] = {}
+    for placement in plan.placements:
+        if placement.action == "drop" and placement.merge_target is None:
+            per_layer[placement.layer] = (
+                per_layer.get(placement.layer, 0.0) + float(placement.share)
+            )
+    if not per_layer:
+        return {"deletes": False}
+    shares = list(per_layer.values())
+    mean = sum(shares) / len(shares)
+    return {
+        "deletes": True,
+        "deleted_share_mean": round(mean, 4),
+        "deleted_share_max": round(max(shares), 4),
+        "suggested_amplitude": round(1.0 - mean, 3),
+    }
+
+
 def summarize_plan(plan: Plan) -> str:
     """A report a human can check before anything is written."""
     counts = plan.counts()
@@ -629,6 +658,19 @@ def summarize_plan(plan: Plan) -> str:
         p for p in plan.placements if p.action == "drop" and p.merge_target is None
     ]
     lines.append(f"of the dropped: {len(merged)} merged away, {len(deleted)} deleted")
+    mass = deletion_mass(plan)
+    if mass["deletes"]:
+        lines.append(
+            f"deleted routing mass: mean {100 * mass['deleted_share_mean']:.1f}%/layer "
+            f"(max {100 * mass['deleted_share_max']:.1f}%) -- survivors' gates inflate "
+            f"~1/(1-P_D); apply with --amplitude ~{mass['suggested_amplitude']} or run "
+            "`surgeon calibrate`"
+        )
+    elif counts["keep_on_disk"]:
+        lines.append(
+            "nothing will be deleted (tier-first default): the tail is placed on "
+            "disk. Pass --disk-experts 0 to delete it instead."
+        )
     if plan.untouched_layers:
         lines.append(f"untouched layers: {sorted(plan.untouched_layers)}")
     for warning in plan.warnings:

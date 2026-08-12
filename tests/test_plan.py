@@ -545,3 +545,87 @@ def test_the_gate_excludes_merge_donors_from_what_it_zeroes():
     assert verdict["merges_not_gated"] == 1
     assert "zeroing cannot emulate a merge" in verdict["reason"]
     assert "deletes nothing" in verdict["reason"]
+
+
+# ----------------------------------------------------------------------
+# What the log-domain experiment (DECISIONS: "Narrow-domain pruning") taught,
+# encoded in the tool instead of only in the register.
+# ----------------------------------------------------------------------
+
+
+def test_the_plan_predicts_the_amplitude_it_will_need():
+    """Deletion inflates surviving gates by 1/(1-P_D), and the prediction matched
+    measurement twice: calibrate found 0.850 on two unrelated domains where the
+    plans' mean deleted share was ~0.15. The plan carries that prediction so the
+    apply step cannot claim it was never told."""
+    from vllm_moe_surgeon.surgery.plan import (
+        ExpertPlacement,
+        Plan,
+        deletion_mass,
+        summarize_plan,
+    )
+
+    def _drop(layer, expert, share):
+        return ExpertPlacement(
+            layer=layer, expert=expert, action="drop", tokens=100,
+            share=share, importance_share=share, reason="test",
+        )
+
+    def _core(layer, expert):
+        return ExpertPlacement(
+            layer=layer, expert=expert, action="merge_into_core", tokens=900,
+            share=0.9, importance_share=0.9, reason="test",
+        )
+
+    plan = Plan(
+        model="m", revision=None, budget={"core_experts": 1},
+        placements=[
+            _core(0, 0), _drop(0, 1, 0.10), _drop(0, 2, 0.05),
+            _core(1, 0), _drop(1, 1, 0.15),
+        ],
+    )
+    mass = deletion_mass(plan)
+    assert mass["deletes"] is True
+    assert mass["deleted_share_mean"] == 0.15   # (0.15 + 0.15) / 2 layers
+    assert mass["suggested_amplitude"] == 0.85  # the measured value, twice
+    assert "--amplitude ~0.85" in summarize_plan(plan)
+
+
+def test_a_tier_only_plan_says_how_to_opt_into_deletion():
+    """The tier-first default cost this experiment a confused round: the plan
+    placed the tail on disk, the gate said "deletes nothing", and the reason was
+    only discoverable by reading another experiment's shell script. The report
+    now names the flag."""
+    from vllm_moe_surgeon.surgery.plan import ExpertPlacement, Plan, summarize_plan
+
+    plan = Plan(
+        model="m", revision=None, budget={"core_experts": 1},
+        placements=[
+            ExpertPlacement(layer=0, expert=0, action="merge_into_core",
+                            tokens=900, share=0.9, importance_share=0.9,
+                            reason="test"),
+            ExpertPlacement(layer=0, expert=1, action="keep_on_disk",
+                            tokens=100, share=0.1, importance_share=0.1,
+                            reason="test"),
+        ],
+    )
+    text = summarize_plan(plan)
+    assert "nothing will be deleted (tier-first default)" in text
+    assert "--disk-experts 0" in text
+
+
+def test_a_merge_donor_does_not_count_as_deleted_mass():
+    """Donors carry action=="drop" too, but their mass folds into a survivor
+    rather than vanishing -- counting them repeated the exact mistake the gate
+    once made with zeroed donors."""
+    from vllm_moe_surgeon.surgery.plan import ExpertPlacement, Plan, deletion_mass
+
+    plan = Plan(
+        model="m", revision=None, budget={"core_experts": 1},
+        placements=[
+            ExpertPlacement(layer=0, expert=1, action="drop", tokens=100,
+                            share=0.2, importance_share=0.2,
+                            merge_target=0, similarity=0.9, reason="merged"),
+        ],
+    )
+    assert deletion_mass(plan) == {"deletes": False}

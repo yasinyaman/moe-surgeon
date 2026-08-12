@@ -40,6 +40,10 @@ def _cmd_profile(args: argparse.Namespace) -> int:
         llm_kwargs=llm_kwargs,
     )
     print(summarize(stats))
+    from .telemetry.stats import concentration_report
+
+    print()
+    print(concentration_report(stats.tokens))
 
     if args.out:
         from .surgery.apply import environment
