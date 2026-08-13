@@ -209,6 +209,42 @@ adapting**: every host-served expert is hidden from the planner, so the cache
 only meets experts it already holds and its resident set freezes. The collapse
 in misses is masking, not learning.
 
+**Surgery decides where each expert goes, one layer at a time.** Experts are
+ranked by importance — rank-1 frequency where the capture supports it, token
+counts where it does not — and the ranking decides four outcomes, of which only
+the last is irreversible.
+
+```mermaid
+flowchart TD
+    PRF["profile<br>per-expert token counts"] --> THIN{"enough slots<br>per expert?"}
+    THIN -->|no| REF["refused<br>profile too thin to rank"]
+    THIN -->|yes| RNK["rank by importance<br>rank-1 frequency, else counts"]
+    RNK --> CORE{"inside core_experts?"}
+    CORE -->|yes| KEEP["core<br>stays resident"]
+    CORE -->|no| SIM{"similar core expert,<br>low co-occurrence?"}
+    SIM -->|yes| MRG["merged away<br>folded into the target"]
+    SIM -->|no| ASK{"deletion asked for?<br>share floor or disk budget"}
+    ASK -->|no| DSK["disk tier<br>the default for the tail"]
+    ASK -->|yes| GATE{"gate passed, bound<br>to this exact drop set?"}
+    GATE -->|no| STOP["apply refuses"]
+    GATE -->|yes| DEL["deleted<br>amplitude correction advised"]
+```
+
+Three things in that flow are deliberate. **Nothing is deleted unless asked**:
+with no share floor and no disk budget the whole tail lands on the tier, which
+is why `surgeon plan` on a cold tail reports "deletes nothing" until
+`--disk-experts 0` says otherwise. **A merge is not a deletion** — the donor's
+weights fold into a survivor, so merges are not gated, because zeroing an
+expert cannot emulate folding it. And **the gate is bound to the drop set it
+measured**, by digest: gating a small deletion and then editing more experts
+into the plan is caught at apply rather than silently authorised.
+
+Deletion is the one irreversible step in the pipeline and its cost is
+measurable before it is paid, so paying it unmeasured has to be an explicit
+choice. What the gate cannot certify is task accuracy — the ceiling is a
+perplexity ratio, and on a broad workload the same plan that passes it costs
+arc_challenge −25% relative.
+
 ## When pruning does pay: a narrow domain, measured
 
 Pruning costs quality on broad workloads (arc_challenge −25% relative on a
