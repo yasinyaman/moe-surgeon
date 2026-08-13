@@ -4,6 +4,55 @@ The offline pipeline: measure what a deployment uses, turn it into a plan,
 measure what the plan's deletions cost, and only then write the checkpoint.
 Also the measured case for why pruning is a last resort on these models.
 
+## Before any of it: is a smaller checkpoint already better?
+
+```bash
+surgeon headroom --corpus heldout.jsonl \
+  --model allenai/OLMoE-1B-7B-0924 \
+  --model ibm-granite/granite-3.0-3b-a800m-base
+```
+
+This is the cheapest question in the pipeline and it can retire the rest of it.
+Pruning buys footprint at a measured quality cost. Measured against an
+off-the-shelf 800M-active checkpoint on a log-triage domain, footprint came
+*free* and quality improved:
+
+```
+  model                                         bits/byte       ppl  B/token
+  ibm-granite/granite-3.0-3b-a800m-base            1.3395     11.58     2.64
+  allenai/OLMoE-1B-7B-0924                         1.4073     27.87     3.41
+
+best on this domain: ibm-granite/granite-3.0-3b-a800m-base (4.8% better bits/byte)
+```
+
+**Read the bits/byte column, not the ppl column.** Per-token perplexity is a
+property of the tokenizer as much as of the model: granite splits this text at
+2.64 bytes/token against OLMoE's 3.41, so its 11.58 against 27.87 is mostly an
+artefact of having more, easier tokens to predict. Bits per byte divides the
+same total loss by the *text* instead of by the tokenization, which is why it
+is the only figure comparable across models — the command says so itself
+whenever the candidates tokenize differently enough to mislead.
+
+Each candidate is scored in its own process. A vLLM engine does not release its
+device memory when the object goes out of scope, so a second model in the same
+process starts against the first one's allocation and fails to boot.
+
+**What a win here does and does not license.** It is held-out likelihood — how
+well the model compresses the domain's text — and this project has already
+measured likelihood and task accuracy parting ways: the pruned checkpoint kept
+a respectable perplexity while losing a quarter of arc_challenge. So treat a
+headroom win as permission to run the task evaluation, not as its result. In
+the case above the follow-up was run and held: against OLMoE at 500 items/task
+with paired exact McNemar, the smaller checkpoint gave up 1.4 points of
+arc_challenge acc_norm (p=0.51, not significant) where *pruning* had cost 11.6
+(p=5e-08), and was 3–5× better on gsm8k. The full entry is in
+[DECISIONS.md](../DECISIONS.md) under "Model selection, gated against pruning".
+
+Note what this does **not** displace: the tier. Its job is fitting a model that
+does not fit, and it composes with whichever checkpoint wins here — granite at
+3B bf16 is ~6.4 GiB, still above a 3.68 GiB laptop card. Only *pruning* was
+dominated.
+
 ## Profiling
 
 ```bash

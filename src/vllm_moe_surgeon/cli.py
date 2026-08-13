@@ -498,6 +498,57 @@ def _cmd_vram_floor(args: argparse.Namespace) -> int:
     return 0 if result.floor_fraction is not None else 1
 
 
+def _cmd_headroom(args: argparse.Namespace) -> int:
+    import tempfile
+
+    from .compat.headroom import Headroom, report, score_model, stage_corpus
+    from .compat.profile_runner import iter_prompts_from_jsonl
+
+    prompts = list(iter_prompts_from_jsonl(args.corpus, args.field))
+    if args.limit:
+        prompts = prompts[: args.limit]
+    if not prompts:
+        print(f"no prompts in {args.corpus}", file=sys.stderr)
+        return 1
+
+    llm_kwargs = json.loads(args.llm_kwargs) if args.llm_kwargs else {}
+    with tempfile.TemporaryDirectory() as tmp:
+        # Staged once: every candidate must be scored on byte-identical text.
+        staged = os.path.join(tmp, "corpus.jsonl")
+        corpus_bytes = stage_corpus(prompts, staged)
+        result = Headroom(
+            corpus=args.corpus, corpus_bytes=corpus_bytes, n_prompts=len(prompts)
+        )
+        for model in args.model:
+            print(f"scoring {model} ...", file=sys.stderr)
+            result.scores.append(
+                score_model(
+                    model,
+                    staged,
+                    llm_kwargs=llm_kwargs,
+                    timeout=args.timeout,
+                    corpus_bytes=corpus_bytes,
+                )
+            )
+
+    print(report(result))
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(
+                {
+                    "corpus": result.corpus,
+                    "corpus_bytes": result.corpus_bytes,
+                    "n_prompts": result.n_prompts,
+                    "scores": [vars(s) for s in result.scores],
+                },
+                f,
+                indent=2,
+            )
+        print(f"\nwritten to  {args.out}")
+    # Nothing scored is a failed measurement, not a verdict.
+    return 0 if result.ranked else 1
+
+
 def _cmd_seams(args: argparse.Namespace) -> int:
     from .compat.seams import SEAMS, check, check_all_static
 
@@ -770,6 +821,27 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--llm-kwargs", help="extra LLM() kwargs as JSON")
     p.add_argument("--out", help="write the curve as JSON here")
     p.set_defaults(func=_cmd_calibrate)
+
+    p = sub.add_parser(
+        "headroom",
+        help="score candidate checkpoints on a domain, before tiering or cutting",
+    )
+    p.add_argument(
+        "--corpus", required=True, help="HELD-OUT JSONL for the target domain"
+    )
+    p.add_argument("--field", default="text")
+    p.add_argument("--limit", type=int, help="cap the number of prompts")
+    p.add_argument(
+        "--model",
+        action="append",
+        required=True,
+        metavar="MODEL",
+        help="candidate model or checkpoint; repeat for each one to compare",
+    )
+    p.add_argument("--timeout", type=float, default=1800.0, help="per candidate")
+    p.add_argument("--llm-kwargs", help="extra LLM() kwargs as JSON")
+    p.add_argument("--out", help="write the scores here as JSON")
+    p.set_defaults(func=_cmd_headroom)
 
     p = sub.add_parser(
         "vram-floor",

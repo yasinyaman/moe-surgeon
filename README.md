@@ -110,6 +110,7 @@ copy if they differ.
 | serve, interactively | `surgeon run` | GPU |
 | size + serve | `surgeon autoconfig [--start]` | nothing |
 | "will it fit at all" | `surgeon budget` / `surgeon vram-floor` | nothing / GPU |
+| **is a smaller checkpoint already better** | `surgeon headroom` | GPU |
 | what does this deployment use | `surgeon profile` | GPU |
 | inspect routing signals | `surgeon inspect` | nothing |
 | choose a strategy | `surgeon recommend` | nothing |
