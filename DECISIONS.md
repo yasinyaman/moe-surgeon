@@ -62,6 +62,7 @@ Two readings worth keeping:
 | **cross-domain profile** as a cold-start prior | win: ρ +0.43, top-24 overlap 54% vs 37.5% random | n/a | n/a | **keep** — dominates static analysis, and profiling costs minutes |
 | **block dedup across experts** | n/a | n/a | n/a | **drop** — untested, and near-orthogonality makes duplicate blocks implausible in trained bf16 experts |
 | **correlation-driven disk layout** | n/a | no headroom: 6.0 MiB records already reach 93% of the NVMe ceiling on one thread | n/a | **drop** — the lever is already banked by the record-stride design |
+| **CPU expert co-execution** (`cpu_experts`) | win: zero GPU bytes; the run-at-all mode's misses stop paying H2D | **machine-split, measured both ways**: laptop 1.29–1.58× live (7.37 tok/s, the box's best ever; gate 3.7× at f=1.0, s=1.037); GB10 **0.719× — a loss** (unified memory, s=2.385) | small loss: not bit-exact (host reduction order + one fp32→bf16 join); first 12 greedy tokens matched in the A/B | **keep as a loud per-machine opt-in** — enable on discrete cards where `BW_cpu_gemm/BW_h2d` > 1, never on unified boxes; see the gate entry |
 
 > **Attribution and caveats for the residency-prior and EWMA rows.** The 2026-08-05 predecessor
 > measured the same question with a simulator validated bit-exact against live
@@ -493,6 +494,127 @@ by sha256 over every prompt's ids, one arm per process, greedy.
   served correctly and the box stayed up, so the half-the-host pinned-pool rule
   holds at the boundary it was written for.
 
+## CPU expert co-execution: gated, and measured dead on GB10 (2026-08-12)
+
+The capacity-substitution study left one live candidate: compute cold experts
+on the CPU from the host rows the tier already holds, instead of fetching them
+over H2D (Fiddler-shaped; surveyed at 1.6–2.2× from isolated primitives). The
+register's own rule — measure before committing — was applied as a single-layer
+gate on GB10 before any runtime code: real decode shape (B=8, top_k 8, cap 24,
+union ~40), 26 streaming weight sets, GPU arm vs a co-exec arm running the
+coldest half on 10 cores concurrently with the GPU half.
+
+**NO-GO, decisively.** GPU-only 6.07 ms/layer; co-exec 8.44 ms at f=0.5
+(ratio **0.719**, the gate needed ≥ 1.4; every f in 0.336–0.568 and nt in
+{10, 6} lost). The killer is measured contention: the CPU half ran **2.385×**
+slower under the live GPU than solo — statistically the same as the 2.33×
+"pessimistic" bound taken against a saturating GPU. On unified memory the
+balanced duty cycle does not exist: CPU GEMM reads, H2D copies, and the GPU's
+own weight reads all queue on one LPDDR5X controller, so the co-exec's premise
+("zero GPU bytes" buys a second bandwidth pool) is false on this box. The
+1.6–2.2× model assumed s ≤ ~1.5; the measurement refutes it where it was
+always weakest — the term the survey admitted was never hostilely reviewed.
+
+Two findings survive the death and are worth keeping:
+
+- **The T=1 GEMV cliff and its fix are now measured, twice.** A single-token
+  expert forward costs 1000.7–1497.7 µs on 10 cores; padding the token block
+  to 2 rows recovers it to 282.3–294.0 µs (~3.5–5.1×). The "pad to ≥2" fix was
+  asserted in the survey; it is now a number.
+- **The cold tail is a T=1 population.** Under B=8 decode with the hottest 24
+  resident, the cold experts carry almost exclusively one token each — a
+  min-tokens ≥ 2 *exclusion* empties the candidate set entirely (the first
+  gate run selected zero experts in every rep). Any future CPU-exec attempt
+  must pad, not exclude — and its per-expert arithmetic must use the T=1
+  padded cost, not the T=2 one.
+
+**L6 follow-up, same day: on the laptop the answer is GO — decisively.** The
+same gate, laptop shape (i7-12700H, RTX 3050 Ti, B=2, cap 4, pad-to-2
+arithmetic): H2D costs **1139.7 µs/record** over PCIe (11.0 GB/s) against the
+CPU's **368.8 µs/expert** (34.1 GB/s effective) — `BW_cpu_gemm/BW_h2d` =
+**3.09**, inside the survey's predicted 1.3–4 window. The concurrent arm:
+GPU-only 12.72 ms/layer vs **3.45 ms at f=1.0** (all eleven cold experts on
+the CPU) — **3.7×**, and implied contention **s = 1.037**: on a discrete card
+CPU DRAM reads and PCIe H2D genuinely are separate pools, the term that
+killed GB10 simply is not there. Two policy consequences, both measured: the
+winning fraction is **f = 1.0** — never H2D a cold expert on this class of
+machine, compute every one of them on the CPU — and the T=1-dominated cold
+tail costs 368.8 µs/expert *padded*, so the pad-never-exclude rule from the
+GB10 run carries over unchanged. Gate scripts: `bench/l5_cpu_coexec_gate.py`
+(GB10), `bench/l6_cpu_coexec_gate.py` (laptop). Implementation proceeds,
+laptop-targeted, per the approved plan: the feature is a per-machine opt-in
+whose one honest predictor is the measured `BW_cpu_gemm/BW_h2d` ratio — GB10
+class (unified, ratio < 1) stays refused-by-record; laptop class (discrete,
+ratio ~3) is the target.
+
+**Implemented and measured end-to-end, same day** (laptop, OLMoE bf16 store,
+B=2, cap 4, `split=expert`, eager, one arm per process, greedy, 2×128 tokens
+×3 repeats):
+
+| arm | ram_cache | decode | ratio | GPU misses | cpu_execs |
+|---|---|---|---|---|---|
+| off | 16 | 2.78 tok/s | — | 95,405 | 0 |
+| on | 16 | 3.58 tok/s | **1.29×** | 11,013 | 73,925 |
+| off | 24 | 4.66 tok/s | — | 95,405 | 0 |
+| on | 24 | **7.37 tok/s** | **1.58×** | 1,414 | 85,165 |
+
+Re-measured after this feature's own hostile review, since several fixes
+touch the hot path; the pre-review build read 1.37× and 1.52×. Compare within
+a pair, never across: each pair ran back-to-back with the flag as the only
+difference, while absolute tok/s drifts between sessions — the ram16 off arm
+measured 3.72 in one window and 2.78 in another with **byte-identical
+counters**, i.e. the same work on a differently-warmed disk-bound machine.
+
+7.37 tok/s is the fastest this laptop has served this model (the fp8 recipe
+topped out at 6.10, indirectly comparable at best — different store type).
+The mechanism is measured, not inferred: in-engine host cost is **356–377
+µs/expert against the gate's solo 368.8**, so contention inside the real
+engine is ≈1.0, exactly as the L6 gate predicted. The
+residual gap to the gate's 3.7× is the disk tier — the RAM pool (16–24 rows)
+is far below the 64-expert working set, so both arms still read cold rows off
+NVMe; the ram16→ram24 trend is that gap closing.
+
+**What the miss column does *not* mean.** 95,405 → 1,414 is not the cache
+learning. Every CPU-served expert is masked out before the planners see it,
+so `prepare()` only ever meets residents: no insertions, no evictions, the
+resident set frozen at whatever the last uncovered forward left. The misses
+became invisible. Two consequences to keep in mind when reading any counter
+from a co-exec run: the GPU tier's eviction policy is unreachable while
+co-exec covers the whole miss set, and a low GPU hit rate means the opposite
+of what it means without this mode. (An earlier draft of this entry
+attributed the collapse to "residency finally forming"; the hostile review
+of the implementation refuted it from the masking path.)
+
+The first 12 greedy tokens matched the baseline on both prompts — an
+observation, not a guarantee; the mode stays declared not-bit-exact.
+
+**Costs, recorded honestly.** v1 is silu-only and bf16-records-only (fp8
+records would need a CPU dequant twin); refused with CUDA graphs, zero-copy,
+fp8 checkpoints, non-silu activations and router-weight-on-input. One new
+data coupling (`layer.activation` semantics), zero new internal seams. Live
+catches worth keeping: `layer.activation` is an **enum** in this vLLM
+(`MoEActivation.SILU`), not a string — the first laptop boot was refused by
+our own check until the comparison normalized on `.value`; and the laptop's
+three pinning-strictness tests fail identically on the pre-change provider,
+i.e. environmental, verified by overlaying the old file.
+
+**Hostile review of the implementation, same day: ten findings, all fixed.**
+Four correctness bugs the A/B could not have surfaced — `cpu_release` outside
+a `try/finally` (a leaked protection entry made the RAM victim scan's bare
+assert reachable, killing the engine on a later forward); `out[rows] += …`
+lowering to a non-accumulating `index_put_`, which silently drops one term
+when a token routes to the same expert twice; `clamp_min(0)` folding `-1`
+padding into expert 0's count and pushing a genuinely cold expert 0 back onto
+the H2D path; and `cpu_views_for`'s fp8 guard testing `_store_fp8`, a flag
+true only for row-quantized *records*, so an fp8 **checkpoint**'s per-expert
+scales would have been dropped silently. Also fixed: `VLLM_MOE_CPU_EXPERTS=True`
+parsed as *off* (two env channels disagreeing), the thread knob applied too
+late for torch to honour it, a missing prefetch drain, and a second
+`_DECODE_ROWS` constant at 64 shadowing runtime.py's 512. The provider now
+serves as many experts as its pool can hold rather than asserting, and the
+oversubscription warning stands down under co-exec instead of advising the
+user to disable the mode.
+
 ## Hostile review of the day's commits (2026-08-12)
 
 Eight-angle adversarial review of everything after the previous review commit;
@@ -539,6 +661,10 @@ run even in a bare venv there), plus the GB10 fork venv with vLLM installed:
 
 ## Open
 
+- ~~CPU expert co-execution on the **laptop** (experiment L6).~~ **Gated GO
+  (2026-08-12): 3.7× at f=1.0, s=1.037, BW ratio 3.09** — see the gate entry
+  above. Runtime implementation in progress, laptop-targeted, per the approved
+  plan (fork-first provider views, `store/expert_cpu_exec.py`, loud opt-in).
 - ~~Streaming load.~~ **Done and measured.** The tier's boot floor went 23.40 GiB →
   **11.35 GiB**, against 14.60 GiB untiered — the tier is now 22% below untiered
   instead of 60% above. Removed 12.05 GiB where the accounting predicted 12.0 GiB for

@@ -12,6 +12,7 @@ here; it lives in :mod:`vllm_moe_surgeon.compat`, so that everything which knows
 about vLLM internals sits behind one seam.
 """
 
+from .expert_cpu_exec import run_with_cpu_coexec
 from .expert_disk_store import ALIGN, DiskExpertStore, quantize_rowwise_fp8
 from .expert_load_pipeline import (
     DiskLoadWorker,
@@ -39,6 +40,7 @@ __all__ = [
     "make_policy",
     "quantize_rowwise_fp8",
     "routing_trace_file",
+    "run_with_cpu_coexec",
     "run_with_expert_cache",
     "shutdown_disk_load_worker",
     "worker_count",

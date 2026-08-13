@@ -38,6 +38,24 @@ tier for a machine with no memory. Where the numbers do not allow a good answer 
 says so — a capacity below `top_k` comes with the warning that the expert split is
 not bit-exact, and a target that cannot fit at all is an error naming the shortfall.
 
+On a capacity-starved **discrete-card** machine, one more measured lever exists:
+`cpu_experts` (see [serving.md](serving.md)) serves the misses from the host CPU
+instead of over PCIe — 1.29× at `ram_cache 16` and 1.58× at `ram_cache 24` on the
+3.6 GiB laptop, growing as the RAM tier covers more of the working set, because
+the residual cost is the disk reads both arms share. The rule of thumb it obeys:
+enable it only where `BW_cpu_gemm > BW_h2d` (a discrete card; measured 3.09 there,
+0.78 on a unified box, where the same experiment is a loss), and keep
+`ram_cache − expert_cache_size` as large as the host allows.
+
+Expect the GPU cache's miss counter to collapse (95,405 → 1,414 in the A/B) —
+and read it correctly: **that is masking, not learning.** Every CPU-served
+expert is hidden from the planners, so the cache only ever sees experts it
+already holds; it stops inserting and stops evicting, and its resident set is
+frozen at whatever the last uncovered forward left. While co-exec covers the
+whole miss set the eviction policy is unreachable, and a low GPU hit rate on
+these runs means the opposite of what it means everywhere else in this
+document.
+
 ## Sizing it by hand: the only knob that matters, and what it costs
 
 Everything else in these documents is a mechanism. This is the number to get right, and it

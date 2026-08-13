@@ -64,6 +64,14 @@ Three levels, and they run in different places:
 
 A large `skipped` count on a laptop is expected, not a warning sign.
 
+One coupling worth naming here because it is behavioural rather than symbolic:
+`store/expert_cpu_exec.py` (CPU expert co-execution) re-implements the expert's
+silu act-and-mul on the host and assumes gate weights are applied after the
+expert. That is a dependency on what `layer.activation` *means*, not on a
+symbol existing — so it lives in `compat/seams.py`'s `DATA_COUPLINGS` table,
+and `validate()` refuses non-silu activations and router-weight-on-input
+models by name rather than diverging silently.
+
 ## Pricing a vLLM upgrade
 
 ```bash

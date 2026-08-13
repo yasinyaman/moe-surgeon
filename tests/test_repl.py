@@ -183,3 +183,20 @@ def test_the_first_fill_is_not_misdiagnosed_as_an_undersized_ram_tier():
         TierStats(hits=900, misses=100, ram_hits=50, ram_misses=50, layers=16)
     )
     assert "! evictions" in warm
+
+
+def test_tier_stats_carries_the_cpu_coexec_counters():
+    from vllm_moe_surgeon.compat.repl import TierStats, format_session
+
+    a = TierStats(hits=10, misses=2, cpu_execs=8, cpu_gemm_s=0.004, layers=16)
+    b = TierStats(hits=4, misses=1, cpu_execs=3, cpu_gemm_s=0.001, layers=16)
+    d = a - b
+    assert d.cpu_execs == 5
+    assert abs(d.cpu_gemm_s - 0.003) < 1e-9
+
+    text = format_session(a)
+    assert "CPU co-exec: 8 expert forwards" in text
+    # ... and the line stays out of a run that never used the host path.
+    assert "CPU co-exec" not in format_session(
+        TierStats(hits=10, misses=2, layers=16)
+    )

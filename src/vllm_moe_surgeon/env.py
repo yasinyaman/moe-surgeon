@@ -88,6 +88,18 @@ _SPEC: dict[str, tuple[Callable[[str], Any], Any]] = {
     # Cross-group RAM prefetch under the current group's kernel. Silently
     # no-ops unless ram_capacity >= 2 * capacity; rejects zero copy.
     "VLLM_MOE_DISK_PREFETCH": (_bool, False),
+    # CPU expert co-execution: compute cold experts on the host instead of
+    # fetching them over H2D. Measured 3.7x on a discrete card (l6 gate) and
+    # a LOSS on unified memory (l5 gate) -- per-machine opt-in, never a
+    # default, and not bit-exact.
+    "VLLM_MOE_CPU_EXPERTS": (_bool, False),
+    # Experts below this routed-token count stay on the GPU path. The T=1
+    # cliff is handled by pad-to-2 inside the CPU kernel, so 1 is the
+    # measured default -- excluding T=1 empties the candidate set entirely.
+    "VLLM_MOE_CPU_EXPERT_MIN_TOKENS": (int, 1),
+    # torch intra-op threads for the host GEMMs. 0 leaves the pool alone;
+    # 10-of-20 measured best on GB10-class hosts, 12 on the i7-12700H.
+    "VLLM_MOE_CPU_EXPERT_THREADS": (int, 0),
     # Row-scaled fp8-e4m3 records. bf16/fp16 unquantized checkpoints only.
     # Must be set identically at store-build time and at serve time.
     "VLLM_MOE_DISK_STORE_FP8": (_bool, False),

@@ -52,6 +52,11 @@ class TierStats:
     ram_hits: int = 0
     ram_misses: int = 0
     disk_bytes: int = 0
+    #: Expert forwards computed on the host by CPU co-execution. Their RAM
+    #: reads count as ram_hits/ram_misses (RAM-tier truth) but never as GPU
+    #: hits/misses -- those keep meaning "an H2D load happened".
+    cpu_execs: int = 0
+    cpu_gemm_s: float = 0.0
     layers: int = 0
 
     def __sub__(self, other: TierStats) -> TierStats:
@@ -61,6 +66,8 @@ class TierStats:
             ram_hits=self.ram_hits - other.ram_hits,
             ram_misses=self.ram_misses - other.ram_misses,
             disk_bytes=self.disk_bytes - other.disk_bytes,
+            cpu_execs=self.cpu_execs - other.cpu_execs,
+            cpu_gemm_s=self.cpu_gemm_s - other.cpu_gemm_s,
             layers=self.layers,
         )
 
@@ -99,6 +106,8 @@ def collect(llm: Any) -> TierStats | None:
                         getattr(provider, "ram_hits", 0),
                         getattr(provider, "ram_misses", 0),
                         getattr(provider, "n_disk_bytes", 0),
+                        getattr(provider, "cpu_execs", 0),
+                        getattr(provider, "t_cpu_gemm", 0.0),
                     )
                 )
         return out
@@ -116,6 +125,8 @@ def collect(llm: Any) -> TierStats | None:
         ram_hits=sum(r[2] for r in rows),
         ram_misses=sum(r[3] for r in rows),
         disk_bytes=sum(r[4] for r in rows),
+        cpu_execs=sum(r[5] for r in rows),
+        cpu_gemm_s=sum(r[6] for r in rows),
         layers=len(rows),
     )
 
@@ -152,9 +163,18 @@ def format_session(stats: TierStats) -> str:
             f"({100 * stats.ram_hits / ram_total:.1f}% hit rate)"
         )
     lines.append(f"  read off disk: {stats.disk_bytes / 1024**2:.0f} MiB")
+    if stats.cpu_execs:
+        per = stats.cpu_gemm_s / stats.cpu_execs * 1e6
+        lines.append(
+            f"  CPU co-exec: {stats.cpu_execs} expert forwards on the host "
+            f"({stats.cpu_gemm_s * 1e3:.0f} ms GEMM, {per:.0f} us/expert)"
+        )
 
     # The two misconfigurations this package measured, named when the counters
     # show them, because "it feels slow" is not a diagnosis.
+    # (Under cpu_experts, CPU-path disk reads count as ram_misses by design --
+    # RAM-resident-first selection keeps them rare, but the cold-fill equality
+    # below can be off by those reads on a co-exec run.)
     if rate < 0.5:
         lines.append(
             "  ! under half of expert lookups hit the GPU cache. Raising "

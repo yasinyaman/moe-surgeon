@@ -164,6 +164,7 @@ leave their domain. Full experiment in
 
 | doc | what it covers |
 |---|---|
+| [docs/benchmarks.md](docs/benchmarks.md) | every measured number in one place, with the machine and the method |
 | [docs/serving.md](docs/serving.md) | the out-of-tree runtime, fp8, the interactive prompt, cold start |
 | [docs/sizing.md](docs/sizing.md) | the measured sizing rules, autoconfig, boot floors, streaming load, CUDA graphs, the capacity sweep |
 | [docs/surgery.md](docs/surgery.md) | profiling, planning, pruning/merging, the amplitude fix, the quality gate |
@@ -182,6 +183,12 @@ including the tier's own costs, stated above rather than discovered later.
 - Serving: unquantized and fp8 checkpoints; piecewise CUDA graphs (no
   `--enforce-eager`); streaming load on by default; bit-exactness verified by
   token-stream hash across untiered, tiered and zero-copy runs.
+- CPU expert co-execution (`cpu_experts`, opt-in): on a discrete card, cold
+  experts are computed on the host instead of fetched over PCIe — measured
+  **1.29–1.58× live** on the small-VRAM laptop (7.37 tok/s, its best serve of
+  this model), and refused-by-record on unified-memory hosts where the same
+  experiment measured a loss. Not bit-exact, and loud about it. Numbers and
+  method: [docs/benchmarks.md](docs/benchmarks.md).
 - Sizing: measured rules (`expert_cache_size` toward the batch's per-layer union,
   `ram_cache` ≥ the expert count, `fp8_store` only under space pressure), applied
   automatically by `surgeon autoconfig` and cached per machine.
@@ -192,7 +199,9 @@ including the tier's own costs, stated above rather than discovered later.
   symbol when one moves. At last check: v0.27.1, zero required seams broken.
 - Known limits, refused loudly rather than mishandled: tensor parallelism (store
   identity has no rank component), block-quantised fp8, MoE layers with bias
-  terms, in-tree and out-of-tree cache both enabled.
+  terms, in-tree and out-of-tree cache both enabled; and for `cpu_experts`:
+  fp8 stores and checkpoints (no CPU dequant twin), zero-copy, CUDA graphs,
+  non-silu activations, router-weight-on-input models.
 
 [DECISIONS.md](DECISIONS.md) is the decision register: per-method verdicts on the
 three axes, the benchmarks behind every number quoted here, and the open items

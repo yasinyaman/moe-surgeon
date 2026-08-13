@@ -177,6 +177,13 @@ def make_surgeon_fp8_method(base_cls: Any) -> Any:
 
             validate(config, layer)
             refuse_unverified_fp8_scheme(self)
+            if config.cpu_experts:
+                raise ValueError(
+                    "cpu_experts is not implemented for fp8 checkpoints: the "
+                    "store holds fp8 weights plus per-expert scales and the "
+                    "CPU path has no dequantizing twin. Drop cpu_experts for "
+                    "this model."
+                )
 
             # --- copied from Fp8MoEMethod._setup_kernel, one line swapped -----------
             from vllm.model_executor.layers.fused_moe.oracle.fp8 import (

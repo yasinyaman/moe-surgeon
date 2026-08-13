@@ -48,6 +48,25 @@ goes through a `Fp8Config` shadowing the `"fp8"` config, and the override copies
 costs three more (optional) internal seams, the price recorded in
 [DECISIONS.md](../DECISIONS.md).
 
+**CPU expert co-execution** (`"cpu_experts": true` in the surgeon config) computes
+cold experts on the host from the RAM tier's rows instead of fetching them over
+H2D, and joins the partial into the MoE output in fp32. It engages only on
+decode-shaped forwards whose expert union exceeds `expert_cache_size`, and it is
+a **per-machine** decision: measured 1.29–1.58× live on a discrete-card laptop
+(where CPU DRAM reads and PCIe H2D are separate bandwidth pools) and a loss on a
+unified-memory host (same experiment, same code — the pools are one there). It
+is **not bit-exact** — the host GEMM's reduction order differs from the fused
+kernel's — and says so in a boot-time warning. Refused with: fp8 stores and fp8
+checkpoints (the records would need a CPU dequant twin), zero-copy, CUDA graphs,
+non-silu activations, and router-weight-on-input models. `/stats` reports
+`CPU co-exec: N expert forwards` with the per-expert host cost, so the path
+proves it ran rather than being assumed to. Knobs:
+`cpu_expert_min_tokens` (default 1 — single-token experts are padded to two
+rows inside the kernel, the measured fix for the 5× GEMV cliff, never excluded)
+and `VLLM_MOE_CPU_EXPERT_THREADS` (0 leaves torch's pool alone; 12 measured
+best on an i7-12700H). Full measurements in
+[DECISIONS.md](../DECISIONS.md) under "CPU expert co-execution".
+
 ## Trying it interactively
 
 ```bash

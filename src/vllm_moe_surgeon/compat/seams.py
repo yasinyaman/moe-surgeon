@@ -533,6 +533,17 @@ DATA_COUPLINGS: tuple[tuple[str, str, str], ...] = (
         "a change to the encoding decodes to garbage, not an error",
     ),
     (
+        "store/expert_cpu_exec.py",
+        "layer.activation string semantics -- the CPU co-execution path "
+        "re-implements 'silu' act-and-mul exactly as the fused kernel computes "
+        "it, and assumes topk_weights are NOT folded into the input "
+        "(apply_router_weight_on_input=False); validate() refuses both "
+        "deviations by name",
+        "a changed activation meaning or a new weight-folding mode diverges "
+        "host-computed expert outputs from the kernel's, as wrong output "
+        "rather than an error",
+    ),
+    (
         "telemetry/layers.py",
         "RoutedExptsCapturer sizes its buffer by num_hidden_layers and zeroes it each "
         "step, so dense-layer rows read as 'expert 0 chosen by every token'; and the "

@@ -40,6 +40,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from .. import env as envs
 from .._logging import init_logger
 
 logger = init_logger(__name__)
@@ -62,6 +63,23 @@ class RuntimeConfig:
     #: OLMoE) and buys nothing, so nobody should land on it by accident. Set it
     #: explicitly to False to force the old path.
     stream_load: bool | None = None
+    #: Compute cold experts on the host instead of fetching them over H2D.
+    #: A per-machine opt-in, never a default: measured 3.7x on a discrete
+    #: card (the PCIe H2D and the CPU's DRAM reads are separate pools) and a
+    #: LOSS on unified memory, where they are the same pool (DECISIONS "CPU
+    #: expert co-execution"). Not bit-exact -- the host GEMM's reduction
+    #: order differs from the fused kernel's.
+    cpu_experts: bool = False
+    #: Experts below this routed-token count stay on the GPU path. The T=1
+    #: GEMV cliff is handled by pad-to-2 inside the CPU kernel, so 1 is the
+    #: measured default; excluding T=1 empties the candidate set entirely.
+    cpu_expert_min_tokens: int = 1
+    #: torch intra-op threads for the host GEMMs. 0 leaves the pool alone.
+    #: Applied at weight-load time, not on the first co-exec forward: torch
+    #: documents set_num_threads as needing to run before parallel work
+    #: starts, so a lazy call mid-serve can be ignored outright -- silently
+    #: forfeiting the measured tuning (12 on the i7-12700H).
+    cpu_expert_threads: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -133,6 +151,19 @@ def read_config_from(vllm_config: Any) -> RuntimeConfig:
         stream_load=_tri_state(
             payload.get("stream_load", os.environ.get("VLLM_MOE_STREAM_LOAD")),
         ),
+        # Through env.py so the documented spellings (yes/on/True) mean here
+        # what its _SPEC says they mean; reading os.environ directly made
+        # VLLM_MOE_CPU_EXPERTS=True parse as *off*, with no warning and no
+        # mode tag -- the feature simply never engaged.
+        cpu_experts=bool(payload.get("cpu_experts", envs.VLLM_MOE_CPU_EXPERTS)),
+        cpu_expert_min_tokens=int(
+            payload.get(
+                "cpu_expert_min_tokens", envs.VLLM_MOE_CPU_EXPERT_MIN_TOKENS
+            )
+        ),
+        cpu_expert_threads=int(
+            payload.get("cpu_expert_threads", envs.VLLM_MOE_CPU_EXPERT_THREADS)
+        ),
     )
 
 
@@ -194,6 +225,30 @@ def check_config(config: RuntimeConfig) -> None:
             "store is being built. Set store_dir and ram_cache, or drop fp8_store."
         )
 
+    if config.cpu_experts and config.fp8_store:
+        raise ValueError(
+            "cpu_experts computes offloaded experts from the host records, and an "
+            "fp8_store's records hold fp8 bytes plus scales -- the CPU path would "
+            "have to dequantize every forward, which is not implemented. Drop "
+            "fp8_store, or drop cpu_experts."
+        )
+
+    if config.cpu_experts:
+        if envs.VLLM_MOE_ZERO_COPY:
+            raise ValueError(
+                "VLLM_MOE_ZERO_COPY makes the pinned pool the set the kernel "
+                "reads directly, so there is no cold host tier left to compute "
+                "from and an eviction is kernel-visible. Drop one of the two."
+            )
+
+    if config.cpu_expert_min_tokens < 1:
+        raise ValueError(
+            f"cpu_expert_min_tokens={config.cpu_expert_min_tokens} is below 1. "
+            "Single-token experts are handled by pad-to-2 inside the CPU kernel "
+            "(measured: 1000-1500 us raw vs ~300 us padded); the knob only "
+            "raises the bar, it cannot go below one token."
+        )
+
 
 def validate(config: RuntimeConfig, layer: Any) -> None:
     """Refuse the combinations this port does not implement, by name.
@@ -243,6 +298,27 @@ def validate(config: RuntimeConfig, layer: Any) -> None:
             "than silently served wrong."
         )
 
+    if config.cpu_experts:
+        # Layer-only checks, before anything touches vLLM: testable anywhere.
+        activation = getattr(layer, "activation", None)
+        # A string in older vLLMs, a MoEActivation enum in newer ones -- the
+        # enum's value is the string. Caught live: the first laptop boot was
+        # refused for using <MoEActivation.SILU: 'silu'>.
+        name = getattr(activation, "value", activation)
+        if name != "silu":
+            raise ValueError(
+                "cpu_experts re-implements the expert activation on the host, "
+                f"and only 'silu' has a verified CPU twin; this layer uses "
+                f"{activation!r}. Drop cpu_experts for this model."
+            )
+        if getattr(layer, "apply_router_weight_on_input", False):
+            raise ValueError(
+                "cpu_experts applies the gate weights after the expert, and "
+                "this model folds them into the input (top_k==1 style) -- the "
+                "CPU path would double-apply them. Refused rather than "
+                "silently wrong."
+            )
+
     from vllm.config import CUDAGraphMode, get_current_vllm_config
 
     from .graph_runtime import moe_split_active
@@ -270,6 +346,15 @@ def validate(config: RuntimeConfig, layer: Any) -> None:
             "both the in-tree expert cache (--moe-expert-cache-size) and the "
             "out-of-tree one (additional_config.surgeon) are enabled. Pick one; "
             "they would each try to own the same expert weights."
+        )
+
+    if config.cpu_experts and graphs_on:
+        raise ValueError(
+            "cpu_experts joins a host-computed partial into the MoE output "
+            "on every forward; a captured graph replays without the host, "
+            "and the piecewise split copies the MoE output to a "
+            "capture-stable address before the join could land. Pass "
+            "--enforce-eager, or drop cpu_experts."
         )
 
 
@@ -411,6 +496,17 @@ def _warn_if_oversubscribed(layer: Any, provider: Any, topk_ids: Any) -> None:
         return
     capacity = getattr(provider, "capacity", 0)
     if not capacity:
+        return
+    if getattr(layer, "_surgeon_config", None) is not None and (
+        layer._surgeon_config.cpu_experts
+    ):
+        # Under co-execution both halves of this message are false: the cold
+        # experts were computed on the host with no H2D at all, and taking
+        # every miss removes the chunk split. Worse, its remedy -- raise
+        # expert_cache_size toward the union -- shrinks the co-exec headroom
+        # (ram_cache - expert_cache_size), i.e. it advises disabling most of
+        # the mode. The oversubscription it describes is the mode's premise.
+        layer._surgeon_capacity_warned = True
         return
     if getattr(provider, "split", None) == "expert":
         # An explicit expert split IS the acknowledgement that the device cannot
@@ -615,11 +711,35 @@ def install() -> bool:
                 (
                     f"disk-backed (ram_cache={config.ram_cache}"
                     f"{', fp8' if config.fp8_store else ''}"
-                    f"{', streamed' if config.streams else ''})"
+                    f"{', streamed' if config.streams else ''}"
+                    f"{', cpu-coexec' if config.cpu_experts else ''})"
                     if config.use_disk
                     else "full-DRAM: every expert stays pinned in host memory"
+                    + (", cpu-coexec" if config.cpu_experts else "")
                 ),
             )
+            if config.cpu_experts:
+                # Loud on purpose: this mode is not bit-exact, and it is a
+                # per-machine decision -- measured 3.7x on a discrete card
+                # and a loss on unified memory (DECISIONS "CPU expert
+                # co-execution").
+                if config.cpu_expert_threads > 0:
+                    # Here, not on the first co-exec forward: torch documents
+                    # set_num_threads as needing to run before parallel work
+                    # begins, so a lazy call mid-serve can be ignored with
+                    # only a warning -- silently forfeiting the tuning the
+                    # gates measured while the gates, which set it in a fresh
+                    # process, keep showing the win.
+                    import torch
+
+                    torch.set_num_threads(config.cpu_expert_threads)
+                logger.warning(
+                    "cpu_experts is ON for %s: cold experts are computed on "
+                    "the host and joined in fp32 -- NOT bit-exact with the "
+                    "fused kernel, and only a win on machines where CPU DRAM "
+                    "and H2D are separate bandwidth pools (discrete GPUs).",
+                    layer.layer_name,
+                )
 
         def apply(self, layer, x, topk_weights, topk_ids, shared_experts,
                   shared_experts_input):
@@ -630,7 +750,7 @@ def install() -> bool:
                     shared_experts_input,
                 )
 
-            from ..store import run_with_expert_cache
+            from ..store import run_with_cpu_coexec, run_with_expert_cache
 
             _warn_if_oversubscribed(layer, provider, topk_ids)
 
@@ -655,6 +775,14 @@ def install() -> bool:
                     ),
                 )
 
+            cfg = getattr(layer, "_surgeon_config", None)
+            if cfg is not None and cfg.cpu_experts:
+                out = run_with_cpu_coexec(
+                    provider, x, topk_ids, topk_weights, run,
+                    min_tokens=cfg.cpu_expert_min_tokens,
+                )
+                if out is not None:
+                    return out
             return run_with_expert_cache(provider, topk_ids, run)
 
     # Called on the class being replaced, so register_oot's default reg_name is

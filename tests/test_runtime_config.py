@@ -352,3 +352,87 @@ def test_an_explicit_expert_split_suppresses_the_capacity_warning(caplog):
         _warn_if_oversubscribed(layer, _SplitProvider(), None)
     assert not caplog.records
     assert layer._surgeon_capacity_warned is True
+
+
+# ----------------------------------------------------------------------
+# CPU expert co-execution: the refusals, each naming its measured reason.
+# ----------------------------------------------------------------------
+
+
+def test_cpu_experts_with_fp8_store_is_refused():
+    config = RuntimeConfig(
+        expert_cache_size=4, store_dir="/s", ram_cache=16,
+        fp8_store=True, cpu_experts=True,
+    )
+    with pytest.raises(ValueError, match="dequantize every forward"):
+        check_config(config)
+
+
+def test_cpu_experts_with_zero_copy_is_refused(monkeypatch):
+    monkeypatch.setenv("VLLM_MOE_ZERO_COPY", "1")
+    config = RuntimeConfig(
+        expert_cache_size=4, store_dir="/s", ram_cache=16, cpu_experts=True,
+    )
+    with pytest.raises(ValueError, match="no cold host tier"):
+        check_config(config)
+
+
+def test_cpu_expert_min_tokens_below_one_is_refused():
+    """Pad-to-2 inside the kernel handles T=1 (measured 1000-1500 us raw vs
+    ~300 padded); the knob can only raise the bar, not go below one."""
+    config = RuntimeConfig(
+        expert_cache_size=4, store_dir="/s", ram_cache=16,
+        cpu_experts=True, cpu_expert_min_tokens=0,
+    )
+    with pytest.raises(ValueError, match="pad-to-2"):
+        check_config(config)
+
+
+def test_cpu_experts_refuses_a_non_silu_activation():
+    layer = _Layer()
+    layer.activation = "gelu"
+    layer.apply_router_weight_on_input = False
+    with pytest.raises(ValueError, match="verified CPU twin"):
+        validate(
+            RuntimeConfig(expert_cache_size=24, ram_cache=0, cpu_experts=True),
+            layer,
+        )
+
+
+def test_cpu_experts_refuses_router_weight_on_input():
+    layer = _Layer()
+    layer.activation = "silu"
+    layer.apply_router_weight_on_input = True
+    with pytest.raises(ValueError, match="double-apply"):
+        validate(
+            RuntimeConfig(expert_cache_size=24, ram_cache=0, cpu_experts=True),
+            layer,
+        )
+
+
+def test_cpu_expert_knobs_accept_the_spellings_env_py_advertises(monkeypatch):
+    """Read through env.py, not os.environ: VLLM_MOE_CPU_EXPERTS=True parsed
+    as *off* under the old `in ("1", "true")` check -- no refusal, no warning,
+    no mode tag, the feature simply never engaged."""
+    from vllm_moe_surgeon.compat.runtime import read_config_from
+
+    for spelling in ("True", "yes", "on", "1"):
+        monkeypatch.setenv("VLLM_MOE_CPU_EXPERTS", spelling)
+        assert read_config_from(None).cpu_experts is True, spelling
+    monkeypatch.setenv("VLLM_MOE_CPU_EXPERTS", "0")
+    assert read_config_from(None).cpu_experts is False
+
+
+def test_cpu_expert_threads_is_reachable_from_additional_config():
+    """The one knob measured to matter (12 on the i7-12700H) was env-only,
+    so a deployment using the documented additional_config channel could
+    enable the mode but not tune it."""
+    from vllm_moe_surgeon.compat.runtime import read_config_from
+
+    class _Cfg:
+        additional_config = {"surgeon": {"cpu_experts": True,
+                                         "cpu_expert_threads": 12}}
+
+    config = read_config_from(_Cfg())
+    assert config.cpu_experts is True
+    assert config.cpu_expert_threads == 12
