@@ -47,6 +47,32 @@ numbers below are measured, on hardware, and reproduced in this README:
   measurement; `surgeon autoconfig` applies those rules to your machine so you do
   not rediscover them the slow way.
 
+## The numbers, in one table
+
+Every row measured on hardware, one arm per process, decode timed on a
+short-prompt/long-generation workload after a warm-up. Method, machines and
+the full set: [docs/benchmarks.md](docs/benchmarks.md).
+
+| what | machine | measured | reading |
+|---|---|---|---|
+| **serves a 12.9 GiB model on a 3.7 GiB card** | laptop | 2.69 GiB peak, 7.7 tok/s | untiered never boots — the host swaps itself unreachable |
+| **load time** | GB10 | 13–15 s vs 118 s untiered | ~8×, from streaming into the store |
+| **boot floor** | GB10 | 11.55 vs 14.29 GiB untiered | 19% below untiered (streamed fp8) |
+| **capacity, the one knob** | GB10 | 54.3 → 145.1 tok/s (cap 24 → 48) | **2.67×** across one integer, perplexity identical |
+| decode, correctly sized | GB10 | 145.1 vs 218.5 untiered | 0.66× — the cost, stated |
+| **CPU co-execution** | laptop | 4.66 → 7.37 tok/s | **1.58×**, opt-in, discrete cards only |
+| CPU co-execution | GB10 | 0.719× | a **loss** on unified memory — refused by record |
+| tier transparency | GB10 | identical token hashes, 9/9 | untiered ≡ tiered ≡ zero-copy |
+| pruning, broad domain | GB10 | 1.25× perplexity, arc −25% | why deletion is a last resort |
+| pruning, narrow domain | GB10 | 1.17× ppl, +25% decode, −4.5 GiB | where deletion does pay |
+
+The two rows that disagree with each other are the point: the same CPU
+co-execution code wins 1.58× on a discrete card and loses on unified memory,
+because the whole mechanism depends on whether host DRAM and device transfers
+are separate bandwidth pools. Measured `BW_cpu_gemm/BW_h2d` is 3.09 on the
+laptop and 0.78 on GB10 — that ratio is the predictor, and it is why this one
+ships as a per-machine opt-in rather than a default.
+
 ## Quick start
 
 Not on PyPI yet — install from the repository:
