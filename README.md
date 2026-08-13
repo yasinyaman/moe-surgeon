@@ -139,6 +139,76 @@ The slots are paid for out of KV cache, not free device memory — capacity buys
 throughput and spends context. The full evidence, including the boot-floor
 instrument and the capacity sweep, is in [docs/sizing.md](docs/sizing.md).
 
+## How it fits together
+
+**Sizing runs before any engine boots.** The checkpoint is read from safetensors
+headers alone and the machine is probed once, so `surgeon autoconfig` answers in
+seconds without a GPU. Both readings are bucketed before they reach the cache
+key — free VRAM moves by a few MiB between two consecutive reads, and an exact
+key would never hit.
+
+```mermaid
+flowchart TD
+    HDR["checkpoint headers<br>experts, top_k, dtype"] --> FP["fingerprint<br>bucketed resources"]
+    PRB["machine probe<br>free VRAM, RAM, disk"] --> FP
+    FP -->|hit| CACHE["cached answer<br>no re-probe"]
+    FP --> DEC
+    subgraph DEC["decide"]
+        direction LR
+        CAP["capacity<br>min(union, what fits)"]
+        RAM["ram_cache<br>all experts, else fp8"]
+        SPL["split<br>expert if under top_k"]
+    end
+    DEC --> CFG["additional-config<br>or VLLM_MOE_ env vars"]
+    CFG --> VAL["check_config + validate<br>refuse by name, never guess"]
+    VAL --> EC["expert cache<br>misses fetch over H2D"]
+    VAL --> CX["cpu co-exec<br>host GEMM, fp32 join"]
+```
+
+Those three decisions are the whole of the sizing logic, and the table above is
+where each one's number comes from. Anything that would produce wrong output
+instead of an error — tensor parallelism, CUDA graphs without the MoE split,
+fp8 with `cpu_experts` — is refused by name, with the way out in the message.
+
+**A forward under co-execution splits one layer between two processors.** The
+trick is that the routing ids play two roles: a masked copy goes to the planner,
+so it never fetches what the host will compute, while the original goes to the
+kernel, so every surviving pair still gets its gate weight. Experts hidden by
+the expert map contribute zero, so nothing is counted twice.
+
+```mermaid
+flowchart TD
+    AP["apply<br>x, topk_ids, topk_weights"] --> CP["one copy of the ids to host<br>union and per-expert counts"]
+    CP --> SEL{"union exceeds capacity?"}
+    SEL -->|no| PLAIN["plain path<br>no co-execution"]
+    SEL -->|yes| PICK["select cold experts<br>GPU misses, RAM rows first"]
+    PICK --> PLAN
+    PICK --> ROWS
+    subgraph DEVICE["device"]
+        PLAN["planner sees masked ids<br>cold set hidden as -1"] --> KERN["kernel runs async<br>original ids weight it"]
+    end
+    subgraph HOST["host"]
+        ROWS["protected RAM rows<br>safe from eviction"] --> GEMM["silu GEMM per expert<br>single rows padded to two"]
+    end
+    KERN --> JOIN["add in fp32, cast once<br>expert outputs are additive"]
+    GEMM --> JOIN
+```
+
+The join is legal because an MoE output is a gate-weighted sum over the experts
+a token chose, so the sum can be taken a subset at a time — the same property
+the expert split already relies on. "Protected" is not decoration: a row being
+read by a host GEMM would otherwise be evictable mid-multiply, so those rows are
+skipped by both eviction scans between claim and release.
+
+Two things the diagram cannot show, both measured. The win is **not** the
+overlap: roughly 124 ms/token of PCIe transfer is replaced by ~41 ms/token of
+host compute, and the measured saving (~82 ms/token) is close to that
+difference — computing an expert is simply cheaper than moving it, on the right
+machine. And while co-execution covers the whole miss set, **the GPU cache stops
+adapting**: every host-served expert is hidden from the planner, so the cache
+only meets experts it already holds and its resident set freezes. The collapse
+in misses is masking, not learning.
+
 ## When pruning does pay: a narrow domain, measured
 
 Pruning costs quality on broad workloads (arc_challenge −25% relative on a
