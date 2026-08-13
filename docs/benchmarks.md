@@ -1,251 +1,226 @@
 # Benchmarks
 
-Every number this package claims, in one place, with the machine and the
-method next to it. The per-axis *verdicts* live in
-[DECISIONS.md](../DECISIONS.md); this page is the measurements themselves.
+Every number this package claims, with the machine and the method beside it.
 
-**Method, applied to every table below.** One arm per process — a vLLM engine
-does not release its device memory when the object goes out of scope, so a
-second arm in the same process starts against the first one's allocation.
-Decode is timed as output tokens over wall time on a short-prompt /
-long-generation workload (prompt share ~1%) after a warm-up pass, never as
-`full − prefill-only`. Repeats are medians with the spread reported; a single
-boot is not a measurement. Perplexity is held-out, and where token identity
-matters it is a sha256 over the generated ids, not a perplexity printed to
-four decimals.
+**Method, applied throughout.** One arm per process — a vLLM engine does not
+release its device memory when the object goes out of scope, so a second arm in
+the same process starts against the first one's allocation. Decode is timed as
+output tokens over wall time on a short-prompt / long-generation workload
+(prompt share ~1%) after a warm-up pass, never as `full − prefill-only`.
+Repeats are medians with the spread reported. Where token identity matters it
+is a sha256 over the generated ids.
 
-## The machines
+**Machines.**
 
-| name | device | host | role |
-|---|---|---|---|
-| **GB10** | DGX Spark, 121 GB unified LPDDR5X | 20× Cortex-X925 | the big box: throughput, capacity, graphs |
-| **laptop** | RTX 3050 Ti, 3.68 GiB usable | i7-12700H, 14.8 GB | the small box: feasibility, run-at-all |
+| name | device | host |
+|---|---|---|
+| **GB10** | DGX Spark, 121 GB unified LPDDR5X | 20× Cortex-X925 |
+| **laptop** | RTX 3050 Ti, 3.68 GiB usable | i7-12700H, 14.8 GB |
+
+Model unless stated: OLMoE-1B-7B-0924 (64 experts, top-8, 16 MoE layers,
+12.89 GiB bf16).
 
 ---
 
-## Capacity: the one knob that matters
+## Cache size
 
-OLMoE-1B-7B bf16, `ram_cache 64`, eager, 8 prompts × 256 tokens, 3 repeats.
-Measured twice — in-tree (2026-08-11) and again through the out-of-tree
-runtime (2026-08-12) — because "the OOT package reproduces every in-tree
-capability" is a claim that needed a throughput number, not just a test pass.
+GB10, bf16 store, `ram_cache 64`, eager, 8 prompts × 256 tokens, 3 repeats.
 
-| `expert_cache_size` (of 64) | in-tree decode | **OOT decode** | OOT load |
-|---|---|---|---|
-| 24 | 55.3 tok/s | **54.3 tok/s** | 33.0 s |
-| 32 | 75.5 | **74.6** | 19.0 s |
-| 40 | 107.9 | **109.3** | 16.8 s |
-| 48 | 143.0 | **145.1** | 16.9 s |
-| *untiered* | *218.2* | ***218.5*** | *128.9 s* |
+| `expert_cache_size` (of 64) | decode | load |
+|---|---|---|
+| 24 | 54.3 tok/s | 33.0 s |
+| 32 | 74.6 tok/s | 19.0 s |
+| 40 | 109.3 tok/s | 16.8 s |
+| **48** | **145.1 tok/s** | 16.9 s |
+| *untiered* | *218.5 tok/s* | *128.9 s* |
 
-**2.59× in-tree, 2.67× out-of-tree, across one integer.** The two
-implementations agree within 1–2% at every capacity. Perplexity was identical
-on all five OOT arms including untiered, so the lever is free on the accuracy
-axis. Load time is ~7.7× shorter under the tier (streaming); the first tiered
-arm's 33 s is a cold page cache, and later arms settle at 17–19 s.
+**2.67× across one integer.** Perplexity was identical on every row including
+untiered, so the lever is free on the accuracy axis.
 
-The cause is oversubscription, not bandwidth: at batch 8 the per-layer expert
-union measures 35.28 mean / 46 max, so 24 slots are 47% oversubscribed and
-every layer splits into 2–3 chunks, each paying a blocking D2H, its own
-mapping upload and a separate GEMM. At capacity ≥ 46 the split disappears.
+The cause is oversubscription. At batch 8 the per-layer expert union measures
+35.28 mean / 46 max, so 24 slots are 47% oversubscribed and every layer splits
+into 2–3 chunks, each paying a blocking device-to-host sync, its own mapping
+upload and a separate GEMM. At capacity ≥ 46 the split disappears.
 
-Sizing rules derived from this: [docs/sizing.md](sizing.md).
+## Host-RAM tier
 
-## CPU expert co-execution
+GB10, cache 24, eager.
 
-Cold experts computed on the host instead of fetched over the link. The
-decisive quantity is `BW_cpu_gemm / BW_h2d` — whether the CPU's DRAM reads
-and the GPU's inbound copies are separate bandwidth pools.
+| `ram_cache` | decode | spread |
+|---|---|---|
+| 48 | 33.6 tok/s | σ 0.315 |
+| 64 | **55.8 tok/s** | σ 0.044 |
 
-### The gate, before any code was written
+**1.66×**, and the spread collapse is the tell: a tier that spills to disk is
+erratic, not merely slow.
 
-Single layer, no engine, real decode shape, 26 streaming weight sets, median
-of 15 reps. Go/no-go was fixed in advance at ≥1.4×.
+## Numerical transparency
 
-| | GB10 (L5) | laptop (L6) |
+Seed-pinned greedy generation, sha256 over token ids, 3 repeats each of
+{untiered, tier cache 48 / ram 64, zero-copy}, one arm per process.
+
+**All nine runs produced the identical hash.** A correctly sized tier is
+numerically transparent, zero-copy included.
+
+The expert split (`split: "expert"`) is the exception and is documented as not
+bit-exact; so is `fp8_store`.
+
+## Feasibility
+
+`surgeon vram-floor` bisects the real minimum by booting and generating.
+
+| configuration | boot floor | fails below |
+|---|---|---|
+| untiered | 14.29 GiB | 0.115 |
+| tier, streamed fp8 | **11.55 GiB** | 0.092 |
+
+The tier boots **19% below** untiered. Without streaming load it was *above* it
+(23.40 GiB): on unified memory, page-locked host memory is charged against
+`gpu_memory_utilization`.
+
+On the laptop the answer is blunter: the tier serves the 12.9 GiB model at
+**2.69 GiB peak, 7.7 tok/s, 6.6 s load**. The untiered arm was never booted —
+the attempt drove the 14.8 GB host into swap and lost the session.
+
+Note that peak-VRAM readings on GB10 report the preallocated pool, not what a
+model needs; feasibility numbers come from `surgeon budget` and `vram-floor`.
+
+## CPU co-execution
+
+Cold experts computed on the host instead of fetched over the link.
+
+### Where it works, and where it does not
+
+Single layer, no engine, real decode shape, 26 streaming weight sets, median of
+15 repeats.
+
+| | GB10 (unified) | laptop (discrete) |
 |---|---|---|
 | GPU-only | 6.07 ms/layer | 12.72 ms/layer |
-| best co-exec | 8.44 ms (f=0.5) | **3.45 ms (f=1.0)** |
-| **ratio vs the ≥1.4 gate** | **0.719 — NO-GO** | **3.7× — GO** |
-| measured contention *s* | 2.385 | **1.037** |
-| H2D per record | 217 µs | 1139.7 µs |
-| CPU per expert (padded) | ~300 µs | 368.8 µs |
+| best co-exec | 8.44 ms | **3.45 ms** |
+| ratio | **0.719× — a loss** | **3.7× — a win** |
+| measured contention | 2.385 | 1.037 |
+| host→device per record | 217 µs | 1139.7 µs |
+| host GEMM per expert | ~300 µs | 368.8 µs |
 | `BW_cpu_gemm / BW_h2d` | 0.78 | **3.09** |
 
-Unified memory has one pool, so the host half and the GPU half fight for it
-and the co-exec arm loses. A discrete card has two, and the laptop's PCIe H2D
-is so much slower than its CPU GEMM that the winning policy is **f = 1.0**:
-never fetch a cold expert, compute all of them.
+Unified memory has one pool, so the host half and the device half compete for
+it. A discrete card has two, and there the PCIe transfer is slow enough that
+computing an expert beats moving it.
 
-Scripts: `bench/l5_cpu_coexec_gate.py`, `bench/l6_cpu_coexec_gate.py`.
+### In the engine
 
-### End to end, in the engine
+Laptop, bf16 store, batch 2, cache 4, expert split, eager, greedy, 2 prompts ×
+128 tokens, 3 repeats. The flag is the only difference between arms.
 
-Laptop, OLMoE bf16 store, B=2, `expert_cache_size 4`, `split=expert`, eager,
-greedy, 2 prompts × 128 tokens, 3 repeats. The flag is the only difference
-between arms.
-
-| arm | `ram_cache` | decode | ratio | GPU misses | host expert forwards |
-|---|---|---|---|---|---|
-| off | 16 | 2.78 tok/s | — | 95,405 | 0 |
-| **on** | 16 | **3.58 tok/s** | **1.29×** | 11,013 | 73,925 |
-| off | 24 | 4.66 tok/s | — | 95,405 | 0 |
-| **on** | 24 | **7.37 tok/s** | **1.58×** | 1,414 | 85,165 |
-
-**Compare within a pair, not across them.** Each pair was run back-to-back
-with the flag as the only difference; absolute tok/s drifts between sessions
-because the ram16 configuration is disk-bound and therefore sensitive to page
-cache and thermal state (its off arm measured 3.72 tok/s in an earlier
-window and 2.78 in this one, with byte-identical counters — same work,
-different machine). The ratios are what the flag controls.
-
-7.37 tok/s is the fastest this laptop has served this model; the fp8 recipe
-topped out at 6.10 — an indirect comparison, since that arm used a different
-store type. In-engine host cost measured **356–377 µs/expert against the
-gate's solo 368.8**, so contention inside the real engine is ≈1.0 — the
-gate's central prediction, confirmed where it counts.
-
-These are post-review numbers: the whole table was re-measured after the
-implementation's hostile review, because several of its fixes touch the hot
-path (the per-forward counts pass, the in-place join, and the thread knob
-moving to boot time where torch will actually honour it). The pre-review
-build measured 1.37× and 1.52× on the same two configurations.
-
-The residual gap to the gate's 3.7× is the disk tier: the RAM pool (16–24
-rows) is far below the 64-expert working set, so both arms still read cold
-rows off NVMe. The ram16 → ram24 trend is that gap closing.
-
-**Read the miss column correctly.** The collapse from 95,405 to 1,414 is
-*masking, not learning*: every CPU-served expert is hidden from the planners,
-so the GPU cache only ever sees experts it already holds — it stops inserting
-and stops evicting, and its resident set freezes. While co-execution covers
-the whole miss set, the eviction policy is unreachable and a low GPU hit rate
-means the opposite of what it means elsewhere in these docs.
-
-Not bit-exact by construction (host reduction order, one fp32 join). The
-first 12 greedy tokens matched the baseline on both prompts, which is an
-observation, not a guarantee.
-
-## Model selection, judged on all three axes
-
-`surgeon headroom` ranks candidates on domain likelihood. That is one axis, so
-the winner was then measured on the other two — same GB10, same harness as the
-capacity sweep (8 prompts × 256 tokens, 3 repeats, one arm per process,
-untiered and eager on both sides).
-
-| axis | OLMoE-1B-7B | granite-3.0-3b-a800m | |
+| `ram_cache` | off | on | ratio |
 |---|---|---|---|
-| decode | 218.33 tok/s | **329.55 tok/s** | **1.51×** |
-| load, this run | 115.8 s | **7.5 s** | ~15× |
-| resident weights | 12.89 GiB | **6.29 GiB** | 2.0× smaller |
-| bit-exact tier floor | 2.39 GiB | **1.79 GiB** | 1.3× smaller |
-| checkpoint on disk | 12.89 GiB | 12.57 GiB | **the same** |
-| log-domain bits/byte | 1.4073 | **1.3395** | 4.8% better |
-| arc_challenge acc_norm | 0.468 | 0.454 | ns (p=0.51) |
-| gsm8k strict | 0.088 | **0.354** | ~4× better |
+| 16 | 2.78 tok/s | 3.58 tok/s | **1.29×** |
+| 24 | 4.66 tok/s | **7.37 tok/s** | **1.58×** |
 
-OLMoE re-measured at 218.33 tok/s against the 218.2 and 218.5 already on
-record, so this is the same baseline the rest of this page uses.
+Compare within a pair, not across them: each pair ran back-to-back, while
+absolute throughput drifts between sessions on this disk-bound configuration.
 
-**Two corrections this measurement forced, both worth more than the headline.**
+In-engine host cost measured 356–377 µs/expert against the isolated 368.8, so
+contention inside the real engine is ≈1.0.
 
-The checkpoint is **not** smaller on disk. granite ships fp32, so 3B parameters
-occupy 12.57 GiB against OLMoE's 12.89 GiB at bf16 — the same download. What
-halves is *resident* weights (6.29 vs 12.89 GiB), because vLLM downcasts to two
-bytes at load. "Fewer parameters" and "smaller artifact" are not the same claim,
-and only the first one holds here.
+Not bit-exact. The GPU cache also stops adapting while co-execution covers the
+whole miss set — every host-served expert is hidden from the planner, so the
+resident set freezes.
 
-Peak VRAM is **not** the feasibility number on this machine. Both arms reported
-~50 GiB peak, which is `gpu_memory_utilization=0.42` of a 121 GiB unified box —
-the preallocated pool, identical for both models and telling you nothing about
-either. Feasibility comes from `surgeon budget`, which is where the resident and
-floor rows above come from.
+## Pruning
 
-**What this does not say.** It compares two training efforts, not two
-strategies: a stronger model per active parameter beating a weaker one says
-nothing about whether the tier helps the stronger one. The tier's job — fitting
-a model that does not fit — is untouched, and granite's 6.29 GiB resident is
-still well above a 3.68 GiB laptop card, so the tier still has work to do on the
-winner. Only *pruning* was dominated.
-
-## Surgery: what deletion costs and buys
-
-OLMoE-1B-7B, GB10, held-out gsm8k[400:500], baseline perplexity 9.703.
+GB10, held-out gsm8k, baseline perplexity 9.703.
 
 | configuration | load | decode | perplexity |
 |---|---|---|---|
 | baseline, 64 experts resident | 98.6 s | 689.4 tok/s | 9.703 |
-| disk tier, 24/64 resident | 45.2 s | 265.1 | 9.734 (1.003×) |
-| pruned to 40, no tier | 83.4 s | 695.1 | 12.115 (1.249×) |
-| **pruned to 40 + tier, 24/40** | **44.5 s** | **350.8** | 12.145 (1.252×) |
+| tier, 24 of 64 resident | 45.2 s | 265.1 tok/s | 9.734 (1.003×) |
+| pruned to 40, no tier | 83.4 s | 695.1 tok/s | 12.115 (1.249×) |
+| **pruned to 40 + tier** | **44.5 s** | **350.8 tok/s** | 12.145 (1.252×) |
 
-Pruned+tier decodes **1.32× faster than tier alone** at the same capacity: a
+Pruned+tier decodes **1.32× faster than tier alone** at the same cache size: a
 24-slot cache covers more of a 40-expert candidate set than a 64-expert one.
-This is why surgery exists to *support* the tier rather than compete with it.
 
-**Perplexity is a proxy, and here is where it misleads.** The same pruned-40
-checkpoint, `lm-eval` at 500 items/task with paired exact McNemar:
-arc_challenge acc_norm 0.468 → **0.352** (p=5e-08), hellaswag 0.662 → 0.618
-(p=0.014), gsm8k 0.100 → 0.058 (p=0.006). The amplitude fix removes ~60% of
-the perplexity damage and recovers **no** task accuracy (all three p ≥ 0.5).
+**Perplexity does not certify task accuracy.** The same pruned checkpoint,
+`lm-eval` at 500 items/task with paired exact McNemar:
 
-### When pruning does pay: a narrow domain
+| task (metric) | baseline | pruned-40 | Δ (p) | + amplitude 0.85 |
+|---|---|---|---|---|
+| arc_challenge (acc_norm) | 0.468 | 0.352 | **−0.116** (4.8e‑08) | 0.350 |
+| hellaswag (acc_norm) | 0.662 | 0.618 | −0.044 (0.014) | 0.622 |
+| gsm8k (exact, strict) | 0.100 | 0.058 | −0.042 (0.0055) | 0.068 |
 
-Real system logs (Linux+SSH+Apache triage), held-out log perplexity,
-baseline 27.89. Full experiment in [DECISIONS.md](../DECISIONS.md).
+The amplitude fix removes ~60% of the *perplexity* damage and recovers **no**
+task accuracy (p = 1.0, 0.83, 0.53).
+
+### On a narrow domain
+
+Real system logs (Linux + SSH + Apache triage prompts, held-out lines from the
+same files), baseline 27.89.
 
 | pruned to | applied | ratio |
 |---|---|---|
-| 56 of 64 (the dead tail) | 30.64 | 1.10× |
-| 40 of 64, **without amplitude** | 41.00 | **1.47× — the trap** |
-| 40 of 64, **with amplitude 0.85** | 32.53 | **1.17×** |
+| 56 of 64 | 30.64 | 1.10× |
+| 40 of 64, no amplitude | 41.00 | **1.47×** |
+| 40 of 64, amplitude 0.85 | 32.53 | **1.17×** |
 
-And the gain side, tier against tier at full coverage:
+Deletion inflates surviving gates by `1/(1−P_D)`; the plan predicts the
+correction from its own deleted routing mass (0.861 predicted against 0.850
+measured, 0.2% apart).
+
+Gains, tier against tier at full coverage:
 
 | configuration | GPU slot bytes | decode |
 |---|---|---|
-| **pruned-40 + tier, 40/40 resident** | **7.5 GiB** | **256.2 tok/s** |
-| unpruned + tier, 64/64 resident | 12.0 GiB | 205.1 |
-| unpruned, untiered | 12.0 GiB | 218.2 |
+| **pruned-40 + tier** | **7.5 GiB** | **256.2 tok/s** |
+| unpruned + tier | 12.0 GiB | 205.1 tok/s |
+| unpruned, untiered | 12.0 GiB | 218.2 tok/s |
 
-Pruning buys compute, not just memory — a 40-expert kernel is smaller than a
-64-expert one, so the pruned model beats even the untiered baseline.
+The pruned model beats even the untiered baseline: a 40-expert kernel is
+smaller than a 64-expert one, so pruning buys compute as well as memory.
 
-## Feasibility: the boot floor
+## Checkpoint selection
 
-`surgeon vram-floor` bisects the real minimum by booting, so this is measured
-rather than accounted.
+Scoring candidate checkpoints on a domain corpus, and what the winner serves at.
+Bits per byte rather than perplexity, because per-token perplexity depends on
+the tokenizer.
 
-| configuration | boot floor | fails below |
-|---|---|---|
-| OLMoE untiered | 14.29 GiB | 0.115 |
-| OLMoE tier, streamed fp8 | **11.55 GiB** | 0.092 |
+| | OLMoE-1B-7B | granite-3.0-3b-a800m | |
+|---|---|---|---|
+| log-domain bits/byte | 1.4073 | **1.3395** | 4.8% better |
+| decode | 218.33 tok/s | **329.55 tok/s** | 1.51× |
+| load | 115.8 s | **7.5 s** | ~15× |
+| resident weights | 12.89 GiB | **6.29 GiB** | 2.0× smaller |
+| bit-exact tier floor | 2.39 GiB | **1.79 GiB** | 1.3× smaller |
+| checkpoint on disk | 12.89 GiB | 12.57 GiB | the same |
+| arc_challenge acc_norm | 0.468 | 0.454 | not significant (p=0.51) |
+| gsm8k strict | 0.088 | **0.354** | ~4× better |
 
-The tier boots **19% below** untiered. Without streaming load it was *above*
-it (23.40 GiB) — the streaming path is what turned feasibility from a loss
-into a win.
+The checkpoint is not smaller on disk: granite ships fp32, so 3B parameters
+occupy as much as OLMoE's 7B at bf16. What halves is *resident* weights,
+because vLLM downcasts at load.
 
-On the laptop the same question has a blunter answer: the tier serves the
-12.9 GiB model at **2.69 GiB peak / 7.7 tok/s**, and the untiered arm was
-never booted — an attempt drove the 14 GB host into swap and lost the ssh
-session. That *is* the feasibility result.
+This compares two checkpoints, not two strategies, and it does not displace the
+tier — granite's 6.29 GiB resident is still well above a 3.68 GiB card.
 
-## What the fp8 store does and does not buy
+## fp8 store
 
 | axis | effect |
 |---|---|
 | VRAM | **none** — the provider dequantizes into model-dtype slots |
 | disk / host RAM / transfer | halved |
-| decode (bf16 model, cap 48) | 128.6 vs 143.0 tok/s — **1.11× slower** |
-| accuracy | not bit-exact (ppl 11.7393 vs 11.6253) |
+| decode (bf16 model, cache 48) | 128.6 vs 145.1 tok/s — **1.11× slower** |
+| accuracy | not bit-exact (11.7393 vs 11.6253 perplexity) |
 
-`fp8_store` is a **space** mechanism. Enable it when the store or the host
-RAM tier does not otherwise fit, never for speed.
+A **space** mechanism. Enable it when the store or the host RAM tier does not
+otherwise fit, never for speed.
 
-## Reproducing
+## CUDA graphs
 
-Scripts live in the workspace's `bench/` directory (outside the package, so
-they are free to modify): `cpu_coexec_ab_arm.py` and the two gate scripts for
-co-execution, plus the capacity-sweep and boot-floor harnesses. Raw results
-for the co-execution work are checked in as `bench/cpu_coexec_ab_results.json`
-and `bench/l6_result.json`.
+Piecewise capture with the MoE op carved out. Worth **+3.8%** on the untiered
+baseline and **~0** for the tier, by design: the split keeps the MoE op eager.
+Capture costs ~22 s of load time.
+
+Its value is compatibility — `--enforce-eager` is no longer required — not
+throughput.

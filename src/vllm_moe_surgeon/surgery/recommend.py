@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pick a strategy for a target, from properties measured rather than assumed.
 
-``DECISIONS.md`` carries two tables: what each method wins and loses on, and which
-subset a given target and model want. This is those tables as code, so the choice is
-made from the checkpoint's actual geometry and the profile's actual distribution
-instead of from a habit.
+Which method a target and model want, decided from the checkpoint's actual
+geometry and the profile's actual distribution instead of from a habit. The
+measurements behind each rule are in ``docs/benchmarks.md``.
 
 The rule it encodes, updated once task accuracy was measured: **the tier is the
 primary mechanism; deletion is a last resort.** The tier keeps every expert (cold

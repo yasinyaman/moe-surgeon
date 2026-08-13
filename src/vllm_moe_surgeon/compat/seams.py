@@ -17,7 +17,7 @@ An entry marked ``required=False`` is one we can currently live without -- an
 emerging upstream helper we would adopt if present (``_orient_fused_weight``), or a
 name held for a path that installs itself only when reached and declines gracefully
 when the name has moved (the fp8 method substitution, and the ``MoERunner``
-substitution that lifts the ``--enforce-eager`` requirement; see ``DECISIONS.md`` and
+substitution that lifts the ``--enforce-eager`` requirement; see
 :mod:`.graph_runtime`). Those paths degrade rather than crash on a missing name -- fp8
 falls back to no fp8 tier, the graph path back to requiring eager -- so their seams are
 news, not a broken pin. The table is not the *plan's* wishlist: an
@@ -326,7 +326,7 @@ SEAMS: tuple[Seam, ...] = (
         tier="internal",
         required=False,
         why=(
-            "RESERVED for the fp8 path (DECISIONS.md, not yet wired). The cache must "
+            "RESERVED for the fp8 path (not yet wired). The cache must "
             "be installed here, BEFORE get_fused_moe_quant_config captures the scale "
             "tensors. Getting this order wrong scales every expert by whichever one "
             "occupies its slot -- wrong output from the first token, no exception. "

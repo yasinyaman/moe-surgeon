@@ -361,7 +361,7 @@ def decide(
         warnings.append(
             f"host RAM holds only {ram_cache} of {geometry.num_experts} experts"
             f"{' even in fp8' if fp8 else ''}, so evictions will read disk; decode "
-            "will be slower and more variable than the numbers in DECISIONS.md"
+            "will be slower and more variable than the published numbers"
         )
 
     store_bytes = layers * geometry.num_experts * (record_fp8 if fp8 else record_bf16)

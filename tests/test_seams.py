@@ -106,7 +106,7 @@ def test_internal_seams_are_acknowledged():
     # Reviewers should see the ratio move when someone adds a private seam.
     # Raised 14 -> 17 on 2026-08-10 when the fp8 tier was wired: it adds
     # convert_to_fp8_moe_kernel_format / make_fp8_moe_kernel / Fp8MoeBackend, the
-    # surface expansion DECISIONS.md predicted for the fp8 path. All optional.
+    # surface expansion the fp8 path was expected to cost. All optional.
     # Raised 17 -> 28 on 2026-08-11 when the piecewise CUDA-graph path (S5) was
     # wired: it holds MoERunner + _forward_impl, splitting_ops,
     # max_cudagraph_capture_size, CUDAGraphMode, three forward_context names, and the

@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 # Deliberately minimal. The offline surgery pipeline must stay importable
-# without vLLM installed -- see docs/architecture.md. vLLM is an extra.
+# without vLLM installed. vLLM is an extra.
 dependencies = [
     "torch",
     "safetensors",
@@ -38,7 +38,7 @@ Issues = "https://github.com/yasinyaman/moe-surgeon/issues"
 # tests/test_seams.py is what tells you whether a wider pin is safe.
 # 0.26.1 was never released upstream -- the tags go 0.26.0 -> 0.26.1rc0 -> 0.27.0 --
 # so the floor named a version nobody can install. 0.26.0 is the oldest release the
-# seam check passes against; see DECISIONS.md for what the ceiling is waiting on.
+# seam check passes against.
 runtime = ["vllm>=0.26.0,<0.27"]
 server = ["fastapi", "uvicorn", "pydantic>=2", "huggingface_hub"]
 # fastapi+httpx so the TestClient tests run in CI (bare fastapi does not pull

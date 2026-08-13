@@ -7,7 +7,7 @@ that used to go to *any* cluster member. The usage-weighted mean the writer uses
 (:func:`~.apply._blend_expert_rows`) cannot express that: a softmax gate has no bias
 term, so the cluster's **combined selection mass** -- which is additive across members,
 not an average of their rows -- has nowhere to live in one averaged row. That is the
-gap ``DECISIONS.md`` names when it says merging's router rewrite "cannot represent the
+gap in merging's router rewrite: it "cannot represent the
 cluster's summed selection mass."
 
 The principled target is the cluster's log-sum-exp. For a softmax, the probability mass
