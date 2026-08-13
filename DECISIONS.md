@@ -615,6 +615,80 @@ serves as many experts as its pool can hold rather than asserting, and the
 oversubscription warning stands down under co-exec instead of advising the
 user to disable the mode.
 
+## Model selection, gated against pruning — and it wins (2026-08-13)
+
+The recurring proposal — "for a narrow domain, distil a small student instead
+of tiering or cutting experts" — was gated before any training compute, the
+same way CPU co-execution was. The gate never reached distillation, because
+its first rung answered the question outright.
+
+**D1, zero-shot headroom, no training.** `ibm-granite/granite-3.0-3b-a800m-base`
+(3B total, **800M active**) scored on the *same* held-out log corpus as the
+narrow-domain experiment, against OLMoE re-measured in the same session.
+Per-token perplexity is not comparable across tokenizers — granite splits this
+text at 2.64 bytes/token against OLMoE's 3.41 — so the honest metric is bits
+per byte:
+
+| model | active | bits/byte | per-token ppl |
+|---|---|---|---|
+| **granite-3.0-3b-a800m** | **800M** | **1.3395** | n/a (different tokenizer) |
+| OLMoE-1B-7B, full | 1B | 1.4073 | 27.87 |
+| OLMoE pruned-40 + amplitude | ~0.9B | 1.4727 | 32.53 |
+
+OLMoE re-measured at 27.87 against the recorded 27.89, so the harness
+reproduces the original experiment. A smaller off-the-shelf model models this
+domain **4.8% better than the unpruned teacher and 9.0% better than the pruned
+checkpoint**, with no training of any kind.
+
+**D2, does it keep general capability?** The objection D1 could not answer: the
+log domain still leans on the model's core (hot sets overlap gsm8k's at 56%),
+so a smaller model might win the domain and lose everything else. Same lm-eval
+protocol as the pruning run — 500 items/task, `--log_samples`, paired exact
+McNemar. OLMoE reproduced its recorded 0.468 / 0.662 exactly.
+
+| task (metric) | pruning cost (recorded) | granite vs OLMoE |
+|---|---|---|
+| arc_challenge acc_norm | −0.116 (p=4.8e‑08) | **−0.014 (p=0.51, ns)** |
+| hellaswag acc_norm | −0.044 (p=0.014) | −0.044 (p=0.0032) |
+| gsm8k strict | −0.042 (p=0.0055) | **+0.266 (p<1e‑4)** |
+| arc_challenge acc | n/a | −0.068 (p=0.0008) |
+
+**The uncomfortable reading, recorded because the register exists for exactly
+this.** On the task pruning destroyed, switching model costs nothing
+measurable; on gsm8k the smaller checkpoint is 3–5× better. **For this model
+and this domain, choosing a better small model dominates pruning on every
+axis** — better in-domain likelihood, no significant arc loss, far better
+gsm8k, 3B instead of 7B, and 12.8 s load against 84.2 s. Pruning's whole
+purpose was to buy footprint at a measured quality cost; here footprint comes
+free and quality improves.
+
+**Three limits, so this is not over-read.**
+
+- **It compares models, not strategies.** OLMoE-1B-7B-0924 and granite-3.0 are
+  different training efforts; a stronger model per active parameter beating a
+  weaker one says nothing about whether the tier helps the stronger one.
+- **It does not touch the tier.** The tier's job is fitting a model that does
+  not fit, and granite at 3B bf16 is ~6.4 GiB — still above the 3.68 GiB laptop
+  card. The tier composes with whatever checkpoint is chosen; only *pruning* is
+  dominated here.
+- **The domain metric is still a proxy.** D1 scores likelihood on prompt text
+  that is mostly log lines, i.e. compression of structured text, not triage
+  competence. And granite loses arc_challenge on raw `acc` even while matching
+  on `acc_norm` — the two metrics disagree, and the recorded protocol used
+  `acc_norm`.
+
+**Consequence for the distillation proposal: it is not needed for this case and
+was never reached.** If an off-the-shelf model of the target size already wins
+the domain and holds general capability, there is nothing to distil. Training
+compute stays unspent, the package stays training-free, and the standing advice
+gains a step that costs minutes: **before tiering or cutting, measure whether a
+smaller existing checkpoint already serves the domain better.** Distillation
+remains open only for the case this gate did not produce — a target size with
+no adequate off-the-shelf model.
+
+Scripts: `bench/d1_headroom.py`, `bench/d2_capability.sh`, paired analysis via
+`bench/eval_pair.py`.
+
 ## Hostile review of the day's commits (2026-08-12)
 
 Eight-angle adversarial review of everything after the previous review commit;
