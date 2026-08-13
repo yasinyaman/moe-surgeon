@@ -126,6 +126,48 @@ Not bit-exact by construction (host reduction order, one fp32 join). The
 first 12 greedy tokens matched the baseline on both prompts, which is an
 observation, not a guarantee.
 
+## Model selection, judged on all three axes
+
+`surgeon headroom` ranks candidates on domain likelihood. That is one axis, so
+the winner was then measured on the other two — same GB10, same harness as the
+capacity sweep (8 prompts × 256 tokens, 3 repeats, one arm per process,
+untiered and eager on both sides).
+
+| axis | OLMoE-1B-7B | granite-3.0-3b-a800m | |
+|---|---|---|---|
+| decode | 218.33 tok/s | **329.55 tok/s** | **1.51×** |
+| load, this run | 115.8 s | **7.5 s** | ~15× |
+| resident weights | 12.89 GiB | **6.29 GiB** | 2.0× smaller |
+| bit-exact tier floor | 2.39 GiB | **1.79 GiB** | 1.3× smaller |
+| checkpoint on disk | 12.89 GiB | 12.57 GiB | **the same** |
+| log-domain bits/byte | 1.4073 | **1.3395** | 4.8% better |
+| arc_challenge acc_norm | 0.468 | 0.454 | ns (p=0.51) |
+| gsm8k strict | 0.088 | **0.354** | ~4× better |
+
+OLMoE re-measured at 218.33 tok/s against the 218.2 and 218.5 already on
+record, so this is the same baseline the rest of this page uses.
+
+**Two corrections this measurement forced, both worth more than the headline.**
+
+The checkpoint is **not** smaller on disk. granite ships fp32, so 3B parameters
+occupy 12.57 GiB against OLMoE's 12.89 GiB at bf16 — the same download. What
+halves is *resident* weights (6.29 vs 12.89 GiB), because vLLM downcasts to two
+bytes at load. "Fewer parameters" and "smaller artifact" are not the same claim,
+and only the first one holds here.
+
+Peak VRAM is **not** the feasibility number on this machine. Both arms reported
+~50 GiB peak, which is `gpu_memory_utilization=0.42` of a 121 GiB unified box —
+the preallocated pool, identical for both models and telling you nothing about
+either. Feasibility comes from `surgeon budget`, which is where the resident and
+floor rows above come from.
+
+**What this does not say.** It compares two training efforts, not two
+strategies: a stronger model per active parameter beating a weaker one says
+nothing about whether the tier helps the stronger one. The tier's job — fitting
+a model that does not fit — is untouched, and granite's 6.29 GiB resident is
+still well above a 3.68 GiB laptop card, so the tier still has work to do on the
+winner. Only *pruning* was dominated.
+
 ## Surgery: what deletion costs and buys
 
 OLMoE-1B-7B, GB10, held-out gsm8k[400:500], baseline perplexity 9.703.

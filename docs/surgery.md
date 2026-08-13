@@ -49,9 +49,16 @@ arc_challenge acc_norm (p=0.51, not significant) where *pruning* had cost 11.6
 [DECISIONS.md](../DECISIONS.md) under "Model selection, gated against pruning".
 
 Note what this does **not** displace: the tier. Its job is fitting a model that
-does not fit, and it composes with whichever checkpoint wins here — granite at
-3B bf16 is ~6.4 GiB, still above a 3.68 GiB laptop card. Only *pruning* was
-dominated.
+does not fit, and it composes with whichever checkpoint wins here — granite's
+resident weights measure 6.29 GiB (`surgeon budget`), still well above a 3.68
+GiB laptop card. Only *pruning* was dominated.
+
+The winner was then measured on the other two axes, because a likelihood win is
+one third of the register's rule: **decode 329.55 against 218.33 tok/s (1.51×)**
+and resident weights halved. One correction that measurement forced — the
+checkpoint is *not* smaller on disk (granite ships fp32, 12.57 GiB against
+OLMoE's 12.89 GiB at bf16); what halves is resident weights, because vLLM
+downcasts at load. Full table in [benchmarks.md](benchmarks.md).
 
 ## Profiling
 

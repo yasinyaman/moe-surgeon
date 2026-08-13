@@ -668,7 +668,7 @@ free and quality improves.
   different training efforts; a stronger model per active parameter beating a
   weaker one says nothing about whether the tier helps the stronger one.
 - **It does not touch the tier.** The tier's job is fitting a model that does
-  not fit, and granite at 3B bf16 is ~6.4 GiB — still above the 3.68 GiB laptop
+  not fit, and granite's resident weights measure 6.29 GiB — still above the 3.68 GiB laptop
   card. The tier composes with whatever checkpoint is chosen; only *pruning* is
   dominated here.
 - **The domain metric is still a proxy.** D1 scores likelihood on prompt text
@@ -676,6 +676,29 @@ free and quality improves.
   competence. And granite loses arc_challenge on raw `acc` even while matching
   on `acc_norm` — the two metrics disagree, and the recorded protocol used
   `acc_norm`.
+
+**The other two axes, measured after the fact** (same GB10 harness as the
+capacity sweep, untiered and eager on both sides; OLMoE re-measured at 218.33
+tok/s against the 218.2/218.5 on record):
+
+| axis | OLMoE-1B-7B | granite-3.0-3b-a800m | |
+|---|---|---|---|
+| decode | 218.33 tok/s | **329.55 tok/s** | **1.51×** |
+| load, this run | 115.8 s | **7.5 s** | ~15× |
+| resident weights | 12.89 GiB | **6.29 GiB** | 2.0× smaller |
+| bit-exact tier floor | 2.39 GiB | **1.79 GiB** | 1.3× smaller |
+| checkpoint on disk | 12.89 GiB | 12.57 GiB | **the same** |
+
+Two corrections this forced, both worth more than the headline. **The
+checkpoint is not smaller on disk**: granite ships fp32, so 3B parameters
+occupy 12.57 GiB against OLMoE's 12.89 GiB at bf16 — the same download. What
+halves is *resident* weights, because vLLM downcasts at load. "Fewer
+parameters" and "smaller artifact" are separate claims and only the first holds
+here; an earlier draft of this entry implied both. And **peak VRAM is not the
+feasibility number on this box**: both arms reported ~50 GiB, which is
+`gpu_memory_utilization=0.42` of 121 GiB unified — the preallocated pool,
+identical for both and informative about neither. The resident and floor rows
+come from `surgeon budget`, which is the instrument for that question.
 
 **Consequence for the distillation proposal: it is not needed for this case and
 was never reached.** If an off-the-shelf model of the target size already wins
