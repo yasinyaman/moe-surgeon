@@ -43,7 +43,13 @@ logger = init_logger(__name__)
 #: Stages in the order they must run. A request names a subset; the runner keeps this
 #: order regardless of how the request listed them, because plan needs profile and
 #: gate needs plan.
-STAGE_ORDER = ("profile", "recommend", "plan", "gate", "apply", "tier")
+#: headroom runs first on purpose: it asks whether a smaller existing
+#: checkpoint already serves the domain better, and a yes retires every
+#: stage after it. Measuring that after a profile and a plan is measuring
+#: it after the regret.
+STAGE_ORDER = (
+    "headroom", "profile", "recommend", "plan", "gate", "apply", "tier",
+)
 
 
 class JobState(str, Enum):
@@ -251,6 +257,13 @@ def build_stages(spec: dict[str, Any], workdir: str) -> list[StageResult]:
     profile = os.path.join(workdir, "profile.npz")
     plan = os.path.join(workdir, "plan.json")
 
+    if "headroom" in ordered and not spec.get("heldout"):
+        raise ValueError("the headroom stage needs a held-out corpus")
+    if "headroom" in ordered and len(spec.get("candidates") or ()) < 1:
+        raise ValueError(
+            "the headroom stage needs candidates: a list of models to "
+            "rank against this one"
+        )
     if "profile" in ordered and not spec.get("corpus"):
         raise ValueError("the profile stage needs a corpus")
     if "gate" in ordered and not spec.get("heldout"):
@@ -279,7 +292,16 @@ def build_stages(spec: dict[str, Any], workdir: str) -> list[StageResult]:
     out: list[StageResult] = []
 
     for stage in ordered:
-        if stage == "profile":
+        if stage == "headroom":
+            argv = base + [
+                "headroom", "--corpus", spec["heldout"], "--model", loader_model,
+                "--out", os.path.join(workdir, "headroom.json"),
+            ]
+            for candidate in spec["candidates"]:
+                argv += ["--model", candidate]
+            if llm_kwargs:
+                argv += ["--llm-kwargs", json.dumps(llm_kwargs)]
+        elif stage == "profile":
             argv = base + [
                 "profile", "--model", model, "--corpus", spec["corpus"],
                 "--cooc", "--out", profile,
@@ -447,6 +469,7 @@ def collect_artifacts(job: Job) -> dict[str, str]:
     record never advertises an artifact that is not there.
     """
     candidates = {
+        "headroom": os.path.join(job.workdir, "headroom.json"),
         "profile": os.path.join(job.workdir, "profile.npz"),
         "plan": os.path.join(job.workdir, "plan.json"),
         "checkpoint": os.path.join(job.workdir, "checkpoint"),

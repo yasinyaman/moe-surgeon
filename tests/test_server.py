@@ -45,6 +45,8 @@ def _spec(**over):
         "corpus": "/tmp/corpus.jsonl",
         "heldout": "/tmp/heldout.jsonl",
         "core_experts": 24,
+        # Only the headroom stage reads these; every other stage ignores them.
+        "candidates": ["small/candidate"],
     }
     base.update(over)
     return base
@@ -443,3 +445,49 @@ def test_a_token_gates_every_route_but_health(tmp_path):
         assert client.get(
             "/jobs", headers={"X-Surgeon-Token": "s3cret"}
         ).status_code == 200
+
+
+# ----------------------------------------------------------------------
+# headroom as the first stage: ask whether a smaller checkpoint already
+# wins BEFORE spending a profile and a plan on this one.
+# ----------------------------------------------------------------------
+
+
+def test_headroom_runs_before_everything_it_could_retire():
+    from vllm_moe_surgeon.server.jobs import STAGE_ORDER, build_stages
+
+    assert STAGE_ORDER[0] == "headroom"
+    stages = build_stages(
+        {
+            "model": "m",
+            "heldout": "/h.jsonl",
+            "candidates": ["small-a", "small-b"],
+            "corpus": "/c.jsonl",
+            "core_experts": 4,
+            "stages": ["profile", "headroom", "plan"],
+        },
+        "/tmp/wd",
+    )
+    assert [s.name for s in stages] == ["headroom", "profile", "plan"]
+    argv = stages[0].argv
+    # This model plus every candidate, all ranked on the held-out corpus.
+    assert argv.count("--model") == 3
+    assert "small-a" in argv and "small-b" in argv
+    assert "--corpus" in argv and "/h.jsonl" in argv
+
+
+def test_headroom_needs_a_corpus_and_something_to_compare_against():
+    import pytest as _pytest
+
+    from vllm_moe_surgeon.server.jobs import build_stages
+
+    with _pytest.raises(ValueError, match="needs a held-out corpus"):
+        build_stages(
+            {"model": "m", "candidates": ["x"], "stages": ["headroom"]}, "/tmp/wd"
+        )
+    # A ranking of one is not a ranking; refuse rather than boot an engine to
+    # produce a table with a single row.
+    with _pytest.raises(ValueError, match="needs candidates"):
+        build_stages(
+            {"model": "m", "heldout": "/h.jsonl", "stages": ["headroom"]}, "/tmp/wd"
+        )

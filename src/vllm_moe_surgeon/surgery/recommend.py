@@ -53,6 +53,19 @@ _DELETION_COST_WARNING = (
     "the tier wherever it fits."
 )
 
+#: Also attached to every deletion recommendation, as a *prerequisite* rather than a
+#: caveat. Deletion buys footprint at a measured quality cost; measured once against
+#: an off-the-shelf 800M-active checkpoint on a narrow domain, the same footprint came
+#: free and quality improved. That check costs minutes and can retire the whole
+#: pipeline, so it belongs before the plan, not after the regret.
+_HEADROOM_PREREQUISITE = (
+    "whether a smaller existing checkpoint already serves this domain better -- "
+    "`surgeon headroom --corpus heldout.jsonl --model A --model B` ranks candidates "
+    "in minutes. Measured once: an 800M-active checkpoint beat the unpruned teacher "
+    "by 4.8% bits/byte with no significant arc_challenge loss, where deleting cost "
+    "11.6 points. Deletion is worth its damage only if nothing off the shelf wins"
+)
+
 
 @dataclass
 class Recommendation:
@@ -200,6 +213,7 @@ def recommend(
             "then measure with `surgeon gate`"
         )
         rec.warnings.append(_DELETION_COST_WARNING)
+        rec.must_measure.append(_HEADROOM_PREREQUISITE)
     elif stats is None and vram_gib is not None:
         rec.reasons.append(
             "the tier fits the target, so deletion is not needed; no profile is "
@@ -225,6 +239,7 @@ def recommend(
                 + ", size the rest with `surgeon budget --vram`, and measure the cost"
             )
             rec.warnings.append(_DELETION_COST_WARNING)
+            rec.must_measure.append(_HEADROOM_PREREQUISITE)
             rec.must_measure.append(
                 "what the deletions cost -- `surgeon gate` decides, and `apply` "
                 "refuses an unmeasured plan"

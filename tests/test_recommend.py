@@ -185,3 +185,26 @@ def test_last_resort_deletion_reports_as_such():
     rec = recommend(_geometry(), vram_gib=0.2, max_similarity=0.1)
     assert rec.delete_experts == -1
     assert "last resort" in rec.report()
+
+
+def test_every_deletion_recommendation_asks_for_the_headroom_check_first():
+    """Deletion buys footprint at a measured quality cost; measured once, a
+    smaller off-the-shelf checkpoint bought the same footprint for free. So the
+    cheap check is a prerequisite of recommending deletion, not a footnote."""
+    from vllm_moe_surgeon.surgery.recommend import recommend
+
+    # Both branches that recommend deletion: with a profile (a sized cut) and
+    # without one (the unsized last resort). Neither may propose deletion
+    # without first asking whether an existing checkpoint makes it unnecessary.
+    sized = recommend(
+        _geometry(), vram_gib=0.2, stats=_with_dead_tail(), max_similarity=0.1
+    )
+    unsized = recommend(_geometry(), vram_gib=0.2, max_similarity=0.1)
+
+    for rec in (sized, unsized):
+        assert rec.delete_experts != 0
+        assert any("surgeon headroom" in m for m in rec.must_measure)
+        assert any("bits/byte" in m for m in rec.must_measure)
+    # And it is a prerequisite, not a caveat: it sits with what must be
+    # measured, not with the warnings.
+    assert not any("surgeon headroom" in w for w in sized.warnings)
