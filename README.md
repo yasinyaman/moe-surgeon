@@ -8,7 +8,8 @@ the measured exceptions — see
 [docs/benchmarks.md](docs/benchmarks.md#numerical-transparency).)
 
 It installs as a vLLM plugin. No fork, no patched vLLM. Supported vLLM range
-`>=0.26.0,<0.27`.
+`>=0.26.0,<0.28`, verified by running on a stock 0.27.1 install rather than by
+parsing it.
 
 ```bash
 pip install git+https://github.com/yasinyaman/moe-surgeon.git

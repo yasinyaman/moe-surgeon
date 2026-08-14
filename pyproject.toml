@@ -34,12 +34,16 @@ Issues = "https://github.com/yasinyaman/moe-surgeon/issues"
 
 [project.optional-dependencies]
 # The runtime half: telemetry collection and the serve-time disk tier.
-# Pinned narrowly on purpose. Widening the pin is a decision, not a default:
-# tests/test_seams.py is what tells you whether a wider pin is safe.
+# Widening the pin is a decision, not a default, and it is not the seam check's
+# to make: that check parses names, not behaviour. The ceiling moved to <0.28
+# only after 0.27.1 was installed and *run* -- 33 seams resolve against the
+# installed package, the suite passes on it, and the tier reproduces the
+# untiered token stream exactly, 3 processes per arm, one hash across all six.
+# See docs/configuration.md, "Surviving a vLLM upgrade".
 # 0.26.1 was never released upstream -- the tags go 0.26.0 -> 0.26.1rc0 -> 0.27.0 --
 # so the floor named a version nobody can install. 0.26.0 is the oldest release the
 # seam check passes against.
-runtime = ["vllm>=0.26.0,<0.27"]
+runtime = ["vllm>=0.26.0,<0.28"]
 server = ["fastapi", "uvicorn", "pydantic>=2", "huggingface_hub"]
 # fastapi+httpx so the TestClient tests run in CI (bare fastapi does not pull
 # httpx); scipy so the greedy alignment fallback is checked against the real

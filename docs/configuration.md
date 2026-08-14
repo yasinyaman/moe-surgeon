@@ -147,7 +147,7 @@ between graph pieces. Worth +3.8% on the untiered baseline and ~0 for the tier.
 
 ## Surviving a vLLM upgrade
 
-**Supported range: `vllm>=0.26.0,<0.27`.** The package holds a declared set of
+**Supported range: `vllm>=0.26.0,<0.28`.** The package holds a declared set of
 vLLM internals. Check them against a new version before upgrading:
 
 ```bash
@@ -167,12 +167,34 @@ exits 1 when a required seam broke — enough to gate a pin bump in CI.
 
 **A clean report is necessary, not sufficient.** The check parses names and
 signatures, **not behaviour**, so it cannot see a semantic change behind an
-unchanged signature. Every runtime verification behind the numbers in
-[benchmarks.md](benchmarks.md) — token identity, the graph controls, the
-capacity sweep — was taken against a 0.26.1-dev fork. Against v0.27.1 the check
-reports 0 required seams broken, and the ceiling still says `<0.27`: moving it
-wants one runtime pass on the new version (boot the tier, hash the tokens
-against untiered), not a green parser.
+unchanged signature. A green parser is not a reason to move the ceiling.
+
+**What moved it to `<0.28`.** vLLM 0.27.1 was installed from PyPI — stock, not
+the fork — into its own environment on both machines, and the package was run
+on it:
+
+| check | result |
+|---|---|
+| seams, against the **installed** package | 33 seams, 0 required broken |
+| plugin entry point | `moe_surgeon` loads |
+| test suite | 633 passed / 1 skipped (GB10) |
+| **tier vs untiered token identity** | **one sha256 across all six runs** |
+
+The last row is the one that counts. OLMoE-1B-7B, greedy, 4 prompts × 128
+tokens, `expert_cache_size` 48 with `ram_cache` 64 on the disk store, against a
+plain untiered boot — 3 processes per arm, one arm per process, and every run
+returned `c08aa685…`. Both arms held `gpu_memory_utilization` at 0.42: a token
+hash is only comparable within one memory configuration, because a different KV
+pool changes the batch composition and with it the reduction order.
+
+This is also the first time the out-of-tree premise — that this runs on stock
+vLLM, not only on the fork it grew out of — has been demonstrated by running it.
+The earlier evidence was a symbol-by-symbol check against a source tree, which
+establishes that the names are there and nothing about what they do.
+
+Note the numbers in [benchmarks.md](benchmarks.md) were still taken against a
+0.26.1-dev fork. The range says the package works on 0.27.1; it does not claim
+the throughput tables were re-measured there.
 
 ## The job server
 
