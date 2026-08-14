@@ -421,6 +421,6 @@ def concentration_report(tokens) -> str:
     else:
         lines.append(
             "  reading: a near-dead tail exists -- deleting it is measured cheap, "
-            "but gate it, and apply with calibrate (see DECISIONS on amplitude)"
+            "but gate it, and apply with calibrate (see docs/scenarios.md on amplitude)"
         )
     return "\n".join(lines)

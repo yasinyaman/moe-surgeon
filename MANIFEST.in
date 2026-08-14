@@ -1,7 +1,7 @@
 # The sdist must be able to run its own suite and honour its own README.
 # setuptools' default file list ships tests/test_*.py but drops conftest.py and
-# _support.py -- a suite that cannot even be collected -- and drops docs/,
-# docs/ and tools/ while the README links into them.
+# _support.py -- a suite that cannot even be collected -- and drops docs/ and
+# tools/, which the documentation links into.
 recursive-include tests *.py
 recursive-include docs *.md
 recursive-include tools *.py

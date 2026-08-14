@@ -11,6 +11,7 @@ import math
 
 import pytest
 
+from vllm_moe_surgeon.compat import headroom
 from vllm_moe_surgeon.compat.headroom import (
     Headroom,
     Score,
@@ -94,6 +95,10 @@ def test_a_single_candidate_is_not_reported_as_a_winner():
     text = report(result)
     assert "nothing to compare it against" in text
     assert "best on this domain" not in text
+    # It still printed a bits/byte figure, so it still owes the caveat. This
+    # path used to return before reaching it.
+    assert "1.3000" in text
+    assert "not task accuracy" in text
 
 
 # -------------------------------------------------------------------- failures
@@ -133,15 +138,146 @@ def test_diagnose_skips_the_shutdown_warning_every_failure_ends_on():
     assert "No available memory" in _diagnose(_Completed())
 
 
-def test_bits_per_byte_matches_the_definition():
-    """bpb = total nll / (bytes * ln 2) -- the same arithmetic the D1 gate used,
-    pinned so a refactor cannot quietly change the unit."""
-    nll, corpus_bytes = 17023.5909, 17452
-    assert math.isclose(
-        nll / (corpus_bytes * math.log(2)), 1.40728, rel_tol=1e-5
+# ------------------------------------------------------- the arithmetic itself
+#
+# These drive `score_model` end to end against a stubbed child. The real child
+# imports vLLM; the stub prints the same SCORE_JSON line, so every figure the
+# command reports is computed by the shipped code path rather than restated in
+# the test. Asserting the formula inline against literals -- which is what stood
+# here before -- only proves that Python divides.
+
+
+def _stub_probe(body: str) -> str:
+    return "import json, sys, time\n" + body
+
+
+def _corpus(tmp_path):
+    path = tmp_path / "c.jsonl"
+    stage_corpus(["irrelevant: the stub does not read it"], str(path))
+    return str(path)
+
+
+def test_score_model_reproduces_the_d1_measurement(tmp_path, monkeypatch):
+    """The recorded D1 gate: OLMoE-full on the log corpus scored 1.4073
+    bits/byte, 27.87 perplexity, 3.41 bytes/token. Feeding the child's own
+    payload back through `score_model` must land on all three."""
+    monkeypatch.setattr(
+        headroom,
+        "_PROBE",
+        _stub_probe(
+            'print("SCORE_JSON" + json.dumps('
+            '{"nll": 17023.5909, "tokens": 5116, "load_seconds": 12.5}))\n'
+        ),
     )
+    score = headroom.score_model(
+        "olmoe", _corpus(tmp_path), corpus_bytes=17452, timeout=60
+    )
+
+    assert score.ok
+    assert math.isclose(score.bits_per_byte, 1.40728, rel_tol=1e-5)
+    assert math.isclose(score.perplexity, 27.869, rel_tol=1e-4)
+    assert math.isclose(score.bytes_per_token, 3.4113, rel_tol=1e-4)
+    assert score.scored_tokens == 5116
+    assert score.load_seconds == 12.5
+    # bits/byte divides by the text, so it must not move when the tokenizer
+    # does -- that is the entire reason this is the ranked column.
+    monkeypatch.setattr(
+        headroom,
+        "_PROBE",
+        _stub_probe(
+            'print("SCORE_JSON" + json.dumps('
+            '{"nll": 17023.5909, "tokens": 6612, "load_seconds": 1.0}))\n'
+        ),
+    )
+    finer = headroom.score_model(
+        "finer-tokenizer", _corpus(tmp_path), corpus_bytes=17452, timeout=60
+    )
+    assert math.isclose(finer.bits_per_byte, score.bits_per_byte, rel_tol=1e-9)
+    assert finer.perplexity < score.perplexity
 
 
 @pytest.mark.parametrize("tokens", [0, -1])
-def test_zero_scored_tokens_is_an_error_not_a_score(tokens):
-    assert not Score(model="m", error="nothing was scored").ok
+def test_zero_scored_tokens_is_an_error_not_a_score(tmp_path, monkeypatch, tokens):
+    """A child that reports no tokens has measured nothing. Dividing by it would
+    produce inf or a negative bits/byte that would then rank first."""
+    monkeypatch.setattr(
+        headroom,
+        "_PROBE",
+        _stub_probe(
+            'print("SCORE_JSON" + json.dumps('
+            f'{{"nll": 100.0, "tokens": {tokens}, "load_seconds": 1.0}}))\n'
+        ),
+    )
+    score = headroom.score_model(
+        "m", _corpus(tmp_path), corpus_bytes=1000, timeout=60
+    )
+    assert not score.ok
+    assert score.error == "nothing was scored"
+
+
+def test_a_hanging_candidate_costs_its_own_row_not_the_run(tmp_path, monkeypatch):
+    """`score_model` promises never to raise for a failed model. A child that
+    hangs is the one failure that used to break that promise, taking every
+    already-scored candidate down with it."""
+    monkeypatch.setattr(headroom, "_PROBE", _stub_probe("time.sleep(30)\n"))
+    score = headroom.score_model(
+        "hangs", _corpus(tmp_path), corpus_bytes=1000, timeout=0.5
+    )
+    assert not score.ok
+    assert "timed out" in score.error
+
+
+def test_a_child_that_dies_is_named_with_its_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        headroom,
+        "_PROBE",
+        _stub_probe(
+            'sys.stderr.write("OSError: is not a local folder\\n"); sys.exit(1)\n'
+        ),
+    )
+    score = headroom.score_model(
+        "missing", _corpus(tmp_path), corpus_bytes=1000, timeout=60
+    )
+    assert not score.ok
+    assert "is not a local folder" in score.error
+
+
+def test_the_artifact_is_valid_json_when_a_candidate_fails(tmp_path, monkeypatch):
+    """`vars(Score)` carries NaN for an unscored candidate, and bare NaN is a
+    Python extension that a strict parser rejects -- taking the successful rows
+    down with it.
+
+    Driven through `main` rather than through the helper, because the defect
+    was in the writer: asserting on `_jsonable` alone would stay green with
+    `json.dump(vars(s))` put back.
+    """
+    import vllm_moe_surgeon.cli as cli
+
+    def _fake(model, *_a, **_kw):
+        if model == "good":
+            return _score("good", 1.3)
+        return Score(model=model, error="out of memory")
+
+    monkeypatch.setattr(headroom, "score_model", _fake)
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text('{"text": "a log line"}\n')
+    out = tmp_path / "headroom.json"
+    rc = cli.main(
+        ["headroom", "--corpus", str(corpus), "--model", "good",
+         "--model", "broken", "--out", str(out)]
+    )
+
+    text = out.read_text()
+    assert "NaN" not in text
+    # A strict reader: json.loads accepts NaN by default, so the default is
+    # exactly what would hide this.
+    back = json.loads(
+        text, parse_constant=lambda c: pytest.fail(f"non-JSON constant {c!r}")
+    )
+    rows = {row["model"]: row for row in back["scores"]}
+    assert rows["good"]["bits_per_byte"] == 1.3
+    assert rows["broken"]["bits_per_byte"] is None
+    assert rows["broken"]["error"] == "out of memory"
+    # One of two candidates scored is a partial result, not a failed stage:
+    # headroom runs first in the pipeline and is deliberately not a gate.
+    assert rc == 0

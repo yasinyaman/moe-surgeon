@@ -54,8 +54,9 @@ throughput:
 | tier, cache 48 of 64 | 145.1 tok/s |
 | tier, cache 24 of 64 | 54.3 tok/s |
 
-Use the tier here only for what it does win: **load time, 13–15 s against
-118 s**. If you restart models often, that alone can be the reason.
+Use the tier here only for what it does win: **load time, ~17 s against 129 s**
+at cache 48 — expert weights stream into the store instead of onto the device.
+If you restart models often, that alone can be the reason.
 
 If you do tier it, the cache size is the whole game:
 
@@ -94,17 +95,21 @@ Read **bits/byte**, not ppl: per-token perplexity depends on the tokenizer, and
 these two split the same text at 2.64 against 3.41 bytes per token.
 
 If a candidate wins, verify it on real tasks before adopting it — likelihood is
-not accuracy. In the run above the follow-up held: no significant
-arc_challenge loss, ~4× better gsm8k.
+not accuracy. In the run above the follow-up mostly held: no significant
+arc_challenge **acc_norm** loss and ~4× better gsm8k, but raw `acc` fell 0.068
+(p=0.0008) and hellaswag 0.044 (p=0.0032). A win here is permission to run the
+task evaluation, not its result.
 
-**If you still need to prune**, the pipeline is profile → plan → gate → apply:
+**If you still need to prune**, the pipeline is profile → plan → gate → apply →
+calibrate → apply again:
 
 ```bash
 surgeon profile --model MODEL --corpus domain.jsonl --cooc --out profile.npz
 surgeon plan --profile profile.npz --core-experts 40 --disk-experts 0 --out plan.json
 surgeon gate --plan plan.json --corpus heldout.jsonl --max-ratio 1.3
+surgeon apply --plan plan.json --source /original --out /pruned
 surgeon calibrate --checkpoint /pruned --corpus heldout.jsonl
-surgeon apply --plan plan.json --source /original --out /pruned --amplitude 0.85
+surgeon apply --plan plan.json --source /original --out /pruned-final --amplitude 0.85
 ```
 
 Notes that decide the outcome:
@@ -113,9 +118,20 @@ Notes that decide the outcome:
   tail goes to the disk tier and the plan reports "deletes nothing".
 - **`apply` refuses an ungated plan.** The gate's verdict is bound to the exact
   drop set by digest, so editing the plan after gating is caught.
+- **`apply` runs twice, and that is not a typo.** `calibrate` sweeps the
+  amplitude on a checkpoint that already exists, so the first `apply` writes
+  one to measure and the second folds in the scalar it reports. The `0.85`
+  above is this domain's measured value, not a constant — `surgeon plan` also
+  predicts it from the plan's own deleted routing mass (0.861 predicted against
+  0.850 measured), which is a usable first pass when a sweep is too expensive.
 - **Run `calibrate`.** Deletion inflates the surviving gates by `1/(1-P_D)`.
   On this domain, skipping the correction measured 1.47× perplexity where the
   corrected apply measured 1.17×.
+- **Pin the corpus, not a slice notation.** Which held-out prompts you score on
+  moves perplexity by more than the effects reported here.
+  [`tools/derive_corpus.py`](../tools/derive_corpus.py) writes the JSONL and a
+  sidecar recording dataset, split, slice, field, template and truncation, so
+  the number stays reproducible.
 
 **Result on real system logs**, held-out perplexity, baseline 27.89:
 
@@ -146,11 +162,17 @@ fetching experts over PCIe.*
 Compute them on the host instead:
 
 ```bash
-vllm serve MODEL --additional-config '{"surgeon": {
+vllm serve MODEL --enforce-eager --additional-config '{"surgeon": {
   "expert_cache_size": 4, "split": "expert",
   "store_dir": "./store", "ram_cache": 24,
   "cpu_experts": true, "cpu_expert_threads": 12}}'
 ```
+
+`--enforce-eager` is required here and only here: `cpu_experts` joins a
+host-computed partial into the MoE output on every forward, and a captured
+graph replays without the host. The runtime refuses the combination at boot
+rather than serving wrong output. (The plain tier does *not* need the flag — it
+carves the MoE op out of the captured region instead.)
 
 **Result**, flag as the only difference:
 

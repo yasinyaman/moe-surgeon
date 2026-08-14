@@ -2,7 +2,7 @@
 """CPU expert co-execution: compute cold experts on the host, never H2D them.
 
 Measured basis (bench/l5_cpu_coexec_gate.py on GB10, bench/l6_cpu_coexec_gate.py
-on the laptop; DECISIONS "CPU expert co-execution"). On a discrete card the
+on the laptop; docs/benchmarks.md, "CPU co-execution"). On a discrete card the
 host GEMM streams weights at ~34 GB/s effective while PCIe H2D delivers
 ~11 GB/s: a cold expert costs 368.8 us on the CPU against 1139.7 us of H2D,
 and the concurrent single-layer arm measured **3.7x at f=1.0** with contention

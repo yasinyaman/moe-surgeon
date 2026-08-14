@@ -548,7 +548,7 @@ def test_the_gate_excludes_merge_donors_from_what_it_zeroes():
 
 
 # ----------------------------------------------------------------------
-# What the log-domain experiment (DECISIONS: "Narrow-domain pruning") taught,
+# What the log-domain experiment (docs/benchmarks.md: "On a narrow domain") taught,
 # encoded in the tool instead of only in the register.
 # ----------------------------------------------------------------------
 

@@ -61,8 +61,10 @@ _HEADROOM_PREREQUISITE = (
     "whether a smaller existing checkpoint already serves this domain better -- "
     "`surgeon headroom --corpus heldout.jsonl --model A --model B` ranks candidates "
     "in minutes. Measured once: an 800M-active checkpoint beat the unpruned teacher "
-    "by 4.8% bits/byte with no significant arc_challenge loss, where deleting cost "
-    "11.6 points. Deletion is worth its damage only if nothing off the shelf wins"
+    "by 4.8% bits/byte with no significant arc_challenge acc_norm loss (p=0.51), "
+    "where deleting cost 11.6 points -- though on raw acc the same run measured "
+    "-0.068 at p=0.0008, so the two arc metrics disagree. Deletion is worth its "
+    "damage only if nothing off the shelf wins"
 )
 
 
@@ -267,7 +269,10 @@ def recommend(
         rec.merge_enabled = True
         rec.reasons.append(
             f"a pair reaches similarity {max_similarity:.3f} >= {merge_threshold}, so "
-            "merging is available and loses no capacity where deletion would"
+            "merging is available; it keeps the capacity deletion would remove, but "
+            "it is not free -- below the threshold it measured WORSE than deleting "
+            "the same experts (1.416x against 1.226x on OLMoE), and no gate verdict "
+            "covers a merge, since zeroing a donor does not model folding it in"
         )
     else:
         rec.reasons.append(

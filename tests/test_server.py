@@ -476,6 +476,49 @@ def test_headroom_runs_before_everything_it_could_retire():
     assert "--corpus" in argv and "/h.jsonl" in argv
 
 
+def test_candidates_survive_http_validation(tmp_path):
+    """The stage is reachable over HTTP, not only through build_stages.
+
+    Every other headroom test calls `build_stages` with a raw dict, which is
+    exactly why the missing `JobSpec.candidates` field went unnoticed: pydantic
+    drops undeclared keys, so the list never reached the stage and the request
+    died on the stage's own precondition. This posts a real body.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from vllm_moe_surgeon.server.app import JobSpec, create_app
+
+    spec = JobSpec(
+        model="m", heldout="/h.jsonl", candidates=["small-a"], stages=["headroom"]
+    )
+    assert spec.model_dump(exclude_none=True)["candidates"] == ["small-a"]
+
+    with TestClient(create_app(str(tmp_path))) as client:
+        accepted = client.post(
+            "/jobs",
+            json={
+                "model": "m",
+                "heldout": str(tmp_path / "h.jsonl"),
+                "candidates": ["small-a"],
+                "stages": ["headroom"],
+            },
+        )
+        assert accepted.status_code == 202, accepted.text
+        # And the same body without candidates is refused, so the 202 above is
+        # the field working rather than the precondition having gone missing.
+        refused = client.post(
+            "/jobs",
+            json={
+                "model": "m",
+                "heldout": str(tmp_path / "h.jsonl"),
+                "stages": ["headroom"],
+            },
+        )
+        assert refused.status_code == 400
+        assert "candidates" in refused.text
+
+
 def test_headroom_needs_a_corpus_and_something_to_compare_against():
     import pytest as _pytest
 

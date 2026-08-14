@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import subprocess
 import sys
+from typing import Any
 
 
 def _cmd_profile(args: argparse.Namespace) -> int:
@@ -504,6 +506,18 @@ def _cmd_headroom(args: argparse.Namespace) -> int:
     from .compat.headroom import Headroom, report, score_model, stage_corpus
     from .compat.profile_runner import iter_prompts_from_jsonl
 
+    if len(args.model) < 2:
+        # The same rule the job server enforces on the request shape: a
+        # one-row table is not a ranking. Refused here rather than after a
+        # full engine boot has produced one.
+        print(
+            "headroom ranks candidates against each other, so it needs at least "
+            "two --model arguments; got one. Add the checkpoint you would "
+            "otherwise tier or prune as the baseline.",
+            file=sys.stderr,
+        )
+        return 1
+
     prompts = list(iter_prompts_from_jsonl(args.corpus, args.field))
     if args.limit:
         prompts = prompts[: args.limit]
@@ -539,14 +553,30 @@ def _cmd_headroom(args: argparse.Namespace) -> int:
                     "corpus": result.corpus,
                     "corpus_bytes": result.corpus_bytes,
                     "n_prompts": result.n_prompts,
-                    "scores": [vars(s) for s in result.scores],
+                    "scores": [_jsonable(vars(s)) for s in result.scores],
                 },
                 f,
                 indent=2,
             )
         print(f"\nwritten to  {args.out}")
-    # Nothing scored is a failed measurement, not a verdict.
+    # Nothing scored is a failed measurement, not a verdict. A run where *some*
+    # candidates failed still exits 0 on purpose: headroom is deliberately not a
+    # gate, and it runs first in the job pipeline, so failing the stage over one
+    # unreachable candidate would abort profile/plan/gate/tier behind it. The
+    # "a ranking of one is not a ranking" rule is enforced up front instead,
+    # where it costs no engine boot.
     return 0 if result.ranked else 1
+
+
+def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
+    """NaN is a Python extension, not JSON: a strict parser rejects the whole
+    file. An unscored candidate is a deliberate, preserved outcome here, so its
+    missing figures serialise as ``null`` -- which round-trips everywhere and
+    still reads as "no number" beside the ``error`` that explains why."""
+    return {
+        key: (None if isinstance(value, float) and not math.isfinite(value) else value)
+        for key, value in row.items()
+    }
 
 
 def _cmd_seams(args: argparse.Namespace) -> int:

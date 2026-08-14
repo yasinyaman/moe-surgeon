@@ -47,6 +47,11 @@ class JobSpec(BaseModel):
     gate_limit: int | None = None
     force: bool = False
     stages: list[str] | None = None
+    #: Candidate checkpoints for the `headroom` stage. A field rather than an
+    #: extra key because pydantic drops what it does not declare: without this
+    #: the stage was unreachable over HTTP -- every request lost its candidates
+    #: in validation and then failed the stage's own precondition.
+    candidates: list[str] | None = None
     llm_kwargs: dict[str, Any] | None = None
     #: Opt in to fetching an uncached model from the network. Off by default, so an
     #: unauthenticated request cannot make the server download an arbitrary repo id.

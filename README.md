@@ -1,11 +1,14 @@
 # moe-surgeon
 
 Serve a Mixture-of-Experts model in less memory than it fits in. Cold experts
-live on NVMe and stream to a GPU cache on demand; a correctly sized cache is
-numerically transparent, so the tiered model produces the same tokens as the
-untiered one.
+live on NVMe and stream to a GPU cache on demand; in eager mode a correctly
+sized cache is numerically transparent, so the tiered model produces the same
+tokens as the untiered one. (`split: "expert"`, `fp8_store` and CUDA graphs are
+the measured exceptions — see
+[docs/benchmarks.md](docs/benchmarks.md#numerical-transparency).)
 
-It installs as a vLLM plugin. No fork, no patched vLLM.
+It installs as a vLLM plugin. No fork, no patched vLLM. Supported vLLM range
+`>=0.26.0,<0.27`.
 
 ```bash
 pip install git+https://github.com/yasinyaman/moe-surgeon.git
@@ -17,7 +20,7 @@ surgeon autoconfig --checkpoint /path/to/model --start
 | you have | you get |
 |---|---|
 | a model too large for the card | it runs — 12.9 GiB model at 2.69 GiB peak |
-| slow cold starts | 13–15 s instead of 118 s |
+| slow cold starts | ~17 s instead of ~129 s |
 | a card that fits the model already | nothing; don't use this |
 
 The cost is decode throughput: a correctly sized tier runs at 0.66× untiered.
@@ -116,12 +119,123 @@ Measured on a DGX Spark (GB10, 121 GB unified) and an RTX 3050 Ti laptop
 | | measured |
 |---|---|
 | serves a 12.9 GiB model on a 3.68 GiB card | 2.69 GiB peak, 7.7 tok/s |
-| load time | 13–15 s vs 118 s untiered |
+| load time, cache 48 | 16.9 s vs 128.9 s untiered |
 | **cache size, the one knob that matters** | **2.67× decode across one integer** |
 | decode, correctly sized | 145.1 vs 218.5 tok/s untiered |
-| numerical transparency | identical token hashes, 9 of 9 runs |
+| numerical transparency, eager | identical token hashes, 9 of 9 runs |
 | CPU co-execution, discrete card | 1.58× |
 | CPU co-execution, unified memory | 0.719× — a loss, refused |
+
+## How it fits together
+
+**Sizing runs before any engine boots.** The checkpoint is read from safetensors
+headers alone and the machine is probed once, so `surgeon autoconfig` answers in
+seconds without a GPU. Both readings are bucketed before they reach the cache
+key — free VRAM moves by a few MiB between two consecutive reads, and an exact
+key would never hit.
+
+```mermaid
+flowchart TD
+    HDR["checkpoint headers<br>experts, top_k, dtype"] --> FP["fingerprint<br>bucketed resources"]
+    PRB["machine probe<br>free VRAM, RAM, disk"] --> FP
+    FP -->|hit| CACHE["cached answer<br>no re-probe"]
+    FP --> DEC
+    subgraph DEC["decide"]
+        direction LR
+        CAP["capacity<br>min(union, what fits)"]
+        RAM["ram_cache<br>all experts, else fp8"]
+        SPL["split<br>expert if under top_k"]
+    end
+    DEC --> CFG["additional-config<br>or VLLM_MOE_ env vars"]
+    CFG --> VAL["check_config + validate<br>refuse by name, never guess"]
+    VAL --> EC["expert cache<br>misses fetch over H2D"]
+    VAL --> CX["cpu co-exec<br>host GEMM, fp32 join"]
+```
+
+Those three decisions are the whole of the sizing logic. Anything that would
+produce wrong output instead of an error — tensor parallelism, CUDA graphs
+without the MoE split, fp8 with `cpu_experts` — is refused by name, with the way
+out in the message.
+
+**A forward under co-execution splits one layer between two processors.** The
+routing ids play two roles: a masked copy goes to the planner, so it never
+fetches what the host will compute, while the original goes to the kernel, so
+every surviving pair still gets its gate weight.
+
+```mermaid
+flowchart TD
+    AP["apply<br>x, topk_ids, topk_weights"] --> CP["one copy of the ids to host<br>union and per-expert counts"]
+    CP --> SEL{"union exceeds capacity?"}
+    SEL -->|no| PLAIN["plain path<br>no co-execution"]
+    SEL -->|yes| PICK["select cold experts<br>GPU misses, RAM rows first"]
+    PICK --> PLAN
+    PICK --> ROWS
+    subgraph DEVICE["device"]
+        PLAN["planner sees masked ids<br>cold set hidden as -1"] --> KERN["kernel runs async<br>original ids weight it"]
+    end
+    subgraph HOST["host"]
+        ROWS["protected RAM rows<br>safe from eviction"] --> GEMM["silu GEMM per expert<br>single rows padded to two"]
+    end
+    KERN --> JOIN["add in fp32, cast once<br>expert outputs are additive"]
+    GEMM --> JOIN
+```
+
+The join is legal because an MoE output is a gate-weighted sum over the experts
+a token chose, so the sum can be taken a subset at a time. Two things the
+diagram cannot show, both measured: the win is **not** the overlap (~124 ms/token
+of PCIe becomes ~41 ms/token of host compute, and the measured ~82 ms/token
+saving is close to that difference), and while co-execution covers the miss set
+**the GPU cache stops adapting** — every host-served expert is hidden from the
+planner, so the resident set freezes. The collapse in misses is masking, not
+learning.
+
+**Surgery decides where each expert goes, one layer at a time**, and only the
+last outcome is irreversible.
+
+```mermaid
+flowchart TD
+    PRF["profile<br>per-expert token counts"] --> THIN{"enough slots<br>per expert?"}
+    THIN -->|no| REF["refused<br>profile too thin to rank"]
+    THIN -->|yes| RNK["rank by importance<br>rank-1 frequency, else counts"]
+    RNK --> CORE{"inside core_experts?"}
+    CORE -->|yes| KEEP["core<br>stays resident"]
+    CORE -->|no| SIM{"similar core expert,<br>low co-occurrence?"}
+    SIM -->|yes| MRG["merged away<br>folded into the target"]
+    SIM -->|no| ASK{"deletion asked for?<br>share floor or disk budget"}
+    ASK -->|no| DSK["disk tier<br>the default for the tail"]
+    ASK -->|yes| GATE{"gate passed, bound<br>to this exact drop set?"}
+    GATE -->|no| STOP["apply refuses"]
+    GATE -->|yes| DEL["deleted<br>amplitude correction advised"]
+```
+
+**Nothing is deleted unless asked**: with no share floor and no disk budget the
+whole tail lands on the tier. **A merge is not a deletion**, so merges are not
+gated — zeroing an expert cannot emulate folding it. And **the gate is bound to
+the drop set it measured**, by digest. What the gate cannot certify is task
+accuracy: its ceiling is a perplexity ratio, and on a broad workload the same
+plan that passes it costs arc_challenge −25% relative.
+
+## Three axes
+
+Every method here is judged on **three axes**, never one, and a method that
+loses on one axis is not eliminated if it wins on another.
+
+| axis | what it asks | how it is measured |
+|---|---|---|
+| **feasibility** | does it run, and on how small a device | `surgeon budget`, `surgeon vram-floor`, measured load time |
+| **speed** | tokens per second | `compat/bench.py`, short prompts / long generations |
+| **accuracy** | held-out perplexity | `compat/ablation.py`, the same metric the gate uses |
+
+Two results exist only because of that rule. Static gate geometry is useless
+for *choosing* experts — gate row norm against measured load correlates
+ρ = −0.03, gate cosine against measured co-occurrence ρ = +0.00 — and genuinely
+useful for *sizing* them, so it ships as `surgeon budget` rather than being
+discarded. And
+`fp8_store` saves **zero** VRAM while halving disk, host RAM and transfer — a
+one-axis win that a speed-only or memory-only verdict would have thrown away.
+
+Read every "accuracy" row as **perplexity**, which is a proxy: the pruned
+checkpoint that passed a 1.3× perplexity gate lost 25% relative arc_challenge.
 
 ## Documentation
 

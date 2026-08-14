@@ -6,9 +6,12 @@ found the expensive way. Pruning buys footprint at a measured quality cost --
 1.25x perplexity and arc_challenge -25% relative on OLMoE. Measured against an
 off-the-shelf 800M-active checkpoint on the same domain, footprint came *free*
 and quality improved: 4.8% better bits per byte than the unpruned teacher, and
-no significant arc_challenge loss where pruning cost 11.6 points. See DECISIONS
-"Model selection, gated against pruning". So: before tiering or cutting, score
-the candidates. It costs minutes and it can retire the rest of the pipeline.
+no significant arc_challenge *acc_norm* loss (-0.014, p=0.51) where pruning cost
+11.6 points -- though on raw `acc` the same paired run measured -0.068 at
+p=0.0008, so the two arc metrics disagree and the recorded protocol used
+`acc_norm`. See docs/benchmarks.md, "Checkpoint selection". So: before tiering
+or cutting, score the candidates. It costs minutes and it can retire the rest
+of the pipeline.
 
 **Bits per byte, not perplexity.** Per-token perplexity is a property of the
 tokenizer as much as the model -- one model splitting the same text into more,
@@ -35,6 +38,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -102,6 +106,23 @@ print("SCORE_JSON" + json.dumps({
 """
 
 
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Take down the child and everything it spawned, then reap it.
+
+    A vLLM engine's workers are children of the child, so killing the direct
+    process leaves them holding the device and the next candidate boots against
+    a GPU that is not free.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, AttributeError):
+        # Already reaped, not ours, or no process groups on this platform.
+        proc.kill()
+    proc.communicate()
+
+
 def _diagnose(completed: subprocess.CompletedProcess) -> str:
     """Why the child failed, avoiding the shutdown warning every failure ends on."""
     markers = (
@@ -147,14 +168,33 @@ def score_model(
         corpus_path,
         json.dumps(llm_kwargs or {}),
     ]
-    completed = subprocess.run(
+    # Popen rather than `run(timeout=...)`: on timeout `run` kills only the
+    # direct child, and a vLLM engine's workers would survive it still holding
+    # the device -- so the next candidate boots against a GPU that is not free.
+    # Its own session lets us signal the whole group.
+    proc = subprocess.Popen(
         argv,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
         env=dict(os.environ),
-        check=False,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # The docstring's promise is the whole point of the child: a candidate
+        # that hangs costs its own row, never the run.
+        _kill_group(proc)
+        return Score(model=model, error=f"timed out after {timeout:.0f}s")
+    except BaseException:
+        # Its own session means a terminal Ctrl-C no longer reaches the child,
+        # and `subprocess.run`'s implicit kill-on-KeyboardInterrupt is gone with
+        # it -- so every other unwind path has to take the group down too, or an
+        # interrupted run leaks a booted engine still holding the device.
+        _kill_group(proc)
+        raise
+    completed = subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
     line = next(
         (
             ln
@@ -231,28 +271,30 @@ def report(result: Headroom) -> str:
     best = ranked[0]
     if len(ranked) == 1:
         lines.append(f"only {best.model} was scored: nothing to compare it against")
-        return "\n".join(lines)
-
-    runner_up = ranked[1]
-    margin = 100 * (1 - best.bits_per_byte / runner_up.bits_per_byte)
-    lines.append(
-        f"best on this domain: {best.model} "
-        f"({margin:.1f}% better bits/byte than {runner_up.model})"
-    )
-    # Per-token perplexity is a tokenizer artefact as much as a model property;
-    # say so wherever the candidates disagree enough for it to mislead.
-    spread = max(s.bytes_per_token for s in ranked) / min(
-        s.bytes_per_token for s in ranked
-    )
-    if spread > 1.05:
+    else:
+        runner_up = ranked[1]
+        margin = 100 * (1 - best.bits_per_byte / runner_up.bits_per_byte)
         lines.append(
-            f"  the ppl column is NOT comparable across these rows: they "
-            f"tokenize this text {spread:.2f}x differently. Compare bits/byte."
+            f"best on this domain: {best.model} "
+            f"({margin:.1f}% better bits/byte than {runner_up.model})"
         )
+        # Per-token perplexity is a tokenizer artefact as much as a model
+        # property; say so wherever the candidates disagree enough to mislead.
+        spread = max(s.bytes_per_token for s in ranked) / min(
+            s.bytes_per_token for s in ranked
+        )
+        if spread > 1.05:
+            lines.append(
+                f"  the ppl column is NOT comparable across these rows: they "
+                f"tokenize this text {spread:.2f}x differently. Compare bits/byte."
+            )
+    # Every path that printed a bits/byte figure carries the caveat, including
+    # the single-candidate one -- a number on screen without it is the failure
+    # mode this whole command exists to prevent.
     lines.append(
         "  this is held-out likelihood, not task accuracy -- the two have "
-        "already parted ways once here (DECISIONS: pruning kept perplexity "
-        "and lost 25% of arc_challenge). Evaluate the winner on real tasks "
-        "before adopting it."
+        "already parted ways once here (docs/benchmarks.md: pruning kept "
+        "perplexity and lost 25% of arc_challenge). Evaluate the winner on "
+        "real tasks before adopting it."
     )
     return "\n".join(lines)

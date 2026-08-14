@@ -205,6 +205,10 @@ def test_every_deletion_recommendation_asks_for_the_headroom_check_first():
         assert rec.delete_experts != 0
         assert any("surgeon headroom" in m for m in rec.must_measure)
         assert any("bits/byte" in m for m in rec.must_measure)
+        # The arc_challenge result is metric-dependent -- acc_norm says not
+        # significant, raw acc says it is. Quoting only the favourable metric
+        # is how the headline outlived its own caveat once already.
+        assert any("acc_norm" in m and "raw acc" in m for m in rec.must_measure)
     # And it is a prerequisite, not a caveat: it sits with what must be
     # measured, not with the warnings.
     assert not any("surgeon headroom" in w for w in sized.warnings)

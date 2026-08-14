@@ -66,8 +66,9 @@ class RuntimeConfig:
     #: Compute cold experts on the host instead of fetching them over H2D.
     #: A per-machine opt-in, never a default: measured 3.7x on a discrete
     #: card (the PCIe H2D and the CPU's DRAM reads are separate pools) and a
-    #: LOSS on unified memory, where they are the same pool (DECISIONS "CPU
-    #: expert co-execution"). Not bit-exact -- the host GEMM's reduction
+    #: LOSS on unified memory, where they are the same pool
+    #: (docs/benchmarks.md, "CPU co-execution"). Not bit-exact -- the host
+    #: GEMM's reduction
     #: order differs from the fused kernel's.
     cpu_experts: bool = False
     #: Experts below this routed-token count stay on the GPU path. The T=1
@@ -721,8 +722,8 @@ def install() -> bool:
             if config.cpu_experts:
                 # Loud on purpose: this mode is not bit-exact, and it is a
                 # per-machine decision -- measured 3.7x on a discrete card
-                # and a loss on unified memory (DECISIONS "CPU expert
-                # co-execution").
+                # and a loss on unified memory (docs/benchmarks.md,
+                # "CPU co-execution").
                 if config.cpu_expert_threads > 0:
                     # Here, not on the first co-exec forward: torch documents
                     # set_num_threads as needing to run before parallel work

@@ -21,8 +21,7 @@ boot either.
     routes to more experts than there are slots. Estimate, then measure.
 ``ram_cache``
     ``>= num_experts`` or every eviction becomes a disk read: 48 -> 64 was 1.66x
-    and, more tellingly, it is the difference between steady and erratic. Given
-    away only when host RAM cannot hold it.
+    decode on the measured pair. Given away only when host RAM cannot hold it.
 ``fp8_store``
     A **space** mechanism, not a speed one: on a non-fp8 checkpoint it costs 1.11x
     decode and bit-exactness to halve disk and host RAM. So it is off unless the
@@ -361,7 +360,7 @@ def decide(
         warnings.append(
             f"host RAM holds only {ram_cache} of {geometry.num_experts} experts"
             f"{' even in fp8' if fp8 else ''}, so evictions will read disk; decode "
-            "will be slower and more variable than the published numbers"
+            "will be slower than the published numbers"
         )
 
     store_bytes = layers * geometry.num_experts * (record_fp8 if fp8 else record_bf16)

@@ -16,10 +16,19 @@ Passed as `--additional-config '{"surgeon": {...}}'`.
 | `fp8_store` | `false` | Store records as row-scaled fp8. Halves disk, host RAM and transfer. Costs ~1.11× decode and bit-exactness. Must match between build and serve. |
 | `split` | `"token"` | `"expert"` splits a layer's expert set into cache-sized groups, which is the only way to run below `top_k` slots. Not bit-exact. |
 | `stream_load` | on with a store | Write experts into the store as the checkpoint arrives, so the full tensor never materialises. Leave it on. |
-| `hot_experts` | none | Residency prior from `surgeon tier`. Worth ~10 points of hit rate over the first 50 accesses, nothing after. |
+| `hot_experts` | none | Residency prior from `surgeon tier`. **Requires `VLLM_MOE_CACHE_POLICY=ewma`** — the default `lfru` policy has no prior table and discards the hint with one warning. See the caveat below the table. |
 | `cpu_experts` | `false` | Compute cold experts on the host instead of fetching them. **Discrete cards only** — see below. |
 | `cpu_expert_min_tokens` | `1` | Experts below this routed-token count stay on the GPU path. Single-token experts are padded inside the kernel, so 1 is correct; raising it shrinks the candidate set. |
 | `cpu_expert_threads` | `0` | torch intra-op threads for the host GEMMs. `0` leaves the pool alone. 12 measured best on an i7-12700H. |
+
+**The `hot_experts` caveat, because the number above needs it.** The `+~10
+points at N=50` figure comes from a single-tier `store/replay.py` run (pure
+numpy) whose warm arm used the replay's **prewarm placement** — experts placed
+resident before the first token. The shipped runtime seeds only the prior
+*bias*; it does not place, so a real warm start realises less than the table
+shows. And +10 points at N=50 is about 5 cache hits, binomial SE ≈ 6.6 points,
+with no repeats. Treat it as indicative, and note that the policy (`ewma` over
+`lfru`, +2.3 to +4.0 on the same window) is worth more than the prior.
 
 ### Environment variables
 
@@ -31,14 +40,17 @@ above. These are store-side only and have no config-payload equivalent:
 
 | variable | default | what it does |
 |---|---|---|
-| `VLLM_MOE_CACHE_POLICY` | `lfru` | `ewma` is worth ~1–4 points of hit rate; opt-in. |
+| `VLLM_MOE_CACHE_POLICY` | `lfru` | `ewma` is worth ~1–4 points of hit rate; opt-in. Required for `hot_experts` to do anything. |
 | `VLLM_MOE_CACHE_DECAY` | `0.999` | EWMA decay. |
 | `VLLM_MOE_DISK_PIPELINE` | `true` | Route disk reads through the reader pool. |
 | `VLLM_MOE_DISK_IO_THREADS` | `2` | Reader threads, clamped to [1, 4]. Past 4, p99 read latency degrades badly. |
 | `VLLM_MOE_DISK_PREFETCH` | `false` | Cross-group prefetch. Needs `ram_cache ≥ 2 × expert_cache_size`; worth 1.03–1.075×. |
 | `VLLM_MOE_ZERO_COPY` | `false` | Map the pinned pool as the kernel's buffer. Needs a disk store; incompatible with prefetch and with `cpu_experts`. |
+| `VLLM_MOE_ZC_FP8_SLOTS` | `0` | Zero-copy over an fp8 store only: retain this many fp8 rows as a cold pool, so a later miss re-expands a row (0.134 ms) instead of reading disk (0.95 ms). Warns on use — validated in simulation and on GB10, **never tested on the small unified boxes it targets**. |
 | `VLLM_MOE_ROUTING_TRACE` | none | Write a routing trace for offline replay. |
-| `VLLM_MOE_RECORD_STATS` / `_COOC` | `false` | Extra counters. |
+| `VLLM_MOE_RECORD_STATS` | `false` | Per-layer hit/miss and timing counters. |
+| `VLLM_MOE_RECORD_COOC` | `false` | Also accumulate the per-layer expert co-occurrence matrix. `surgeon plan` uses it for one thing: vetoing a merge between two experts that fire together (`--max-cooccurrence`). Without it that veto is inert. |
+| `VLLM_MOE_SURGEON_CACHE` | `~/.cache/moe-surgeon/autoconfig` | Where `surgeon autoconfig` caches its per-machine answer. |
 
 ## Sizing rules
 
@@ -48,7 +60,7 @@ caches the answer per machine.
 | setting | rule | measured |
 |---|---|---|
 | `expert_cache_size` | cover the batch's per-layer expert union, not free VRAM | 24 → 48 slots: **2.67×** decode |
-| `ram_cache` | at or above the expert count | 48 → 64: **1.66×**, and the run-to-run spread collapses |
+| `ram_cache` | at or above the expert count | 48 → 64: **1.66×** decode |
 | `fp8_store` | only when the store or host RAM does not otherwise fit | 1.11× slower, not bit-exact |
 
 Cache slots are paid for out of KV cache, not out of free device memory:
@@ -99,6 +111,32 @@ Deleting experts is refused unless a `surgeon gate` verdict is on the plan and
 its recorded drop-set digest matches the plan's current deletions. `--skip-gate`
 overrides.
 
+## Merging, and why it is off by default
+
+`surgeon plan --checkpoint <dir>` enables the fourth placement: folding an
+expert into a sufficiently similar survivor instead of deleting it.
+
+| flag | default | what it does |
+|---|---|---|
+| `--checkpoint` | none | Without it there is no similarity, so no merges are considered at all. |
+| `--merge-threshold` | `0.85` | Minimum permutation-invariant subspace similarity for a pair to merge. |
+| `--max-cooccurrence` | `0.10` | Refuse to merge two experts that fire together often; folding them would lose a distinction the router uses. |
+
+**No real model has cleared the bar.** Maximum measured pairwise similarity is
+0.37 on OLMoE, 0.40 on Qwen3-30B-A3B and 0.33 on DeepSeek-V2-Lite — three
+families, none with a natural merge candidate. The 0.85 default is therefore
+an empirical floor rather than caution: forced down to 0.10 on OLMoE, merging
+233 experts and deleting 151 measured **14.6689 perplexity (1.416×)** against
+**12.7026 (1.226×)** for deleting all 384 outright. Merging a weakly-similar
+expert damages the survivor that was carrying its own function, so below the
+threshold it is worse than the thing it is meant to improve on.
+
+**A gate verdict says nothing about a merge.** The gate zeroes experts, which
+emulates deletion pessimistically and does not model folding a donor's weights
+into a survivor at all — so a plan with merges can pass a gate that never
+examined the part most likely to hurt. `surgeon gate` reports this rather than
+implying coverage.
+
 ## CUDA graphs
 
 Supported. `--enforce-eager` is not required: the runtime carves the MoE op out
@@ -109,8 +147,8 @@ between graph pieces. Worth +3.8% on the untiered baseline and ~0 for the tier.
 
 ## Surviving a vLLM upgrade
 
-The package holds a declared set of vLLM internals. Check them against a new
-version before upgrading:
+**Supported range: `vllm>=0.26.0,<0.27`.** The package holds a declared set of
+vLLM internals. Check them against a new version before upgrading:
 
 ```bash
 surgeon seams                      # against the installed vLLM
@@ -120,6 +158,21 @@ surgeon seams --source /path/to/vllm-checkout   # against a source tree, no GPU
 Optional seams degrade rather than fail: if the fp8 internals move, the fp8
 tier declines; if the graph internals move, `--enforce-eager` is required
 again.
+
+To see *what* moved rather than only that something did,
+[`tools/upstream_drift.py`](../tools/upstream_drift.py) extracts the seam-named
+modules at two git refs of a vLLM checkout and prints the bill as a table. It
+reads blobs out of git, so it needs no install, no torch and no GPU, and it
+exits 1 when a required seam broke — enough to gate a pin bump in CI.
+
+**A clean report is necessary, not sufficient.** The check parses names and
+signatures, **not behaviour**, so it cannot see a semantic change behind an
+unchanged signature. Every runtime verification behind the numbers in
+[benchmarks.md](benchmarks.md) — token identity, the graph controls, the
+capacity sweep — was taken against a 0.26.1-dev fork. Against v0.27.1 the check
+reports 0 required seams broken, and the ceiling still says `<0.27`: moving it
+wants one runtime pass on the new version (boot the tier, hash the tokens
+against untiered), not a green parser.
 
 ## The job server
 

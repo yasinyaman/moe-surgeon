@@ -100,3 +100,17 @@ def test_the_installed_entry_point_survives_a_subprocess_round_trip(tmp_path):
     assert bad.returncode == 2
     assert "Traceback" not in bad.stderr
     assert "surgeon budget:" in bad.stderr
+
+
+def test_headroom_refuses_a_single_model_before_booting_an_engine(tmp_path, capsys):
+    """A one-row table is not a ranking. The job server refuses this on the
+    request shape; the CLI has to refuse it too, and before the engine boot
+    rather than after one has produced the useless row."""
+    from vllm_moe_surgeon.cli import main
+
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text('{"text": "a log line"}\n')
+    rc = main(["headroom", "--corpus", str(corpus), "--model", "only-one"])
+
+    assert rc == 1
+    assert "at least two --model" in capsys.readouterr().err

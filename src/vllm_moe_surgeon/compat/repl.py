@@ -195,7 +195,7 @@ def format_session(stats: TierStats) -> str:
     elif stats.ram_misses and stats.ram_misses > 0.1 * max(1, ram_total):
         lines.append(
             "  ! evictions are reaching disk. ram_cache below the expert count "
-            "was measured at 1.66x slower, and more variable; raise it if the "
+            "was measured at 1.66x slower; raise it if the "
             "host can hold every expert."
         )
     return "\n".join(lines)
