@@ -30,6 +30,20 @@ This is a feasibility and load-time mechanism, not a speed one.
 Optional, and measured separately: permanent expert pruning for deployments
 that only ever see one domain, and CPU co-execution on discrete cards.
 
+### Where the store layer came from
+
+This started in-tree. The five modules under `store/` were lifted out of a vLLM
+fork — branch [`disk-tier-proto`](https://github.com/yasinyaman/vllm/tree/disk-tier-proto)
+— and are kept byte-comparable with it: the only differences are rewritten
+imports, so the two copies can be diffed line for line. Changes are made on the
+fork first and re-lifted, which is what keeps that true.
+
+That is deliberate, because the in-tree route is still open. vLLM has an
+[expert-cache PR](https://github.com/vllm-project/vllm/pull/37190) and an
+[offload RFC](https://github.com/vllm-project/vllm/issues/38256) that defers disk
+tiering to a later phase; if any of this work lands upstream it lands from that
+branch, and this package is the same code with a seam list instead of a rebase.
+
 ## Install
 
 ```bash
