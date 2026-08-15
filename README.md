@@ -152,9 +152,15 @@ cache is just a second copy. The crossover measured near `ram_cache` 24; it is n
 "whether the pool covers the store" — at 36 it still does not, and buffered is
 still wrong.
 
+The ranking holds under load: measured with three processes per cell and
+medians, the fastest single-stream configuration is also the fastest at four
+concurrent streams, by 1.51×. What concurrency changes is how much cache the
+tier needs — the binding quantity is the batch's per-layer expert union, not
+`top_k` — so a machine that can grow `expert_cache_size` with the batch keeps
+scaling, and one that cannot pays for concurrency twice.
+
 `surgeon autoconfig` picks the first two from the machine. The tables, the method
-and the noise floor are in [docs/benchmarks.md](docs/benchmarks.md); read the note
-there on which column is readable before quoting a concurrency number.
+and the noise floors are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## How it fits together
 

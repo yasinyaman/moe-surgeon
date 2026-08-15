@@ -293,9 +293,27 @@ comparable pinned memory (7.25 vs 6.46 GB). The same configuration measured
 **How much of this table is readable.** The first cell was repeated as the last.
 Single-stream latency returned within **0.3%** (134.59 → 134.98); the
 concurrency-4 figure returned **45% higher** (466.73 → 678.61) doing identical
-work by the read counters. So the single-stream column carries the findings and
-**no concurrency comparison below 1.45× is real** — which is why this section
-quotes none.
+work by the read counters. So the single-stream column above carries the
+findings, and a concurrency number from a single pass is not quotable.
+
+### Concurrency, with repeats
+
+The three fastest single-stream cells, three processes each, medians published:
+
+| cell | c4 TPOT | the three runs | spread | c4 tok/s |
+|---|---|---|---|---|
+| bf16 · 36 · co-exec | **202.45 ms** | 194.1 / 202.4 / 217.8 | 1.12× | **15.32** |
+| fp8 · 64 | 304.88 ms | 294.6 / 304.9 / 309.2 | 1.05× | 12.61 |
+| bf16 · 24 · co-exec | 320.85 ms | 307.9 / 320.9 / 342.6 | 1.11× | 10.69 |
+
+Repeating collapses the floor from 1.45× to **1.05–1.12×**, so the 45% above was
+one bad pair rather than the intrinsic spread — and with medians, concurrency
+becomes readable at about 1.12× resolution.
+
+Two things it says. **The ranking does not change with concurrency**: the fastest
+single-stream cell is also the fastest at four streams, by 1.51× over the next —
+comfortably above the floor. And **the other two are tied**: 304.88 vs 320.85 is
+1.06×, inside the floor, so their order is not established and is not claimed.
 
 ### What a slot fill costs
 
@@ -410,6 +428,28 @@ kernel decision, not a flag.
 Not bit-exact. The GPU cache also stops adapting while co-execution covers the
 whole miss set — every host-served expert is hidden from the planner, so the
 resident set freezes.
+
+### How far it moves the output, and why that is not one number
+
+`surgeon fidelity` against the same configuration without the flag, on the same
+corpus, differing only in how much work the host path actually took (the capture
+now reports its own `cpu_execs`):
+
+| corpus | positions | host expert forwards | top-1 agreement |
+|---|---|---|---|
+| 8 prompts | 456 | **384** (0.84 per position) | **98.246%** |
+| 48 prompts | 2785 | **64** (0.023 per position) | 100.000% |
+
+The divergence tracks engagement, not the flag. Two things follow. **A single
+fidelity number for `cpu_experts` would be meaningless** — quote it with the
+workload. And **co-execution engages less as the batch grows**: a larger prefill
+routes enough tokens to each expert that few stay cold enough to be selected, so
+this is a small-batch mechanism and not something to rely on under concurrency.
+
+The zero-forward row for the flag-off arm is the control that makes the other
+row readable; a capture that reports zero forwards *with* the flag set is a
+mechanism that never ran, and `capture_arm` says so rather than reporting "no
+difference".
 
 ## Pruning
 
