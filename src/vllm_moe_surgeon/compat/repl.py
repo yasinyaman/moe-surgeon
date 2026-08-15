@@ -57,6 +57,12 @@ class TierStats:
     #: hits/misses -- those keep meaning "an H2D load happened".
     cpu_execs: int = 0
     cpu_gemm_s: float = 0.0
+    #: Seconds inside ``read_record`` -- the fill of a RAM-tier slot. Under
+    #: O_DIRECT this is physical IO; under VLLM_MOE_DISK_BUFFERED with the
+    #: store cached it is a pure memcpy into the pinned pool, so the same
+    #: counter read in both modes separates the copy from the read.
+    fill_s: float = 0.0
+    fills: int = 0
     layers: int = 0
 
     def __sub__(self, other: TierStats) -> TierStats:
@@ -68,6 +74,8 @@ class TierStats:
             disk_bytes=self.disk_bytes - other.disk_bytes,
             cpu_execs=self.cpu_execs - other.cpu_execs,
             cpu_gemm_s=self.cpu_gemm_s - other.cpu_gemm_s,
+            fill_s=self.fill_s - other.fill_s,
+            fills=self.fills - other.fills,
             layers=self.layers,
         )
 
@@ -83,6 +91,26 @@ class TierStats:
         opposite situations, and printing 0.0% for both would say the wrong one.
         """
         return self.hits / self.lookups if self.lookups else None
+
+
+def _rpc_hint(exc: Exception) -> str:
+    """Name the fix for the one failure that is a configuration, not a break.
+
+    Measured on stock vLLM 0.27.1 (2026-08-15): with the engine core in its own
+    process, `collective_rpc` refuses to serialize a plain callable and raises
+    "Object of type <class 'function'> is not serializable". The counters are
+    then unreachable and every stats line this module prints silently vanishes
+    -- on the version this package pins, in its default configuration. The
+    project's own note that "collective_rpc accepts a plain callable" was taken
+    on the 0.26.1-dev fork and no longer holds.
+    """
+    if "not serializable" in str(exc):
+        return (
+            ". This is the multiprocessing engine refusing to ship a callable: "
+            "run with VLLM_ENABLE_V1_MULTIPROCESSING=0 to keep the engine in "
+            "this process, where the counters are reachable."
+        )
+    return ""
 
 
 def collect(llm: Any) -> TierStats | None:
@@ -108,6 +136,8 @@ def collect(llm: Any) -> TierStats | None:
                         getattr(provider, "n_disk_bytes", 0),
                         getattr(provider, "cpu_execs", 0),
                         getattr(provider, "t_cpu_gemm", 0.0),
+                        getattr(provider, "t_disk_read", 0.0),
+                        getattr(provider, "n_ram_fills", 0),
                     )
                 )
         return out
@@ -115,7 +145,7 @@ def collect(llm: Any) -> TierStats | None:
     try:
         rows = llm.collective_rpc(_read)[0]
     except Exception as exc:  # pragma: no cover - engine internals moved
-        logger.warning("could not read the tier counters: %s", exc)
+        logger.warning("could not read the tier counters: %s%s", exc, _rpc_hint(exc))
         return None
     if not rows:
         return TierStats()
@@ -127,6 +157,8 @@ def collect(llm: Any) -> TierStats | None:
         disk_bytes=sum(r[4] for r in rows),
         cpu_execs=sum(r[5] for r in rows),
         cpu_gemm_s=sum(r[6] for r in rows),
+        fill_s=sum(r[7] for r in rows),
+        fills=sum(r[8] for r in rows),
         layers=len(rows),
     )
 

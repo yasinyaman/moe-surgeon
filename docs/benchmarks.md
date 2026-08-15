@@ -95,6 +95,44 @@ The graph exception is not the tier's doing: stock vLLM is not bit-identical
 between graphs and eager either, and the tier's MoE op runs eager between the
 captured pieces. It is listed because the claim above is an *eager* claim.
 
+### How far the two non-exact configurations actually move
+
+A hash says *that* two arms differ, never by how much — and the exceptions above
+are not exotic: on a card too small to hold `top_k` experts the split is
+**mandatory**, so the laptop runs one of them by default. `surgeon fidelity`
+prices them. OLMoE, GB10, stock vLLM 0.27.1, gsm8k held-out (48 prompts, 2785
+scored positions), every arm at the same `gpu_memory_utilization` 0.42:
+
+| arm | top-1 agreement | KL(untiered ‖ arm) | RMS Δp | max Δp |
+|---|---|---|---|---|
+| `expert_cache_size: 48` (control) | **100.000%** | 0.00000 | 0.000% | 0.000% |
+| `cap 4 + split: "expert"` | 98.205% | ≥0.00095 | 1.090% | +5.885% |
+| `fp8_store` | 97.379% | ≥0.00095 | 1.961% | +19.880% |
+
+The first row is a **positive control, not a result**: cap 48 is the
+configuration whose token hashes have matched untiered nine times out of nine,
+so a non-zero reading there would have meant the instrument was wrong.
+
+So the expert split — which a card too small to hold `top_k` experts makes
+mandatory — moves the sampled token 1.8% of the time, and `fp8_store` 2.6%. For
+scale: 4-bit quantisation of the same model, measured with the same class of
+statistic, moves it **8.0%**.
+
+Two honest limits. The KL figures are lower bounds: they are computed over the
+reference's top-K support, and 3.0% of reference tokens fell outside the arm's
+own top-K and were scored at the most favourable value they could have had.
+Raising K does not fix that — **32 → 128 moved coverage 89.29% → 94.50% and the
+substitution rate only 3.22% → 2.97%**, so the tail is structural rather than a
+capture setting. Top-1 agreement carries no such assumption: an argmax is inside
+its own top-K by construction.
+
+And none of this is task accuracy. That 8%-of-tokens change was measured
+**invisible** to gsm8k@200 (0.095 vs 0.105, ±0.021) and to HellaSwag@400 (62.25%
+vs 61.75%, overlapping intervals) — a change that moves the sampled token one
+time in twelve, which neither benchmark could see. The axis this table measures
+sits between perplexity and task accuracy precisely because both of those have
+been measured here to miss things.
+
 ## Feasibility
 
 `surgeon vram-floor` bisects the real minimum by booting and generating.
@@ -153,6 +191,221 @@ absolute throughput drifts between sessions on this disk-bound configuration.
 
 In-engine host cost measured 356–377 µs/expert against the isolated 368.8, so
 contention inside the real engine is ≈1.0.
+
+### Thread count is not the lever, and here is why
+
+The host GEMM is a *weight read* — one OLMoE expert is 12.58 MB against ~25
+MFLOP — so it scales with memory bandwidth, and bandwidth scales with threads.
+Standalone (`bench/p1_cpu_threads.py`, i7-12700H, 20 CPUs, T=2, bf16):
+
+| threads | 1 | 4 | 8 | 12 | 16 | 20 |
+|---|---|---|---|---|---|---|
+| µs/expert | 1226.4 | 451.8 | 360.6 | 272.0 | 244.2 | **229.8** |
+| GB/s | 10.26 | 27.85 | 34.89 | 46.25 | 51.53 | **54.75** |
+
+**5.34× is available in the kernel** and the gate's recorded 368.8 µs sits at the
+8-thread point of that curve. Raising it in the engine buys nothing: same served
+benchmark, `OMP_NUM_THREADS` unset / 20 / 12 gives **12.27 / 12.40 / 12.32 tok/s**
+(TPOT 278.7 / 271.0 / 265.2) — inside this box's drift, and the *slower* 12-thread
+arm posted the best TPOT of the three, which is what noise looks like.
+
+**Read that arm for exactly what it tested.** With `OMP_NUM_THREADS` unset torch
+already takes 14 threads on this host, so unset → 20 is a 1.09× kernel change,
+not a 5.34× one. The null result therefore says the top of the curve is flat; it
+does **not** establish what share of the step the host GEMM is. The arm that
+would establish it is `OMP_NUM_THREADS=1` — a real 5.34× — and it is listed as
+open below rather than inferred here.
+
+What is already established: the best available tuning of `cpu_expert_threads`
+moves served TPOT by a few percent, so it is a small knob rather than a lever.
+The measurement below says why — the host GEMM shares the step with a much larger
+term.
+
+### Concurrency is the gap, and a served TTFT is not a prefill number
+
+Same laptop arm, same server, two client settings:
+
+| | concurrency 4 | concurrency 1 |
+|---|---|---|
+| median TTFT | 7305 ms | **881 ms** |
+| median TPOT | 274.8 ms | **96.4 ms** |
+
+**Do not read a served median TTFT as prefill cost.** At concurrency 4 with
+128-token outputs, a request waits behind other requests' decode — about 88% of
+that 7305 ms is queueing. The prefill this configuration actually performs takes
+881 ms.
+
+Per-stream decode is 96.4 ms/token alone and 274.8 ms at four in flight — 2.85×
+worse for the same work, since concurrency multiplies the per-layer expert union
+and this card holds 4 experts of 64.
+
+Raising the host tier confirms the mechanism, because it helps exactly where the
+union is large and nowhere else:
+
+| `ram_cache` | c4 tok/s | c4 TPOT | c1 TPOT | host RSS |
+|---|---|---|---|---|
+| 24 | 12.34 | 274.8 ms | 96.4 ms | 7878 MB |
+| 36 | **14.26** | **208.6 ms** (1.32×) | 91.0 ms (1.06×) | 10183 MB |
+| 48 | — | refused | — | — |
+
+The 48 arm did not OOM: the pinned-pool rule refused it, *"only 3.8 GiB of 14.8
+GiB is available and at least 3.7 GiB must stay reclaimable, or the host
+livelocks"*. That guard exists because this box once went into swap and lost its
+session; this is the first time it has fired on a real attempt, and the box
+stayed up.
+
+### The configuration matrix, in one sitting
+
+Every figure above came from a different sitting, and absolute throughput on this
+box drifts between them. Nineteen configurations run back to back are mutually
+comparable; median ms per output token, single stream, lower is better:
+
+| store · `ram_cache` | `cpu_experts` | O_DIRECT | page cache | Δ |
+|---|---|---|---|---|
+| fp8 · 8 | off | 134.59 | **108.17** | 1.24× |
+| fp8 · 24 | off | 94.94 | 93.12 | 1.02× |
+| fp8 · 64 | off | 89.87 | 89.63 | 1.00× |
+| bf16 · 8 | on | 238.79 | **160.04** | 1.49× |
+| bf16 · 24 | on | **109.86** | 132.64 | 0.83× |
+| bf16 · 36 | on | **75.28** | 87.79 | 0.86× |
+| bf16 · 8 | off | 277.23 | **182.94** | 1.52× |
+| bf16 · 24 | off | 158.40 | 152.64 | 1.04× |
+| bf16 · 36 | off | 146.28 | 146.26 | 1.00× |
+
+Three things fall out of it.
+
+**The read path's sign flips with `ram_cache`.** The page cache wins at 8
+(1.24–1.52×), is neutral at 24, and loses at 36 (0.83–0.86×), where it is a
+redundant second copy of records the pinned pool already holds. Choose it by the
+pool's absolute size, not by whether the pool covers the store: at `ram_cache` 36
+the pool is 7.25 GB against a 12.9 GB store and buffered is still the wrong
+choice. The crossover is near 24 on this host.
+
+**Co-execution is worth more the more host RAM it has** — 1.16× at `ram_cache` 8,
+1.44× at 24, 1.94× at 36. What it buys is bytes never sent over PCIe, and the
+only bytes it can avoid sending are the ones already in RAM.
+
+**The fastest cell is not the fully-resident fp8 store.** bf16 · 36 · co-exec ·
+O_DIRECT reaches **75.28 ms/token** against fp8 · 64's 89.87 — 1.19× better at
+comparable pinned memory (7.25 vs 6.46 GB). The same configuration measured
+91.0 ms in a separate sitting; only inside one sitting does its position show.
+
+**How much of this table is readable.** The first cell was repeated as the last.
+Single-stream latency returned within **0.3%** (134.59 → 134.98); the
+concurrency-4 figure returned **45% higher** (466.73 → 678.61) doing identical
+work by the read counters. So the single-stream column carries the findings and
+**no concurrency comparison below 1.45× is real** — which is why this section
+quotes none.
+
+### What a slot fill costs
+
+`t_disk_read` times the `preadv` that stages a record into the pinned pool.
+Reading the same configuration twice separates the copy from the read, because
+`VLLM_MOE_DISK_BUFFERED` with a warm page cache leaves no device inside it. fp8
+store (6.31 MB per record), `ram_cache` 8, identical 10 534 fills:
+
+| read path | µs per fill | effective |
+|---|---|---|
+| buffered, page cache warm | **889.3** | 7.1 GB/s — the copy alone |
+| O_DIRECT | **2200.2** | 2.9 GB/s — device-bound |
+
+So staging a record costs ~889 µs of pure memcpy, about 40% of a device-bound
+fill. Residency is what removes it wholesale: at `ram_cache` 64 the same workload
+performs **103 fills instead of 10 534** (99.2% RAM-tier hit rate).
+
+Scaled to the fastest bf16 cell — 925 fills over 128 tokens, a 12.58 MB record —
+the copy is ~12.8 ms of an 83.7 ms step, about **15%**. That is the ceiling on any
+change that computes host-served experts in place rather than staging them, and
+it is why no such change is shipped: 1.18× on one configuration, on a host that
+cannot cache a 12.9 GB store beside a 4.8 GB engine anyway.
+
+**Do not read `fill_s` as a fraction of the step.** It is summed across the
+reader threads, so with `DISK_IO_THREADS` above 1 overlapping fills can total more
+than wall time — one arm reported a "share" of 1.08. The per-fill figure is the
+trustworthy one.
+
+### What the step is actually made of
+
+Counters rather than inference (`bench/p1e_share.py`, provider `cpu_execs`,
+`t_cpu_gemm`, `n_disk_bytes`; needs `VLLM_ENABLE_V1_MULTIPROCESSING=0`, see
+below). bf16 store, cache 4, `ram_cache` 24, `cpu_experts`, 128 tokens:
+
+| | 1 sequence | 4 sequences |
+|---|---|---|
+| host GEMM share of wall | **29.6%** | **38.6%** |
+| per expert | 335.3 µs | 525.5 µs |
+| **read from disk per token** | **346.78 MiB** | 104.91 MiB |
+| RAM tier hit rate | 76.1% | 74.9% |
+
+**43 GiB of NVMe for 128 tokens.** The host GEMM is a large share but it runs
+underneath that, which is why making it faster changed nothing.
+
+### Fitting the whole store in RAM — what fp8 is actually for
+
+An fp8 record is 6.31 MB against bf16's 12.58, so `ram_cache` 64 costs 6.46 GB
+and the **entire store becomes resident** — the configuration the pinned-pool
+rule refuses for bf16. Same client and workload as the rows above:
+
+| configuration | c1 TTFT | c1 TPOT | c4 TPOT | c4 tok/s | disk/token |
+|---|---|---|---|---|---|
+| bf16 + `cpu_experts`, ram 24 | 881 ms | 96.4 ms | 274.8 ms | 12.34 | 346.78 MiB |
+| bf16 + `cpu_experts`, ram 36 | 655 ms | 91.0 ms | **208.6 ms** | **14.26** | — |
+| **fp8, ram 64 (fully resident)** | **608 ms** | **90.0 ms** | 296.2 ms | 12.78 | **4.84 MiB** |
+| fp8, ram 12 | 814 ms | 110.7 ms | 416.8 ms | 8.75 | — |
+
+Disk traffic falls **72×** and the RAM tier hits 99.2%. Single-stream, that arm
+is the best of everything measured on this box. **At four sequences it loses to
+co-execution anyway**, and the reason is mechanical: `cpu_experts` and
+`fp8_store` are mutually exclusive today, so the fully-resident arm has no host
+compute and every miss crosses PCIe at 1139.7 µs a record — which is precisely
+what concurrency multiplies.
+
+So the two mechanisms win in different regimes, and the honest recommendation for
+a card this size is per-workload rather than universal: **fully-resident fp8 for
+single-stream latency, bf16 + co-execution for concurrent serving.**
+
+### Who should hold the warm tier — us, or the page cache
+
+The store reads with `O_DIRECT`, which keeps the pinned RAM tier the only RAM
+this path uses. `VLLM_MOE_DISK_BUFFERED=1` reads through the page cache instead.
+Same client and workload, physical reads from `/proc/PID/io read_bytes` so
+cache hits are excluded by construction:
+
+| pinned pool | read path | c1 TPOT | c1 read | c4 TPOT | c4 read | c4 tok/s |
+|---|---|---|---|---|---|---|
+| 6.46 GB (`ram_cache` 64) | O_DIRECT | **89.5 ms** | 0 | 306.3 ms | 0 | 12.39 |
+| 6.46 GB | buffered | 89.9 ms | 0 | 296.9 ms | 0 | 12.54 |
+| 0.81 GB (`ram_cache` 8) | **buffered** | 107.5 ms | **0** | 387.8 ms | **5.4 GiB** | 9.96 |
+| 0.81 GB | O_DIRECT | 126.1 ms | 21.4 GiB | 534.7 ms | **918 GiB** | 6.20 |
+
+Two readings, and the second is the useful one. **When the pinned pool holds the
+store, pinning wins** — 89.5 ms against 107.5 for the page cache, and the flag
+itself is free (rows 1 and 2 are the same arm either way). **When it does not,
+the page cache is worth 1.17× at one sequence and 1.61× on throughput at four**,
+and it removes 99.4% of the physical reads — one benchmark of the O_DIRECT arm
+pulled **918 GiB** off the device.
+
+That second case is not hypothetical: it is what a card too small for the pool,
+a model too large for the host, or the pinned-pool refusal all land on, and it is
+where the current default behaves worst. The cgroup worry did not appear —
+capped at 12G and uncapped measure the same (107.5 vs 105.8 ms) because a 6.1 GB
+store fits beside a ~4 GB engine.
+
+It cannot conjure residency that does not exist. With the **bf16** store (12.9 GB
+on a 14.8 GB host) the same switch gives its largest relative win — 1.54× at c1,
+2.19× at c4 — and still only reaches 140.9 ms, because nothing can cache a store
+that does not fit.
+
+`DISK_IO_THREADS` was swept in the same sitting and is flat (1/2/4 → 94.1 / 89.4
+/ 97.2 ms at c1): the device saturates at queue depth 2, measured directly at
+6.2 GB/s against a page-cache hit's 21–40 GB/s (`bench/f0_cache_probe.py`).
+
+The combination that would take both is refused on purpose — *"the CPU path would
+have to dequantize every forward, which is not implemented"*. Worth noting what
+it would cost, because it is not obvious: a naive host dequant reads 6.31 MB and
+writes 12.58, roughly **doubling** the ~335 µs host GEMM, while one fused into
+the GEMM would read **half** the bytes bf16 does and could beat it. That is a
+kernel decision, not a flag.
 
 Not bit-exact. The GPU cache also stops adapting while co-execution covers the
 whole miss set — every host-served expert is hidden from the planner, so the

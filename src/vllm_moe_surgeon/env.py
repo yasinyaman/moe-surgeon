@@ -85,6 +85,14 @@ _SPEC: dict[str, tuple[Callable[[str], Any], Any]] = {
     # Reader threads, clamped to [1, 4] at use. Past 4 the measured p99 read
     # latency degrades badly (4 ms -> 128 ms) for no bandwidth gain.
     "VLLM_MOE_DISK_IO_THREADS": (int, 2),
+    # Read the store through the page cache instead of O_DIRECT, making the
+    # kernel the warm tier rather than the pinned RAM pool. Off by default:
+    # O_DIRECT is what keeps the RAM tier the only RAM this path uses, and a
+    # cached copy alongside a pinned copy is the same bytes twice. Selectable
+    # because the alternative is worth measuring -- a page cache is reclaimable,
+    # so it never trips the pinned-pool refusal that a large ram_cache does.
+    # Records stay 4096-padded either way, so the same store file serves both.
+    "VLLM_MOE_DISK_BUFFERED": (_bool, False),
     # Cross-group RAM prefetch under the current group's kernel. Silently
     # no-ops unless ram_capacity >= 2 * capacity; rejects zero copy.
     "VLLM_MOE_DISK_PREFETCH": (_bool, False),

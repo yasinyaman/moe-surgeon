@@ -192,6 +192,37 @@ same code measured **0.719× — a loss**. The predictor is
 Not bit-exact — the host reduction order differs from the fused kernel's, and
 the runtime says so at boot.
 
+### "Not bit-exact" — by how much?
+
+On a card this size the expert split is mandatory, so the configuration above is
+one you cannot opt out of. `surgeon fidelity` prices it: it scores one corpus
+under several configurations, one engine process each, and measures how far each
+one's output distribution moved from a reference.
+
+```bash
+surgeon fidelity --model MODEL --corpus heldout.jsonl --limit 48 \
+  --llm-kwargs '{"gpu_memory_utilization":0.42,"max_model_len":1024,"enforce_eager":true}' \
+  --arm 'untiered={}' \
+  --arm 'sized={"additional_config":{"surgeon":{"expert_cache_size":48,"store_dir":"./store","ram_cache":64}}}' \
+  --arm 'small={"additional_config":{"surgeon":{"expert_cache_size":4,"store_dir":"./store","ram_cache":24,"split":"expert"}}}'
+```
+
+**Make the first arm a reference you already trust, and include one arm you
+expect to be identical.** A correctly sized tier is numerically transparent, so
+it must read 100% — if it does not, the measurement is wrong and no other row
+means anything.
+
+The headline is top-1 agreement: the fraction of positions where both arms would
+sample the same token at temperature 0. Measured on OLMoE/gsm8k, the split moves
+it 1.8% of the time and `fp8_store` 2.6%, against 8.0% for the 4-bit
+quantisation that is the usual alternative on a card this size
+(docs/benchmarks.md).
+
+Two things it does not do. It is not a bit-exactness test — that is a token
+hash, and the command says so. And it is not task accuracy: a change this size
+was invisible to gsm8k@200 and HellaSwag@400 here, which is exactly why the
+distribution is worth measuring directly.
+
 ---
 
 ## 5. Several models on one big machine

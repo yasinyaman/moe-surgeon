@@ -200,3 +200,17 @@ def test_tier_stats_carries_the_cpu_coexec_counters():
     assert "CPU co-exec" not in format_session(
         TierStats(hits=10, misses=2, layers=16)
     )
+
+
+def test_a_serialization_failure_names_the_env_var_that_fixes_it():
+    """Stock vLLM 0.27.1 in its default multiprocessing mode cannot ship a plain
+    callable to the worker, so the counters vanish and the REPL's whole point
+    with them. The warning has to say which knob brings them back."""
+    from vllm_moe_surgeon.compat.repl import _rpc_hint
+
+    exc = ValueError("Object of type <class 'function'> is not serializable")
+    hint = _rpc_hint(exc)
+
+    assert "VLLM_ENABLE_V1_MULTIPROCESSING=0" in hint
+    # An unrelated failure is an engine break, not a configuration: no advice.
+    assert _rpc_hint(RuntimeError("worker died")) == ""

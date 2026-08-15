@@ -106,6 +106,7 @@ the local copy when they differ.
 | `surgeon apply` | write the pruned checkpoint | nothing |
 | `surgeon calibrate` | what amplitude should a pruned checkpoint carry | GPU |
 | `surgeon ablate` | what do these experts contribute | GPU |
+| `surgeon fidelity` | how far did this configuration move the output distribution | GPU |
 | `surgeon tier` | build the store offline | nothing |
 | `surgeon serve` | run the pipeline over HTTP | GPU for its stages |
 | `surgeon seams` | will this survive a vLLM upgrade | nothing |
@@ -119,13 +120,41 @@ Measured on a DGX Spark (GB10, 121 GB unified) and an RTX 3050 Ti laptop
 
 | | measured |
 |---|---|
-| serves a 12.9 GiB model on a 3.68 GiB card | 2.69 GiB peak, 7.7 tok/s |
+| serves a 12.9 GiB model on a 3.68 GiB card | 2.69 GiB peak |
 | load time, cache 48 | 16.9 s vs 128.9 s untiered |
 | **cache size, the one knob that matters** | **2.67× decode across one integer** |
 | decode, correctly sized | 145.1 vs 218.5 tok/s untiered |
 | numerical transparency, eager | identical token hashes, 9 of 9 runs |
-| CPU co-execution, discrete card | 1.58× |
+| how far the non-exact settings move the output | split 98.2%, `fp8_store` 97.4% top-1 agreement |
+| CPU co-execution, discrete card | 1.58×, and 1.94× with enough host RAM |
 | CPU co-execution, unified memory | 0.719× — a loss, refused |
+
+## Configuring it
+
+The spread between a good and a bad configuration of this package is larger than
+most of the decisions around it: on one card, one model and one sitting, nineteen
+settings span **75 to 277 ms per output token**. Three rules cover most of it.
+
+**Size the GPU cache against the batch's per-layer expert union, not against the
+expert count.** Below the union every layer splits into chunks and each chunk
+re-reads; above it the split disappears. This is the 2.67× above, and it is one
+integer.
+
+**Give the host tier as much as the pinned-pool rule allows.** `ram_cache` is what
+turns a disk read into a RAM hit, and it is also what makes CPU co-execution
+worth having — measured 1.16× at `ram_cache` 8 against **1.94× at 36**, because
+co-execution can only avoid sending bytes that are already in host RAM.
+
+**Set `VLLM_MOE_DISK_BUFFERED` by the pool's absolute size.** Reading the store
+through the OS page cache instead of `O_DIRECT` is worth 1.24–1.52× when the
+pinned pool is small, and *costs* up to 1.16× when it is large enough that the
+cache is just a second copy. The crossover measured near `ram_cache` 24; it is not
+"whether the pool covers the store" — at 36 it still does not, and buffered is
+still wrong.
+
+`surgeon autoconfig` picks the first two from the machine. The tables, the method
+and the noise floor are in [docs/benchmarks.md](docs/benchmarks.md); read the note
+there on which column is readable before quoting a concurrency number.
 
 ## How it fits together
 

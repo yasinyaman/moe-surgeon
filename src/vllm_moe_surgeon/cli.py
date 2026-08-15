@@ -568,6 +568,100 @@ def _cmd_headroom(args: argparse.Namespace) -> int:
     return 0 if result.ranked else 1
 
 
+def _parse_arm(spec: str) -> tuple[str, dict[str, Any]]:
+    """``name={"json": ...}`` -> ``("name", {...})``, with a usable error."""
+    name, sep, payload = spec.partition("=")
+    if not sep or not name.strip():
+        raise ValueError(
+            f"--arm wants NAME=JSON, got {spec!r}. Example: "
+            '--arm \'tier={"additional_config": {"surgeon": {...}}}\''
+        )
+    try:
+        kwargs = json.loads(payload) if payload.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--arm {name}: {exc}") from exc
+    if not isinstance(kwargs, dict):
+        raise ValueError(f"--arm {name}: expected a JSON object, got {type(kwargs)}")
+    return name.strip(), kwargs
+
+
+def _cmd_fidelity(args: argparse.Namespace) -> int:
+    import tempfile
+
+    from .compat.fidelity import capture_arm, stage_corpus
+    from .compat.profile_runner import iter_prompts_from_jsonl
+    from .surgery.fidelity import compare, report, to_dict
+
+    arms = [_parse_arm(spec) for spec in args.arm]
+    if len(arms) < 2:
+        # The reference is an arm, so one --arm is a capture with nothing to
+        # compare it to. Refused before any engine boots.
+        print(
+            "fidelity measures arms against a reference, so it needs at least "
+            "two --arm arguments; the first one is the reference. Got one.",
+            file=sys.stderr,
+        )
+        return 1
+
+    prompts = list(iter_prompts_from_jsonl(args.corpus, args.field))
+    if args.limit:
+        prompts = prompts[: args.limit]
+    if not prompts:
+        print(f"no prompts in {args.corpus}", file=sys.stderr)
+        return 1
+
+    shared = json.loads(args.llm_kwargs) if args.llm_kwargs else {}
+    keep = args.capture_dir
+    if keep:
+        os.makedirs(keep, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = keep or tmp
+        # Staged once: every arm must score byte-identical text, and `compare`
+        # refuses captures whose positions do not line up anyway.
+        staged = os.path.join(target, "corpus.jsonl")
+        stage_corpus(prompts, staged)
+
+        captures = []
+        for name, arm_kwargs in arms:
+            print(f"capturing {name} ...", file=sys.stderr)
+            captures.append(
+                capture_arm(
+                    args.model,
+                    staged,
+                    os.path.join(target, f"fidelity-{name}.npz"),
+                    arm=name,
+                    llm_kwargs={**shared, **arm_kwargs},
+                    top_k=args.top_k,
+                    timeout=args.timeout,
+                )
+            )
+
+        reference = captures[0]
+        results = [
+            compare(reference, capture, arm=name)
+            for (name, _), capture in zip(arms[1:], captures[1:], strict=True)
+        ]
+
+    print(report(arms[0][0], results))
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(
+                {
+                    "model": args.model,
+                    "corpus": args.corpus,
+                    "n_prompts": len(prompts),
+                    "top_k": args.top_k,
+                    "reference": {"arm": arms[0][0], "llm_kwargs": arms[0][1]},
+                    "arms": [to_dict(r) for r in results],
+                },
+                f,
+                indent=2,
+            )
+        print(f"\nwritten to  {args.out}")
+    return 0
+
+
 def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
     """NaN is a Python extension, not JSON: a strict parser rejects the whole
     file. An unscored candidate is a deliberate, preserved outcome here, so its
@@ -891,6 +985,39 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--llm-kwargs", help="extra LLM() kwargs as JSON")
     p.add_argument("--out", help="write the result as JSON here")
     p.set_defaults(func=_cmd_vram_floor)
+
+    p = sub.add_parser(
+        "fidelity",
+        help="how far each configuration's output distribution moved from a reference",
+    )
+    p.add_argument("--model", required=True, help="model or checkpoint directory")
+    p.add_argument("--corpus", required=True, help="HELD-OUT JSONL to score")
+    p.add_argument("--field", default="text")
+    p.add_argument("--limit", type=int, help="cap the number of prompts")
+    p.add_argument(
+        "--arm",
+        action="append",
+        required=True,
+        metavar="NAME=JSON",
+        help=(
+            "configuration to measure, as LLM() kwargs JSON; repeat. "
+            "THE FIRST ARM IS THE REFERENCE every later arm is measured against"
+        ),
+    )
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=32,
+        help="logprobs captured per position; raise it if KL is refused",
+    )
+    p.add_argument("--timeout", type=float, default=3600.0, help="per arm")
+    p.add_argument("--llm-kwargs", help="LLM() kwargs shared by every arm, as JSON")
+    p.add_argument(
+        "--capture-dir",
+        help="keep the per-arm .npz captures here instead of a temporary directory",
+    )
+    p.add_argument("--out", help="write the comparison as JSON here")
+    p.set_defaults(func=_cmd_fidelity)
 
     p = sub.add_parser("seams", help="check the vLLM seams this package holds")
     p.add_argument("--source", help="check a vLLM source tree instead of the install")

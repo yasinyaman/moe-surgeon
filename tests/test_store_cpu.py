@@ -206,3 +206,32 @@ def test_env_overrides_beat_environment(monkeypatch):
     finally:
         env.set_overrides({})
     assert env.VLLM_MOE_RAM_CACHE == 8
+
+
+def test_buffered_mode_reads_the_same_bytes_without_o_direct(tmp_path, monkeypatch):
+    """The page-cache path must be selectable, and identical on the bytes.
+
+    O_DIRECT is a residency/accounting choice, not a format one -- records stay
+    4096-padded either way -- so the SAME store file has to serve both modes.
+    That is what makes a buffered-vs-O_DIRECT A/B honest: no rebuild between
+    arms, so nothing but the read path differs.
+    """
+    w13, w2 = _weights()
+    path = str(tmp_path / "layer0.experts")
+    store = DiskExpertStore.build(path, w13, w2, identity=IDENTITY)
+    direct = [_read_back(store, e) for e in range(NUM_EXPERTS)]
+    store.close()
+
+    monkeypatch.setenv("VLLM_MOE_DISK_BUFFERED", "1")
+    buffered_store = DiskExpertStore.build(path, w13, w2, identity=IDENTITY)
+    for e in range(NUM_EXPERTS):
+        got = _read_back(buffered_store, e)
+        torch.testing.assert_close(got["w13"], direct[e]["w13"], rtol=0, atol=0)
+        torch.testing.assert_close(got["w2"], direct[e]["w2"], rtol=0, atol=0)
+    # The flag has to actually reach the descriptor; a knob that silently keeps
+    # O_DIRECT would make every arm of the A/B measure the same thing. Only
+    # checkable where O_DIRECT exists -- on macOS both modes are buffered
+    # already, so the assertion would pass without testing anything.
+    if hasattr(os, "O_DIRECT"):
+        assert store._o_direct is True
+        assert buffered_store._o_direct is False
