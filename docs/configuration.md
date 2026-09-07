@@ -143,11 +143,16 @@ Supported. `--enforce-eager` is not required: the runtime carves the MoE op out
 of the captured region at config time, so the cache's host code runs eager
 between graph pieces. Worth +3.8% on the untiered baseline and ~0 for the tier.
 
+The pieces share vLLM's one process-wide graph memory pool, and the MoE
+output is copied to a persistent buffer outside it before the next piece
+reads it; per-graph private pools, which can cost gigabytes across a few
+hundred captures, are never used.
+
 `cpu_experts` is incompatible and refused.
 
 ## Surviving a vLLM upgrade
 
-**Supported range: `vllm>=0.26.0,<0.28`.** The package holds a declared set of
+**Supported range: `vllm>=0.26.0,<0.29`.** The package holds a declared set of
 vLLM internals. Check them against a new version before upgrading:
 
 ```bash
@@ -169,32 +174,43 @@ exits 1 when a required seam broke — enough to gate a pin bump in CI.
 signatures, **not behaviour**, so it cannot see a semantic change behind an
 unchanged signature. A green parser is not a reason to move the ceiling.
 
-**What moved it to `<0.28`.** vLLM 0.27.1 was installed from PyPI — stock, not
-the fork — into its own environment on both machines, and the package was run
-on it:
+**What moved it to `<0.29`.** The procedure, run for 0.27.1 (2026-08-14) and
+again for 0.28.0 (2026-09-07): the release is installed from PyPI — stock, not
+the fork — into its own environment on the GB10, the package is installed into
+that environment, and four checks run against it:
 
-| check | result |
-|---|---|
-| seams, against the **installed** package | 33 seams, 0 required broken |
-| plugin entry point | `moe_surgeon` loads |
-| test suite | 633 passed / 1 skipped (GB10) |
-| **tier vs untiered token identity** | **one sha256 across all six runs** |
+| check | 0.27.1 | 0.28.0 |
+|---|---|---|
+| seams, against the **installed** package | 33 seams, 0 required broken | 33 seams, **1 required broke on the parser** (see below), 0 after the fix |
+| plugin entry point | `moe_surgeon` loads | `moe_surgeon` loads |
+| test suite | 633 passed / 1 skipped | 648 passed / 1 skipped |
+| **tier vs untiered token identity** | **one sha256 across all six runs** | **one sha256 across all six runs** |
 
 The last row is the one that counts. OLMoE-1B-7B, greedy, 4 prompts × 128
 tokens, `expert_cache_size` 48 with `ram_cache` 64 on the disk store, against a
-plain untiered boot — 3 processes per arm, one arm per process, and every run
-returned `c08aa685…`. Both arms held `gpu_memory_utilization` at 0.42: a token
-hash is only comparable within one memory configuration, because a different KV
-pool changes the batch composition and with it the reduction order.
+plain untiered boot — 3 processes per arm, one arm per process, every run the
+same hash (`c08aa685…` on 0.27.1, `d339df8a…` on 0.28.0). Both arms hold
+`gpu_memory_utilization` at 0.42, `max_model_len` 1024, `enforce_eager`, and
+**`VLLM_ENABLE_V1_MULTIPROCESSING=0`**. The last one is not optional: with the
+default multi-process client the engine starts stepping while requests are
+still arriving, so the first steps' batch composition — and with it the
+reduction order — depends on timing, and the hash moves from run to run on
+0.27.1 and 0.28.0 alike, tier or no tier. A token hash is only comparable
+within one memory configuration *and* one client mode.
 
-This is also the first time the out-of-tree premise — that this runs on stock
-vLLM, not only on the fork it grew out of — has been demonstrated by running it.
-The earlier evidence was a symbol-by-symbol check against a source tree, which
-establishes that the names are there and nothing about what they do.
+**What 0.28.0 changed.** `replace_parameter`'s third argument was renamed
+`new_data` → `new_tensor`. Every call site here passes it positionally, so
+nothing changed at runtime; the seam table failed, which is what it is for.
+A seam can now declare `params_any`, alternative names for one parameter of
+which at least one must exist, reserved for arguments we pass by position.
+
+This is also how the out-of-tree premise — that this runs on stock vLLM, not
+only on the fork it grew out of — is demonstrated: by running it. The static
+seam check establishes that the names are there and nothing about what they do.
 
 Note the numbers in [benchmarks.md](benchmarks.md) were still taken against a
-0.26.1-dev fork. The range says the package works on 0.27.1; it does not claim
-the throughput tables were re-measured there.
+0.26.1-dev fork. The range says the package works on 0.27.1 and 0.28.0; it
+does not claim the throughput tables were re-measured there.
 
 ## The job server
 
