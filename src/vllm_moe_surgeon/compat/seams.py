@@ -66,6 +66,13 @@ class Seam:
     #: subset, not the full signature: requiring an exact match would fail on
     #: every harmless upstream addition, which trains you to ignore the test.
     params: tuple[str, ...] = field(default_factory=tuple)
+    #: Alternative names for one parameter: each inner tuple must have at least
+    #: one member present. For a parameter we pass *positionally* that upstream
+    #: has renamed -- ``replace_parameter``'s third argument became ``new_tensor``
+    #: in vLLM 0.28.0 -- the position is what we hold, and either name proves
+    #: it is still there. A rename that also moved the position would show up
+    #: at runtime, which is why this is reserved for positional call sites.
+    params_any: tuple[tuple[str, ...], ...] = field(default_factory=tuple)
     #: ``False`` for a seam we would *like* to use but can live without -- one
     #: that upstream has only recently grown, or that we have a fallback for.
     #: Tracking upstream is not only about names disappearing: when upstream
@@ -172,9 +179,7 @@ SEAMS: tuple[Seam, ...] = (
         "runtime format before the cache takes them. Optional -- fp8 tier only.",
     ),
     Seam(
-        target=(
-            "vllm.model_executor.layers.fused_moe.oracle.fp8:make_fp8_moe_kernel"
-        ),
+        target=("vllm.model_executor.layers.fused_moe.oracle.fp8:make_fp8_moe_kernel"),
         kind="function",
         tier="internal",
         required=False,
@@ -207,8 +212,12 @@ SEAMS: tuple[Seam, ...] = (
             "the streaming loader onto them. Renamed upstream -> weights allocated "
             "the stock way, the tier never installs, silent."
         ),
-        params=("layer", "num_experts", "intermediate_size_per_partition",
-                "params_dtype"),
+        params=(
+            "layer",
+            "num_experts",
+            "intermediate_size_per_partition",
+            "params_dtype",
+        ),
     ),
     Seam(
         target=(
@@ -258,9 +267,12 @@ SEAMS: tuple[Seam, ...] = (
         why=(
             "Releases the full w13/w2 parameters to torch.empty(0) once the provider "
             "has copied what it needs. Gone -> the full expert tensors stay "
-            "resident, defeating the tier."
+            "resident, defeating the tier. The third parameter was renamed "
+            "new_data -> new_tensor in vLLM 0.28.0; every call site passes it "
+            "positionally, so either name is accepted."
         ),
-        params=("layer", "param_name", "new_data"),
+        params=("layer", "param_name"),
+        params_any=(("new_data", "new_tensor"),),
     ),
     Seam(
         target="vllm.model_executor.utils:set_weight_attrs",
@@ -383,9 +395,7 @@ SEAMS: tuple[Seam, ...] = (
         ),
     ),
     Seam(
-        target=(
-            "vllm.model_executor.layers.fused_moe.runner.moe_runner:MoERunner"
-        ),
+        target=("vllm.model_executor.layers.fused_moe.runner.moe_runner:MoERunner"),
         kind="class",
         tier="internal",
         required=False,
@@ -614,6 +624,21 @@ def _has_field(owner: Any, name: str) -> bool:
     return False
 
 
+def _wants_params(seam: Seam) -> bool:
+    return bool(seam.params or seam.params_any)
+
+
+def _missing_params(seam: Seam, available: set[str]) -> str | None:
+    """The first parameter requirement ``available`` fails, or None."""
+    missing = [p for p in seam.params if p not in available]
+    if missing:
+        return f"parameters gone: {missing}"
+    for alts in seam.params_any:
+        if not any(a in available for a in alts):
+            return f"parameters gone: none of {list(alts)}"
+    return None
+
+
 def check(seam: Seam) -> SeamProblem | None:
     """Verify one seam resolves and, for callables, carries the params we need."""
     if seam.kind == "attribute":
@@ -651,16 +676,16 @@ def check(seam: Seam) -> SeamProblem | None:
     if seam.kind in ("function", "method") and not callable(obj):
         return SeamProblem(seam, f"expected a callable, got {type(obj).__name__}")
 
-    if seam.params:
+    if _wants_params(seam):
         # For a class, the params we care about are its constructor's.
         target = obj.__init__ if inspect.isclass(obj) else obj
         try:
             available = set(inspect.signature(target).parameters)
         except (TypeError, ValueError) as exc:
             return SeamProblem(seam, f"signature unavailable: {exc}")
-        missing = [p for p in seam.params if p not in available]
-        if missing:
-            return SeamProblem(seam, f"parameters gone: {missing}")
+        detail = _missing_params(seam, available)
+        if detail:
+            return SeamProblem(seam, detail)
 
     return None
 
@@ -794,7 +819,7 @@ def check_static(seam: Seam, source_root: str) -> SeamProblem | None:
         # Terminated on a field. Nothing further to verify statically.
         return None
 
-    if seam.params and isinstance(node, ast.ClassDef):
+    if _wants_params(seam) and isinstance(node, ast.ClassDef):
         # Mirror check(): for a class, the params we require are its
         # constructor's. Without this the static level would silently pass a
         # seam the import level checks, which is worse than not checking.
@@ -810,11 +835,11 @@ def check_static(seam: Seam, source_root: str) -> SeamProblem | None:
             return SeamProblem(
                 seam,
                 f"{node.name} defines no __init__ directly, so params "
-                f"{list(seam.params)} cannot be checked statically",
+                f"{[*seam.params, *seam.params_any]} cannot be checked statically",
             )
         node = init
 
-    if seam.params and isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+    if _wants_params(seam) and isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
         args = node.args
         available = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
         if args.vararg:
@@ -822,9 +847,10 @@ def check_static(seam: Seam, source_root: str) -> SeamProblem | None:
         if args.kwarg:
             # **kwargs swallows anything, so param checks cannot fail here.
             available |= set(seam.params)
-        missing = [p for p in seam.params if p not in available]
-        if missing:
-            return SeamProblem(seam, f"parameters gone: {missing}")
+            available |= {a for alts in seam.params_any for a in alts}
+        detail = _missing_params(seam, available)
+        if detail:
+            return SeamProblem(seam, detail)
 
     return None
 

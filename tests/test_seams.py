@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from vllm_moe_surgeon.compat.seams import SEAMS, check, check_static
+from vllm_moe_surgeon.compat.seams import SEAMS, Seam, check, check_static
 
 _IDS = [s.target for s in SEAMS]
 
@@ -117,6 +117,56 @@ def test_internal_seams_are_acknowledged():
         f"{len(internal)} internal seams -- if this grew on purpose, raise the "
         "bound deliberately and say why in the commit"
     )
+
+
+def _renamed_seam(*alts: str) -> Seam:
+    return Seam(
+        target="json:dumps",
+        kind="function",
+        tier="documented",
+        why="synthetic: a positional parameter upstream may rename, held by position",
+        params=("obj",),
+        params_any=(tuple(alts),),
+    )
+
+
+def test_params_any_holds_a_position_under_either_name():
+    """A parameter we pass positionally survives an upstream rename."""
+    assert check(_renamed_seam("skipkeys", "never_existed")) is None
+    assert check(_renamed_seam("never_existed", "skipkeys")) is None
+    problem = check(_renamed_seam("never_existed", "nor_this"))
+    assert problem is not None
+    assert "none of ['never_existed', 'nor_this']" in problem.detail
+
+
+def test_params_any_is_checked_statically_too(tmp_path):
+    """The static level must mirror the import level, rename included."""
+    pkg = tmp_path / "vllm"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "fake_utils.py").write_text(
+        "def replace_parameter(layer, param_name, new_tensor, prefer_copy=False):\n"
+        "    pass\n"
+    )
+
+    def seam(*alts: str) -> Seam:
+        return Seam(
+            target="vllm.fake_utils:replace_parameter",
+            kind="function",
+            tier="internal",
+            why="synthetic: the 0.28.0 rename of replace_parameter's third argument",
+            params=("layer", "param_name"),
+            params_any=(tuple(alts),),
+        )
+
+    assert check_static(seam("new_data", "new_tensor"), str(tmp_path)) is None
+    problem = check_static(
+        seam(
+            "new_data",
+        ),
+        str(tmp_path),
+    )
+    assert problem is not None and "none of ['new_data']" in problem.detail
 
 
 # ----------------------------------------------------------------------
