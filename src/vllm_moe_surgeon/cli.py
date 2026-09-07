@@ -272,14 +272,24 @@ def _cmd_autoconfig(args: argparse.Namespace) -> int:
         return 2
 
     if args.json:
-        print(json.dumps(config.surgeon))
+        print(
+            json.dumps(
+                {
+                    "surgeon": config.surgeon,
+                    "env": config.env,
+                    "max_num_seqs": config.max_num_seqs,
+                }
+            )
+        )
         return 0
 
     env = config.environment
     source = "cached" if config.cached else "probed"
-    print(f"{source} ({config.fingerprint}): {env.device}, "
-          f"{env.vram_gib:.1f} GiB free VRAM, {env.host_ram_gib:.0f} GiB host RAM, "
-          f"{env.disk_free_gib:.0f} GiB free disk")
+    print(
+        f"{source} ({config.fingerprint}): {env.device}, "
+        f"{env.vram_gib:.1f} GiB free VRAM, {env.host_ram_gib:.0f} GiB host RAM, "
+        f"{env.disk_free_gib:.0f} GiB free disk"
+    )
     for item in env.unknown:
         print(f"  could not measure: {item}")
     print()
@@ -289,8 +299,9 @@ def _cmd_autoconfig(args: argparse.Namespace) -> int:
         print(f"  ! {line}")
     print()
     argv = config.serve_args(args.model or args.checkpoint)
+    prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in config.env.items())
     print("serve with:")
-    print("  " + " ".join(shlex.quote(a) for a in argv))
+    print("  " + prefix + " ".join(shlex.quote(a) for a in argv))
     if config.cached:
         print()
         print("  (cached; the probe re-runs when the machine, model or batch changes,")
@@ -298,8 +309,8 @@ def _cmd_autoconfig(args: argparse.Namespace) -> int:
 
     if args.start:
         print()
-        print("starting:", " ".join(shlex.quote(a) for a in argv))
-        return subprocess.call(argv)
+        print("starting:", prefix + " ".join(shlex.quote(a) for a in argv))
+        return subprocess.call(argv, env={**os.environ, **config.env})
     return 0
 
 
@@ -332,9 +343,7 @@ def _cmd_ablate(args: argparse.Namespace) -> int:
         print("no held-out prompts", file=sys.stderr)
         return 2
 
-    arms = arms_from_profile(
-        stats, args.keep, include_hot_control=not args.no_control
-    )
+    arms = arms_from_profile(stats, args.keep, include_hot_control=not args.no_control)
     study = run_study(
         args.model or meta["model"],
         prompts,
@@ -450,11 +459,7 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     prompts = list(iter_prompts_from_jsonl(args.corpus, args.field))
     if args.limit:
         prompts = prompts[: args.limit]
-    scales = (
-        tuple(float(x) for x in args.scales.split(","))
-        if args.scales
-        else None
-    )
+    scales = tuple(float(x) for x in args.scales.split(",")) if args.scales else None
     kwargs = {"enforce_eager": True}
     if args.llm_kwargs:
         kwargs.update(json.loads(args.llm_kwargs))
@@ -822,16 +827,24 @@ def main(argv: list[str] | None = None) -> int:
         "run", help="interactive prompt, with what the tier costs per turn"
     )
     p.add_argument("model", help="model id or checkpoint directory to serve")
-    p.add_argument("--checkpoint", help="local directory to size from, if `model` "
-                                       "is a repo id")
+    p.add_argument(
+        "--checkpoint", help="local directory to size from, if `model` is a repo id"
+    )
     p.add_argument("--store", default="./store")
     p.add_argument("--max-num-seqs", type=int, default=8)
-    p.add_argument("--kv-reserve", type=float, default=None,
-                   help="KV cache GiB (default: 15%% of free VRAM, clamped to "
-                        "[0.5, 2.0] -- a flat 2.0 starved small cards)")
+    p.add_argument(
+        "--kv-reserve",
+        type=float,
+        default=None,
+        help="KV cache GiB (default: 15%% of free VRAM, clamped to "
+        "[0.5, 2.0] -- a flat 2.0 starved small cards)",
+    )
     p.add_argument("--vram", type=float, help="override the measured free VRAM")
-    p.add_argument("--no-tier", action="store_true", help="serve untiered, for a "
-                                                          "side-by-side comparison")
+    p.add_argument(
+        "--no-tier",
+        action="store_true",
+        help="serve untiered, for a side-by-side comparison",
+    )
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--max-tokens", type=int, default=512)
     p.set_defaults(func=_cmd_run)
@@ -843,11 +856,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--model", help="model id to serve; defaults to --checkpoint")
     p.add_argument("--store", default="./store")
-    p.add_argument("--max-num-seqs", type=int, default=8,
-                   help="serving batch; it sets how many experts a layer can reach")
-    p.add_argument("--kv-reserve", type=float, default=None,
-                   help="KV cache GiB (default: 15%% of free VRAM, clamped to "
-                        "[0.5, 2.0] -- a flat 2.0 starved small cards)")
+    p.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=8,
+        help="serving batch; it sets how many experts a layer can reach",
+    )
+    p.add_argument(
+        "--kv-reserve",
+        type=float,
+        default=None,
+        help="KV cache GiB (default: 15%% of free VRAM, clamped to "
+        "[0.5, 2.0] -- a flat 2.0 starved small cards)",
+    )
     p.add_argument("--vram", type=float, help="override the measured free VRAM")
     p.add_argument("--refresh", action="store_true", help="ignore the cached answer")
     p.add_argument("--json", action="store_true", help="print only the surgeon config")

@@ -135,9 +135,7 @@ def test_the_fingerprint_ignores_jitter_but_not_a_real_change(checkpoint):
     that invalidated the answer the probe would run every boot, which is what this
     exists to avoid."""
     g = analyze(checkpoint)
-    kw = dict(
-        checkpoint=checkpoint, store_dir="/s", max_num_seqs=8, kv_reserve_gib=2.0
-    )
+    kw = dict(checkpoint=checkpoint, store_dir="/s", max_num_seqs=8, kv_reserve_gib=2.0)
 
     base = fingerprint(g, _env(vram=8.00), **kw)
     jitter = fingerprint(g, _env(vram=8.04), **kw)
@@ -246,9 +244,7 @@ def test_fp8_is_never_reached_for_on_a_one_byte_checkpoint():
     g.serving_dtype_bytes = 1
     assert g.record_bytes(fp8=True) >= g.record_bytes(fp8=False)
 
-    store_gib = (
-        g.num_moe_layers * g.num_experts * g.record_bytes(fp8=False) / 1024**3
-    )
+    store_gib = g.num_moe_layers * g.num_experts * g.record_bytes(fp8=False) / 1024**3
     # Disk pressure that the old "assume fp8 halves it" logic would have accepted.
     with pytest.raises(ValueError, match="does not fit|is free at"):
         decide(
@@ -307,3 +303,29 @@ def test_the_scaled_reserve_does_not_leak_probe_jitter_into_the_fingerprint():
     # Across a real bucket boundary the reserve may move -- that is a real change.
     c = resolve_kv_reserve(_env(vram=8.01), None)
     assert c >= a
+
+
+def test_buffered_reads_exactly_when_the_pool_cannot_hold_the_store(tmp_path):
+    """The read path is a decision, not a knob the user has to know about.
+
+    Measured (notes/sayfa-onbellegi-plani.md): with the pinned pool smaller than
+    the store, buffered reads are 1.17-1.61x over O_DIRECT; with the whole store
+    pinned they cost 0.86x. So the env var travels with the config, and only
+    in the regime where it wins.
+    """
+    geometry = _olmoe_geometry()
+    small = decide(geometry, _env(vram=8.0, ram=6.0), store_dir=str(tmp_path))
+    assert small.surgeon["ram_cache"] < geometry.num_experts
+    assert small.env == {"VLLM_MOE_DISK_BUFFERED": "1"}
+    assert any("page cache" in line for line in small.why)
+
+    big = decide(geometry, _env(vram=8.0, ram=64.0), store_dir=str(tmp_path))
+    assert big.surgeon["ram_cache"] == geometry.num_experts
+    assert big.env == {}
+
+
+def test_env_survives_the_cache_round_trip(checkpoint, monkeypatch):
+    first = autoconfigure(checkpoint, store_dir="./store", refresh=True)
+    again = autoconfigure(checkpoint, store_dir="./store")
+    assert again.cached
+    assert again.env == first.env

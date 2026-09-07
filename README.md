@@ -70,7 +70,8 @@ surgeon autoconfig --checkpoint /path/to/model --start
 ```
 
 It probes the machine once, caches the decision, and runs `vllm serve` with the
-right settings. `--json` prints the config instead of starting; omit `--start`
+right settings. `--json` prints the config (surgeon settings, environment,
+`max_num_seqs`) instead of starting; omit `--start`
 to see the reasoning.
 
 **Or talk to it interactively, with per-turn cost:**
@@ -173,8 +174,10 @@ tier needs — the binding quantity is the batch's per-layer expert union, not
 `top_k` — so a machine that can grow `expert_cache_size` with the batch keeps
 scaling, and one that cannot pays for concurrency twice.
 
-`surgeon autoconfig` picks the first two from the machine. The tables, the method
-and the noise floors are in [docs/benchmarks.md](docs/benchmarks.md).
+`surgeon autoconfig` picks all three from the machine — the read path by the
+coarse half of the rule, "buffered when the pool cannot hold the store", printed
+as `VLLM_MOE_DISK_BUFFERED=1` in front of the serve command. The tables, the
+method and the noise floors are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## How it fits together
 

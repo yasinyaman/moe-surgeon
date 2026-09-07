@@ -44,6 +44,7 @@ above. These are store-side only and have no config-payload equivalent:
 | `VLLM_MOE_CACHE_DECAY` | `0.999` | EWMA decay. |
 | `VLLM_MOE_DISK_PIPELINE` | `true` | Route disk reads through the reader pool. |
 | `VLLM_MOE_DISK_IO_THREADS` | `2` | Reader threads, clamped to [1, 4]. Past 4, p99 read latency degrades badly. |
+| `VLLM_MOE_DISK_BUFFERED` | `false` | Read the store through the OS page cache instead of `O_DIRECT`. Worth 1.17–1.61× when the pinned pool cannot hold the store, costs ~0.86× when it can; `surgeon autoconfig` sets it by that rule and prints it in front of the serve command. |
 | `VLLM_MOE_DISK_PREFETCH` | `false` | Cross-group prefetch. Needs `ram_cache ≥ 2 × expert_cache_size`; worth 1.03–1.075×. |
 | `VLLM_MOE_ZERO_COPY` | `false` | Map the pinned pool as the kernel's buffer. Needs a disk store; incompatible with prefetch and with `cpu_experts`. |
 | `VLLM_MOE_ZC_FP8_SLOTS` | `0` | Zero-copy over an fp8 store only: retain this many fp8 rows as a cold pool, so a later miss re-expands a row (0.134 ms) instead of reading disk (0.95 ms). Warns on use — validated in simulation and on GB10, **never tested on the small unified boxes it targets**. |

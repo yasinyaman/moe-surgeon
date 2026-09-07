@@ -60,7 +60,7 @@ _BUCKET_GIB = 0.5
 
 #: Bumped when the decision logic changes, so a cached answer from older logic is
 #: not served for a machine that would now be configured differently.
-_LOGIC_VERSION = 3
+_LOGIC_VERSION = 4
 
 
 def _bucket(gib: float) -> float:
@@ -154,6 +154,9 @@ class AutoConfig:
     #: boot that does not enforce the same bound can route to more experts than
     #: there are slots while the tool has just said no step should re-fetch.
     max_num_seqs: int = 8
+    #: Environment the serve process needs. The store reads these directly and
+    #: `--additional-config` cannot carry them, so they travel beside the argv.
+    env: dict[str, str] = field(default_factory=dict)
 
     def serve_args(self, model: str) -> list[str]:
         """The `vllm serve` argv this configuration corresponds to."""
@@ -386,6 +389,27 @@ def decide(
                 f"{env.disk_free_gib:.1f} GiB is free at {store_dir}"
             )
 
+    # Read path. The pinned pool is the RAM tier; when it cannot hold the store,
+    # every eviction re-reads NVMe, and O_DIRECT bypasses the page cache that
+    # would have served most of those reads for free. Measured (laptop, OLMoE,
+    # notes/sayfa-onbellegi-plani.md): with 0.81 GB pinned, buffered reads were
+    # 1.17x on c1 TPOT and 1.61x on c4 throughput and cut physical IO 99.4%;
+    # with the whole store pinned, buffered lost 0.86x (a second copy). The
+    # finer rule -- crossover near 24 records/layer on that host, README -- is
+    # host specific; this is its portable half.
+    record = record_fp8 if fp8 else record_bf16
+    pool_bytes = layers * max(ram_cache, capacity) * record
+    store_bytes = layers * geometry.num_experts * record
+    env_vars: dict[str, str] = {}
+    if pool_bytes < store_bytes:
+        env_vars["VLLM_MOE_DISK_BUFFERED"] = "1"
+        why.append(
+            f"the pinned pool ({pool_bytes / 1024**3:.1f} GiB) cannot hold the "
+            f"store ({store_bytes / 1024**3:.1f} GiB), so reads go through the page "
+            "cache (VLLM_MOE_DISK_BUFFERED=1): 1.17-1.61x measured over O_DIRECT in "
+            "that regime"
+        )
+
     surgeon: dict[str, Any] = {
         "expert_cache_size": capacity,
         "store_dir": store_dir,
@@ -407,6 +431,7 @@ def decide(
         why=why,
         warnings=warnings,
         max_num_seqs=max_num_seqs,
+        env=env_vars,
     )
 
 
